@@ -1,0 +1,53 @@
+[package]
+name = "third-eye"
+version = "0.1.0"
+description = "Third Eye — instant AI overlay"
+authors = ["slastrina"]
+edition = "2021"
+
+[lib]
+name = "third_eye_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+async-trait = "0.1"
+futures-util = "0.3"
+# No default features: the LM Studio endpoint is plain-http on the local
+# network, so no TLS stack is needed. Add a tls feature if S05 ever allows
+# https endpoints.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# Encode pipeline (capture/encode.rs): PNG only — no other codecs needed,
+# and the pipeline is unit-tested cross-platform with synthetic pixels.
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+[dev-dependencies]
+# net + io-util power the raw TcpListener mock server in llm tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+# Global hotkey registration — desktop only (plugin does not build for mobile)
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+# Launch-at-login registration (macOS LaunchAgent / Windows run key / Linux
+# XDG autostart) — desktop only
+tauri-plugin-autostart = "2"
+# Hotkey persistence (settings.json); S07 reuses this store for lane models
+# and privacy mode — desktop only
+tauri-plugin-store = "2"
+
+# Nonactivating NSPanel conversion — macOS only, git-pinned (v2.1 branch is not on crates.io)
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e894383aa068ec5365a42994e3ac94ba1b6" }
+# Safe ScreenCaptureKit bindings for the one-frame self-excluded capture
+# backend. macos_14_0 unlocks SCScreenshotManager (single-shot capture without
+# a stream); the app already requires a modern macOS.
+screencapturekit = { version = "8.0", features = ["macos_14_0"] }

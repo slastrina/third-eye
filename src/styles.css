@@ -1,0 +1,531 @@
+/* The window itself is transparent; only .overlay-panel paints pixels. */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.overlay-root {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  height: 100%;
+  padding-top: 15vh;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Click-through is enforced natively (setIgnoresMouseEvents); pointer-events
+   mirrors it in the DOM so an idle overlay never shows hover/caret feedback. */
+.overlay-root {
+  pointer-events: none;
+}
+
+.overlay-root[data-state="visible-focused"] {
+  pointer-events: auto;
+}
+
+.overlay-panel {
+  width: 560px;
+  border-radius: 12px;
+  background: rgba(28, 28, 30, 0.82);
+  backdrop-filter: blur(24px);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  padding: 12px;
+  border: 1px solid transparent;
+}
+
+.overlay-root[data-state="visible-focused"] .overlay-panel {
+  border-color: rgba(122, 162, 255, 0.45);
+}
+
+.overlay-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 20px;
+  line-height: 1.4;
+  caret-color: #7aa2ff;
+}
+
+.overlay-input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* --- Tray: S07 stub notice banner (R010 — never silent) -------------------- */
+
+.tray-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(122, 162, 255, 0.14);
+  border: 1px solid rgba(122, 162, 255, 0.4);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+}
+
+/* --- Screen capture: attach affordance (R004/R007/R008) ------------------- */
+
+.attach-row {
+  display: flex;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.attach-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.attach-button:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.attach-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Spinner marking a capture in flight. */
+.attach-spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #7aa2ff;
+  animation: attach-spin 0.8s linear infinite;
+}
+
+@keyframes attach-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  background: rgba(122, 162, 255, 0.18);
+  border: 1px solid rgba(122, 162, 255, 0.45);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.attach-chip-clear {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.attach-chip-clear:hover {
+  color: rgba(255, 255, 255, 0.95);
+}
+
+/* Permission-denied walkthrough (R007 — guidance, never silence). */
+.capture-walkthrough {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 180, 84, 0.12);
+  border: 1px solid rgba(255, 180, 84, 0.4);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+}
+
+.capture-walkthrough-steps {
+  margin: 8px 0;
+  padding-left: 18px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.capture-walkthrough-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* Tag marking a user turn that carried a screenshot. */
+.chat-attached-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(122, 162, 255, 0.3);
+  color: rgba(210, 224, 255, 0.95);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- Chat: offline/error banner ------------------------------------------ */
+
+.chat-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 96, 92, 0.14);
+  border: 1px solid rgba(255, 96, 92, 0.4);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+}
+
+.chat-banner[data-online="true"] {
+  background: rgba(64, 200, 120, 0.14);
+  border-color: rgba(64, 200, 120, 0.4);
+}
+
+.chat-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chat-banner-text span {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.chat-retry {
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+.chat-retry:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.chat-retry:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* --- Chat: message list --------------------------------------------------- */
+
+.chat-messages {
+  margin-top: 10px;
+  max-height: 40vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-message {
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-message .chat-text {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.chat-user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: rgba(122, 162, 255, 0.22);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.chat-assistant {
+  align-self: stretch;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.chat-assistant[data-status="interrupted"] {
+  border: 1px dashed rgba(255, 96, 92, 0.5);
+}
+
+.chat-interrupted-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255, 96, 92, 0.25);
+  color: rgba(255, 200, 198, 0.95);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- Model routing indicator (R003) --------------------------------------- */
+
+.model-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.model-indicator-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-lanes {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.model-lane {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.model-lane:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.model-lane[aria-pressed="true"] {
+  background: rgba(122, 162, 255, 0.25);
+  border-color: rgba(122, 162, 255, 0.6);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+/* --- Settings window (S07) ------------------------------------------------ */
+
+/* The settings window is transparent like the overlay; .settings-panel paints
+   the whole surface (borderless window, rounded corners from CSS). */
+.settings-root {
+  height: 100%;
+  padding: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.settings-panel {
+  height: 100%;
+  border-radius: 12px;
+  background: rgba(28, 28, 30, 0.94);
+  backdrop-filter: blur(24px);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 16px;
+  color: rgba(255, 255, 255, 0.92);
+  overflow-y: auto;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.settings-close {
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.settings-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.settings-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.settings-row-label {
+  color: rgba(255, 255, 255, 0.85);
+  text-transform: capitalize;
+}
+
+.settings-select {
+  max-width: 60%;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+}
+
+.settings-refresh {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.settings-refresh:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.settings-refresh:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.settings-toggle {
+  width: 16px;
+  height: 16px;
+  accent-color: #7aa2ff;
+}
+
+.settings-hint {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 12px;
+}
+
+.settings-unavailable {
+  margin: 8px 0 0;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 13px;
+}
+
+.settings-error {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 92, 92, 0.14);
+  border: 1px solid rgba(255, 92, 92, 0.35);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.settings-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.settings-status-value {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+}
+
+/* Attach affordance privacy hint (S07): the button stays live so an
+   attempted capture surfaces the typed privacy-mode error. */
+.attach-privacy-hint {
+  font-size: 11px;
+  color: rgba(255, 200, 120, 0.9);
+}
+
+/* Blinking caret marking a live stream. */
+.chat-caret {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  background: #7aa2ff;
+  animation: chat-caret-blink 1s steps(1) infinite;
+}
+
+@keyframes chat-caret-blink {
+  50% {
+    opacity: 0;
+  }
+}

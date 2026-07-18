@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Baseline capability for the overlay window","local":true,"windows":["overlay"],"permissions":["core:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-focus","core:window:allow-set-ignore-cursor-events","global-shortcut:allow-is-registered"]}}
