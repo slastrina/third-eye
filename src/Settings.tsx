@@ -26,6 +26,23 @@ import {
   type NudgeStatus,
 } from "./chat";
 import {
+  CLOUD_PROVIDERS,
+  cloudHeavyProvider,
+  cloudKeyStatus,
+  cloudOptinStatus,
+  cloudReducer,
+  deleteCloudApiKey,
+  initialCloudViewState,
+  isCloudKeyError,
+  keyErrorTitle,
+  keyPresent,
+  onCloudOptin,
+  setCloudApiKey,
+  setCloudHeavyProvider,
+  setCloudOptin,
+  type CloudProvider,
+} from "./cloud-state";
+import {
   MEMORY_EMPTY_HINT,
   MEMORY_PAGE_SIZE,
   MEMORY_UNAVAILABLE_MESSAGE,
@@ -88,6 +105,15 @@ function Settings() {
   const [state, dispatch] = useReducer(settingsReducer, initialSettingsState);
   const [watcher, dispatchWatcher] = useReducer(watcherReducer, initialWatcherViewState);
   const [memory, dispatchMemory] = useReducer(memoryReducer, initialMemoryViewState);
+  const [cloud, dispatchCloud] = useReducer(cloudReducer, initialCloudViewState);
+  // The masked key drafts live only in local component state, keyed by
+  // provider — never in the reducer, so an entered key can never round-trip
+  // back into rendered view state (the never-echo property). Cleared the
+  // instant it is handed to the backend.
+  const [keyDrafts, setKeyDrafts] = useState<Record<CloudProvider, string>>({
+    openai: "",
+    anthropic: "",
+  });
   // Nudge status is a single authoritative backend snapshot (mount query,
   // toggle response, nudge://state broadcast all land the same shape), so a
   // plain state cell suffices — no transitions to keep pure.
@@ -137,6 +163,23 @@ function Settings() {
       (telemetry) => setGuard(telemetry),
       (err) => console.debug("settings: guard_status unavailable:", err),
     );
+    cloudOptinStatus().then(
+      (status) => dispatchCloud({ type: "optin", status }),
+      (err) => console.debug("settings: cloud_optin_status unavailable:", err),
+    );
+    cloudKeyStatus().then(
+      (status) => dispatchCloud({ type: "keys", status }),
+      // A CloudKeyError means the store itself failed; anything else is the
+      // no-runtime case. Either way the key rows stay renderable.
+      (err) => {
+        if (isCloudKeyError(err)) dispatchCloud({ type: "key-error", error: err });
+        else console.debug("settings: cloud_key_status unavailable:", err);
+      },
+    );
+    cloudHeavyProvider().then(
+      (status) => dispatchCloud({ type: "heavy", status }),
+      (err) => console.debug("settings: cloud_heavy_provider unavailable:", err),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -160,7 +203,16 @@ function Settings() {
       // (external forward redaction, guard block, watcher increment)
       // arrives as a fresh privacy://state snapshot.
       onPrivacyState((telemetry) => setGuard(telemetry)),
+      // Cloud opt-in truth flows one way too: a toggle from any window
+      // broadcasts the resulting status as cloud://optin.
+      onCloudOptin((status) => dispatchCloud({ type: "optin", status })),
     ];
+    // MEM115: a capability/ACL denial rejects listen() inside the real app —
+    // without this catch the rejection is unhandled and every live surface
+    // silently freezes at its boot-time snapshot.
+    unlistens.forEach((u) => {
+      u.catch((err) => console.error("settings: event subscription failed:", err));
+    });
     return () => {
       unlistens.forEach((u) => u.then((f) => f()));
     };
@@ -215,6 +267,48 @@ function Settings() {
       // a rolled-back toggle comes back as the authoritative snapshot.
       (status) => setNudges(status),
       (err) => console.debug("settings: set_nudges_enabled unavailable:", err),
+    );
+  };
+
+  const toggleCloudOptin = (enable: boolean) => {
+    setCloudOptin(enable).then(
+      // Never rejects backend-side; a persist failure rides persistError and
+      // a rolled-back toggle comes back as the authoritative snapshot.
+      (status) => dispatchCloud({ type: "optin", status }),
+      (err) => console.debug("settings: set_cloud_optin unavailable:", err),
+    );
+  };
+
+  const submitKey = (provider: CloudProvider) => {
+    const key = keyDrafts[provider];
+    if (key.trim().length === 0) return;
+    // Clear the draft immediately: the key is on its way to the OS store and
+    // must never linger in a rendered field.
+    setKeyDrafts((drafts) => ({ ...drafts, [provider]: "" }));
+    setCloudApiKey(provider, key).then(
+      (status) => dispatchCloud({ type: "keys", status }),
+      (err) => {
+        if (isCloudKeyError(err)) dispatchCloud({ type: "key-error", error: err });
+        else console.debug("settings: set_cloud_api_key unavailable:", err);
+      },
+    );
+  };
+
+  const removeKey = (provider: CloudProvider) => {
+    deleteCloudApiKey(provider).then(
+      (status) => dispatchCloud({ type: "keys", status }),
+      (err) => {
+        if (isCloudKeyError(err)) dispatchCloud({ type: "key-error", error: err });
+        else console.debug("settings: delete_cloud_api_key unavailable:", err);
+      },
+    );
+  };
+
+  const selectHeavyProvider = (provider: CloudProvider | null) => {
+    setCloudHeavyProvider(provider).then(
+      // Never rejects backend-side; a persist failure rides persistError.
+      (status) => dispatchCloud({ type: "heavy", status }),
+      (err) => console.debug("settings: set_cloud_heavy_provider unavailable:", err),
     );
   };
 
@@ -540,6 +634,129 @@ function Settings() {
               <strong>{bannerTitle(nudges.lastError)}</strong>
               <span>{bannerDetail(nudges.lastError)}</span>
             </div>
+          )}
+        </section>
+
+        <section className="settings-section" aria-labelledby="settings-cloud-heading">
+          <h2 id="settings-cloud-heading" className="settings-section-title">
+            Cloud Providers
+          </h2>
+          <label className="settings-row">
+            <span className="settings-row-label">Use cloud providers</span>
+            <input
+              type="checkbox"
+              className="settings-toggle"
+              aria-label="Use cloud providers"
+              disabled={cloud.optin === null}
+              checked={cloud.optin?.enabled ?? false}
+              onChange={(event) => toggleCloudOptin(event.target.checked)}
+            />
+          </label>
+          <p className="settings-hint">
+            Off by default — everything runs on-device. Turn this on to let the
+            heavy lane use a remote provider with your own API key. Turning it
+            off reverts to local-only.
+          </p>
+          {cloud.optin === null && (
+            <p className="settings-unavailable">
+              Cloud state is unavailable outside the app.
+            </p>
+          )}
+          {cloud.optin?.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Cloud opt-in couldn't be saved</strong>
+              <span>{cloud.optin.persistError}</span>
+            </div>
+          )}
+          {cloud.optin?.enabled && (
+            <>
+              {CLOUD_PROVIDERS.map((p) => (
+                <div key={p.id} className="cloud-provider" data-cloud-provider={p.id}>
+                  <div className="settings-status-row">
+                    <span className="settings-row-label">{p.label} API key</span>
+                    <span
+                      className="settings-status-value"
+                      data-cloud-key-present={keyPresent(cloud.keys, p.id)}
+                    >
+                      {keyPresent(cloud.keys, p.id) ? "Stored" : "Not stored"}
+                    </span>
+                  </div>
+                  <div className="settings-row">
+                    <input
+                      type="password"
+                      className="settings-key-input"
+                      aria-label={`${p.label} API key`}
+                      data-cloud-key-input={p.id}
+                      autoComplete="off"
+                      placeholder={keyPresent(cloud.keys, p.id) ? "Replace stored key" : "Paste API key"}
+                      value={keyDrafts[p.id]}
+                      onChange={(event) =>
+                        setKeyDrafts((drafts) => ({ ...drafts, [p.id]: event.target.value }))
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="settings-refresh"
+                      data-cloud-key-save={p.id}
+                      disabled={keyDrafts[p.id].trim().length === 0}
+                      onClick={() => submitKey(p.id)}
+                    >
+                      Save
+                    </button>
+                    {keyPresent(cloud.keys, p.id) && (
+                      <button
+                        type="button"
+                        className="memory-delete"
+                        data-cloud-key-delete={p.id}
+                        aria-label={`Delete ${p.label} API key`}
+                        onClick={() => removeKey(p.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {cloud.keyError && (
+                <div className="settings-error" role="alert">
+                  <strong>{keyErrorTitle(cloud.keyError)}</strong>
+                  <span>{cloud.keyError.detail}</span>
+                </div>
+              )}
+              <label className="settings-row">
+                <span className="settings-row-label">Heavy lane provider</span>
+                <select
+                  className="settings-select"
+                  aria-label="Heavy lane cloud provider"
+                  data-cloud-heavy-provider
+                  value={cloud.heavy?.provider ?? DEFAULT_OPTION}
+                  onChange={(event) =>
+                    selectHeavyProvider(
+                      event.target.value === DEFAULT_OPTION
+                        ? null
+                        : (event.target.value as CloudProvider),
+                    )
+                  }
+                >
+                  <option value={DEFAULT_OPTION}>none (local only)</option>
+                  {CLOUD_PROVIDERS.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="settings-hint">
+                Which provider the heavy lane targets. Routing lands in a later
+                update — this only remembers the choice for now.
+              </p>
+              {cloud.heavy?.persistError && (
+                <div className="settings-error" role="alert">
+                  <strong>Provider choice couldn't be saved</strong>
+                  <span>{cloud.heavy.persistError}</span>
+                </div>
+              )}
+            </>
           )}
         </section>
 

@@ -208,4 +208,43 @@ mod tests {
     fn settings_label_is_distinct_from_the_overlay() {
         assert_ne!(SETTINGS_WINDOW_LABEL, crate::OVERLAY_WINDOW_LABEL);
     }
+
+    /// MEM115: a window covered by no capability is denied the event ACL, so
+    /// `listen()` in that webview silently fails while custom-command invokes
+    /// still work — live broadcasts freeze at boot-time snapshots. Every
+    /// window declared in tauri.conf.json must appear in at least one
+    /// capability that grants `core:default` (which includes
+    /// `core:event:default`, the listen/unlisten permission set).
+    #[test]
+    fn every_declared_window_has_a_capability_granting_core_default() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let capabilities: [serde_json::Value; 2] = [
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap(),
+            serde_json::from_str(include_str!("../capabilities/settings.json")).unwrap(),
+        ];
+
+        for window in conf["app"]["windows"].as_array().expect("windows array") {
+            let label = window["label"].as_str().expect("window label");
+            let covered = capabilities.iter().any(|cap| {
+                let in_windows = cap["windows"]
+                    .as_array()
+                    .expect("capability windows array")
+                    .iter()
+                    .any(|w| w == label);
+                let grants_core_default = cap["permissions"]
+                    .as_array()
+                    .expect("capability permissions array")
+                    .iter()
+                    .any(|p| p == "core:default");
+                in_windows && grants_core_default
+            });
+            assert!(
+                covered,
+                "window '{label}' is not covered by any capability granting core:default — \
+                 its webview cannot listen() to backend event broadcasts (MEM115); add it to \
+                 a capability file in src-tauri/capabilities/ and include_str! that file here"
+            );
+        }
+    }
 }

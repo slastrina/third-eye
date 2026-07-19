@@ -228,6 +228,124 @@ pub fn save_watcher_enabled(app: &AppHandle, enabled: bool) -> Result<(), String
     Ok(())
 }
 
+/// Store key holding the cloud opt-in toggle (M004 S03). Absent means off —
+/// the default; there is no env fallback. Opt-in is the single gate that lets
+/// any remote-provider client be constructed, so garbage in the store must
+/// fail safe to off (never silently enable cloud egress).
+pub const CLOUD_OPTIN_KEY: &str = "cloudOptin";
+
+/// Read the persisted cloud opt-in toggle. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller
+/// keeps the default (off).
+pub fn load_cloud_optin(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(CLOUD_OPTIN_KEY)?;
+    Some(stored_cloud_optin(&value))
+}
+
+/// Interpret one stored opt-in value. Only a JSON boolean is trusted;
+/// anything else is logged and treated as off rather than silently enabling
+/// remote providers on garbage data — off is the only safe fallback for the
+/// cloud-egress gate.
+fn stored_cloud_optin(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!("config: {CLOUD_OPTIN_KEY} holds non-boolean value {other}; treating as off");
+            false
+        }
+    }
+}
+
+/// Persist the cloud opt-in toggle. The error names the failed persist path;
+/// the caller (the opt-in applier) rolls the in-memory toggle back so an
+/// unpersisted opt-in can never silently revert on restart (hotkey precedent).
+pub fn save_cloud_optin(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(CLOUD_OPTIN_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {CLOUD_OPTIN_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {CLOUD_OPTIN_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Store key holding the heavy-lane cloud provider selection (M004 S04).
+/// Absent/null means no cloud provider is selected — the default. The value is
+/// the provider's kebab-case wire name ("openai" / "anthropic"), kept
+/// identical to [`crate::cloud::keystore::CloudProvider`]'s serde encoding.
+pub const CLOUD_HEAVY_PROVIDER_KEY: &str = "cloudHeavyProvider";
+
+/// Read the persisted heavy-lane provider. `None` means nothing usable is
+/// persisted (no store, no key, null, or garbage — all logged where relevant):
+/// the caller keeps the default (unselected). There is no env fallback, so a
+/// flat `Option` is enough — "absent" and "explicitly none" are the same here.
+pub fn load_cloud_heavy_provider(app: &AppHandle) -> Option<crate::cloud::keystore::CloudProvider> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(CLOUD_HEAVY_PROVIDER_KEY)?;
+    stored_cloud_heavy_provider(&value)
+}
+
+/// Interpret one stored heavy-provider value. Only a recognized provider wire
+/// name is trusted; null, unknown strings, and non-strings are treated as
+/// unselected rather than silently pinning a garbage provider — there is no
+/// safe "default provider" to fall back to.
+fn stored_cloud_heavy_provider(
+    value: &serde_json::Value,
+) -> Option<crate::cloud::keystore::CloudProvider> {
+    match value {
+        serde_json::Value::Null => None,
+        other => match serde_json::from_value::<crate::cloud::keystore::CloudProvider>(other.clone())
+        {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                log::warn!(
+                    "config: {CLOUD_HEAVY_PROVIDER_KEY} holds unrecognized value {other}; \
+                     treating as unselected"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Persist the heavy-lane provider selection (`None` writes an explicit JSON
+/// null — "unselected" is a decision, so it is stored, not just absent). The
+/// error names the failed persist path; the caller rolls the in-memory
+/// selection back so an unpersisted choice can never silently revert on
+/// restart (opt-in / hotkey precedent).
+pub fn save_cloud_heavy_provider(
+    app: &AppHandle,
+    provider: Option<crate::cloud::keystore::CloudProvider>,
+) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    let wire = provider.map(|p| p.account());
+    store.set(CLOUD_HEAVY_PROVIDER_KEY, serde_json::json!(wire));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}: {e}"))?;
+    log::info!("config: persisted {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}");
+    Ok(())
+}
+
 /// Store key holding the nudges off-switch (M002 S05, D019). Unlike the
 /// watcher/privacy toggles the default is ON — nudges only fire while the
 /// watcher runs, so the off-switch is the feature, not the default.
@@ -374,6 +492,56 @@ mod tests {
         assert!(!stored_privacy_mode(&serde_json::json!(1)));
         assert!(!stored_privacy_mode(&serde_json::Value::Null));
         assert!(!stored_privacy_mode(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_cloud_optin_booleans_round_trip() {
+        assert!(stored_cloud_optin(&serde_json::json!(true)));
+        assert!(!stored_cloud_optin(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_non_boolean_cloud_optin_is_treated_as_off() {
+        // Q5/Q7: garbage in the store must never silently enable cloud
+        // egress — off is the only safe fallback for the remote-provider gate.
+        assert!(!stored_cloud_optin(&serde_json::json!("true")));
+        assert!(!stored_cloud_optin(&serde_json::json!(1)));
+        assert!(!stored_cloud_optin(&serde_json::Value::Null));
+        assert!(!stored_cloud_optin(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_cloud_heavy_provider_round_trips_each_provider() {
+        // The persist round-trip proven at the interpreter level (the same
+        // level every other config test proves at): the wire name written by
+        // save_cloud_heavy_provider reads back to the same provider.
+        use crate::cloud::keystore::CloudProvider;
+        for provider in CloudProvider::ALL {
+            let stored = serde_json::json!(provider.account());
+            assert_eq!(stored_cloud_heavy_provider(&stored), Some(provider));
+        }
+    }
+
+    #[test]
+    fn stored_null_cloud_heavy_provider_is_unselected() {
+        // null is the persisted "no provider selected" decision.
+        assert_eq!(stored_cloud_heavy_provider(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn stored_garbage_cloud_heavy_provider_is_unselected() {
+        // Q5/Q7: an unknown or malformed value must never pin a garbage
+        // provider — unselected is the only safe fallback (no default provider).
+        for bad in [
+            serde_json::json!("gemini"),
+            serde_json::json!("OpenAI"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"provider": "openai"}),
+            serde_json::json!(["openai"]),
+        ] {
+            assert_eq!(stored_cloud_heavy_provider(&bad), None, "bad value: {bad}");
+        }
     }
 
     #[test]

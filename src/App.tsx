@@ -56,6 +56,9 @@ function App() {
 
   useEffect(() => {
     const unlisten = onOverlayStateChanged(setState);
+    // MEM115: a capability/ACL denial rejects listen() inside the real app —
+    // catch loudly so a dead subscription is visible, not a frozen surface.
+    unlisten.catch((err) => console.error("overlay: event subscription failed:", err));
     return () => {
       unlisten.then((f) => f());
     };
@@ -72,6 +75,7 @@ function App() {
       if (trayNoticeTimer.current !== null) window.clearTimeout(trayNoticeTimer.current);
       trayNoticeTimer.current = window.setTimeout(() => setTrayNotice(null), 6000);
     });
+    unlisten.catch((err) => console.error("overlay: event subscription failed:", err));
     return () => {
       unlisten.then((f) => f());
       if (trayNoticeTimer.current !== null) window.clearTimeout(trayNoticeTimer.current);
@@ -140,6 +144,9 @@ function App() {
       onLlmToolCall((payload) => dispatchChat({ type: "tool-call", payload })),
       onLlmToolResult((payload) => dispatchChat({ type: "tool-result", payload })),
     ];
+    unlistens.forEach((u) => {
+      u.catch((err) => console.error("overlay: event subscription failed:", err));
+    });
     return () => {
       unlistens.forEach((u) => u.then((f) => f()));
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
@@ -217,6 +224,9 @@ function App() {
       onModelInfoBroadcast((info) => dispatchChat({ type: "model-info", info })),
       onPrivacyChanged((status) => dispatchChat({ type: "privacy", status })),
     ];
+    unlistens.forEach((u) => {
+      u.catch((err) => console.error("overlay: event subscription failed:", err));
+    });
     return () => {
       unlistens.forEach((u) => u.then((f) => f()));
     };
@@ -232,6 +242,9 @@ function App() {
       onNudgeShow((payload) => dispatchChat({ type: "nudge-shown", payload })),
       onNudgeDismiss((reason) => dispatchChat({ type: "nudge-dismissed", reason })),
     ];
+    unlistens.forEach((u) => {
+      u.catch((err) => console.error("overlay: event subscription failed:", err));
+    });
     return () => {
       unlistens.forEach((u) => u.then((f) => f()));
     };

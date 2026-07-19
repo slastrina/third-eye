@@ -47,6 +47,10 @@ pub struct OpenAiClient {
     /// `Some` pins requests to one loaded model (S03 lane routing); `None`
     /// omits the `model` key entirely (single-model fallback).
     model: Option<String>,
+    /// `Some` attaches `Authorization: Bearer` to every request (M004 cloud
+    /// providers). Never logged, never in error details; the struct
+    /// deliberately has no Debug derive so the key has no leak surface.
+    api_key: Option<String>,
     http: reqwest::Client,
 }
 
@@ -57,7 +61,7 @@ impl OpenAiClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client construction cannot fail with static config");
-        Self { endpoint, model: None, http }
+        Self { endpoint, model: None, api_key: None, http }
     }
 
     /// Pin this client to one model id. LM Studio validates the id only when
@@ -73,9 +77,33 @@ impl OpenAiClient {
         self.model.as_deref()
     }
 
+    /// Attach an API key: every request carries `Authorization: Bearer`.
+    /// The cloud construction path (M004 `cloud/client.rs`) is the only
+    /// production caller; the loopback LM Studio lanes stay keyless.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Replace the transport client. The cloud construction path injects a
+    /// reqwest client carrying TLS trust/resolve tweaks built with the same
+    /// connect timeout; nothing else should call this.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
     /// Client against the project-default LM Studio endpoint.
     pub fn default_endpoint() -> Self {
         Self::new(DEFAULT_ENDPOINT)
+    }
+
+    /// Apply bearer auth exactly when a key is configured.
+    fn authorize(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.bearer_auth(key),
+            None => rb,
+        }
     }
 
     /// The model ids the endpoint actually serves: GET `{endpoint}/v1/models`
@@ -87,8 +115,7 @@ impl OpenAiClient {
     pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         let url = format!("{}/v1/models", self.endpoint);
         let resp = self
-            .http
-            .get(&url)
+            .authorize(self.http.get(&url))
             .timeout(LIST_MODELS_TIMEOUT)
             .send()
             .await
@@ -143,8 +170,7 @@ impl LlmClient for OpenAiClient {
         );
 
         let resp = self
-            .http
-            .post(&url)
+            .authorize(self.http.post(&url))
             .json(&body)
             .send()
             .await
@@ -277,7 +303,8 @@ impl LlmClient for OpenAiClient {
 
     async fn health(&self) -> LlmHealth {
         let url = format!("{}/v1/models", self.endpoint);
-        let online = match self.http.get(&url).timeout(HEALTH_TIMEOUT).send().await {
+        let online = match self.authorize(self.http.get(&url)).timeout(HEALTH_TIMEOUT).send().await
+        {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
                 log::debug!("llm: health probe failed for {}: {e}", self.endpoint);
@@ -863,6 +890,33 @@ mod tests {
             !body.as_object().unwrap().contains_key("model"),
             "unpinned client must omit the model key entirely: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn api_key_rides_as_bearer_authorization_header() {
+        let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
+        let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
+        let client = OpenAiClient::new(&endpoint).with_api_key("sk-test-bearer-123");
+        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        let raw = captured.lock().unwrap().clone();
+        let headers = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            headers.contains("authorization: bearer sk-test-bearer-123"),
+            "keyed client must send the bearer header"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyless_client_sends_no_authorization_header() {
+        // The loopback LM Studio lanes stay keyless — no stray auth header
+        // may appear on the local wire.
+        let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
+        let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
+        let client = OpenAiClient::new(&endpoint);
+        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        let raw = captured.lock().unwrap().clone();
+        let headers = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(!headers.contains("authorization:"), "keyless client must not send auth");
     }
 
     #[tokio::test]

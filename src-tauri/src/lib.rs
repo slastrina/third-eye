@@ -4,6 +4,8 @@ use tauri::Manager;
 pub mod autostart;
 pub mod capture;
 #[cfg(desktop)]
+pub mod cloud;
+#[cfg(desktop)]
 pub mod config;
 #[cfg(desktop)]
 pub mod hotkey;
@@ -72,6 +74,20 @@ pub fn run() {
     // The detector loop and persisted-toggle apply run from setup().
     #[cfg(desktop)]
     let builder = builder.manage(nudge::NudgeState::new());
+    // Cloud keystore (M004 S02): key bytes live in the OS credential store;
+    // the managed state only ever serializes presence booleans outbound.
+    #[cfg(desktop)]
+    let builder = builder.manage(cloud::commands::CloudKeysState::new());
+    // Cloud opt-in gate (M004 S03): defaults OFF so the local-only default is
+    // untouched; the single guarded construction choke point reads it before
+    // any remote client can exist. Persisted state applied in setup(); the
+    // Settings toggle UX arrives in S04.
+    #[cfg(desktop)]
+    let builder = builder.manage(cloud::optin::CloudOptIn::new());
+    // Heavy-lane cloud provider selection (M004 S04): persisted + readable so
+    // the Settings surface can render the choice; live routing lands in S05.
+    #[cfg(desktop)]
+    let builder = builder.manage(cloud::optin::CloudHeavyProvider::new());
 
     builder
         .manage(overlay::OverlayManager::new())
@@ -113,7 +129,14 @@ pub fn run() {
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
             settings_window::show_settings_window,
-            settings_window::hide_settings_window
+            settings_window::hide_settings_window,
+            cloud::commands::set_cloud_api_key,
+            cloud::commands::delete_cloud_api_key,
+            cloud::commands::cloud_key_status,
+            cloud::optin::set_cloud_optin,
+            cloud::optin::cloud_optin_status,
+            cloud::optin::set_cloud_heavy_provider,
+            cloud::optin::cloud_heavy_provider
         ])
         .setup(|app| {
             // Accessory policy: no Dock icon, and the app can never become
@@ -156,6 +179,19 @@ pub fn run() {
             #[cfg(desktop)]
             nudge::commands::apply_persisted_nudges_enabled(app.handle());
 
+            // Persisted cloud opt-in (M004 S03): a present settings.json key
+            // restores the user's choice; absent keeps the safe default (off).
+            // In-memory only — the construction choke point reads it live.
+            #[cfg(desktop)]
+            cloud::optin::apply_persisted_cloud_opt_in(app.handle());
+
+            // Persisted heavy-lane provider selection (M004 S04): a present
+            // settings.json key restores the choice; absent/garbage keeps the
+            // safe default (unselected). In-memory only — no re-save, nothing
+            // listening yet; S05 wires it into the running heavy lane.
+            #[cfg(desktop)]
+            cloud::optin::apply_persisted_cloud_heavy_provider(app.handle());
+
             // Tray build failure is likewise non-fatal (Q5): the overlay
             // stays reachable via the hotkey and IPC; the cause is logged.
             #[cfg(desktop)]
@@ -167,6 +203,15 @@ pub fn run() {
             // over the THIRD_EYE_* env fallback the router booted with.
             #[cfg(desktop)]
             llm::commands::apply_persisted_lane_models(app.handle());
+
+            // Heavy-lane cloud routing (M004 S05): evaluated AFTER the local
+            // lane pins are settled so the revert path has the right local
+            // fallback, and after the persisted opt-in + provider are restored.
+            // Opt-in on + a provider + a stored key routes the heavy lane to the
+            // guarded cloud client; every other case (the default) leaves it
+            // local. Fail-safe — a build failure logs and stays local.
+            #[cfg(desktop)]
+            cloud::routing::apply_cloud_routing(app.handle());
 
             // Privacy-guard notifier (M003 S03): install the privacy://state
             // emitter on the shared GuardState before the watcher loop

@@ -183,6 +183,37 @@ impl ModelRouter {
         Ok(self.info())
     }
 
+    /// Swap a lane's client verbatim — the M004 S05 cloud-routing seam.
+    /// Unlike [`set_lane_model`](Self::set_lane_model), which rebuilds a local
+    /// [`OpenAiClient`] and re-wraps it in a fresh [`GuardedClient`], this
+    /// injects an already-guarded client (the cloud `Arc<GuardedClient>` that
+    /// `build_cloud_client` produced) *verbatim* — no re-wrap, so the guard the
+    /// caller mounted is exactly the guard on the wire. The lane's `model_id`
+    /// is deliberately left untouched: it is the record of the lane's *local*
+    /// pin, so a later revert can restore it via
+    /// [`set_lane_model`](Self::set_lane_model). Same lock discipline as
+    /// `set_lane_model` — the `lanes` write lock is dropped before returning and
+    /// never held across an await, so in-flight streams finish on the client
+    /// `Arc` they snapshotted at start. Unknown lanes are rejected naming the
+    /// lane and the known set, leaving every lane unchanged. Returns the updated
+    /// routing state on success.
+    pub fn set_lane_client(
+        &self,
+        name: &str,
+        client: Arc<dyn LlmClient>,
+    ) -> Result<ModelInfo, String> {
+        let mut lanes = self.lanes.write().unwrap();
+        let idx = lane_index(&lanes, name)?;
+        lanes[idx].client = client;
+        log::info!(
+            "llm: lane {name} client swap → {} (model pin {} preserved)",
+            lanes[idx].client.endpoint(),
+            lanes[idx].model_label()
+        );
+        drop(lanes);
+        Ok(self.info())
+    }
+
     /// Current routing state as a value (health-as-value pattern).
     pub fn info(&self) -> ModelInfo {
         let lanes = self.lanes.read().unwrap();
@@ -629,6 +660,73 @@ mod tests {
         gate.notify_one();
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome.text, "old-client-reply", "in-flight stream must finish on its snapshot");
+    }
+
+    // --- M004 S05: the cloud-routing injection seam. set_lane_client swaps a
+    // --- lane's already-guarded client verbatim (no re-wrap) and preserves the
+    // --- local model pin so a revert can restore it.
+
+    #[tokio::test]
+    async fn set_lane_client_swaps_the_delegated_client_verbatim() {
+        // The heavy lane starts on a local reply; injecting a new client makes
+        // the *next* heavy request answer with the injected client's tag.
+        let router = thin_heavy_mock();
+        router.set_active(HEAVY_LANE).unwrap();
+        let (before, _) = chat(&router).await;
+        assert_eq!(before.unwrap().text, "heavy-reply");
+
+        router.set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud-reply")).unwrap();
+        let (after, seen) = chat(&router).await;
+        assert_eq!(after.unwrap().text, "cloud-reply", "the injected client must serve the lane");
+        assert_eq!(seen, vec!["cloud-reply"]);
+    }
+
+    #[test]
+    fn set_lane_client_preserves_the_local_model_pin_for_revert() {
+        // The revert contract: model_id is the record of the lane's local pin,
+        // so injecting a cloud client must leave it intact — set_lane_model can
+        // then rebuild the same local model on opt-in-off.
+        let router = thin_heavy_mock();
+        router.set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud")).unwrap();
+        assert_eq!(
+            router.info().lanes[1].model_id.as_deref(),
+            Some("heavy-7b"),
+            "the heavy lane's local model pin must survive a client swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_lane_client_injects_the_clients_own_guard_not_a_re_wrap() {
+        // "Verbatim" proof: inject a GuardedClient carrying its OWN GuardState;
+        // a blocked request must increment THAT guard, never the router's — the
+        // router does not re-wrap the injected client in its own guard.
+        let router_guard = test_guard();
+        let router = ModelRouter::thin_heavy(TEST_NET_1, None, None, router_guard.clone());
+
+        let injected_guard = test_guard();
+        let cloud = OpenAiClient::new(TEST_NET_1);
+        let guarded = GuardedClient::new(Arc::new(cloud), injected_guard.clone());
+        router.set_lane_client(HEAVY_LANE, Arc::new(guarded)).unwrap();
+        router.set_active(HEAVY_LANE).unwrap();
+
+        let err = router.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        assert_eq!(err.kind(), "guard-blocked", "the injected guarded client must still block");
+        assert_eq!(injected_guard.blocked_count(), 1, "the injected client's own guard fired");
+        assert_eq!(router_guard.blocked_count(), 0, "the router did not re-wrap with its guard");
+    }
+
+    #[test]
+    fn set_lane_client_rejects_unknown_lane_leaving_lanes_unchanged() {
+        let router = thin_heavy_mock();
+        let err = router
+            .set_lane_client("turbo", TaggedClient::ok("x"))
+            .err()
+            .expect("unknown lane must be rejected");
+        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
+        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+        let info = router.info();
+        assert_eq!(info.lanes[0].model_id.as_deref(), Some("thin-1b"));
+        assert_eq!(info.lanes[1].model_id.as_deref(), Some("heavy-7b"));
     }
 
     // --- M003 S02 integration proof: the guard is mounted at construction,

@@ -20,10 +20,11 @@ log = "0.4"
 env_logger = "0.11"
 async-trait = "0.1"
 futures-util = "0.3"
-# No default features: the LM Studio endpoint is plain-http on the local
-# network, so no TLS stack is needed. Add a tls feature if S05 ever allows
-# https endpoints.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# native-tls (M004 S03) powers the https cloud providers: SecureTransport on
+# macOS, schannel on Windows (pure Rust over windows-sys — msvc cross-check
+# safe), openssl on Linux (libssl-dev already installed by linux-check.sh).
+# The LM Studio loopback path stays plain-http and never negotiates TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # Encode pipeline (capture/encode.rs): PNG only — no other codecs needed,
 # and the pipeline is unit-tested cross-platform with synthetic pixels.
@@ -39,6 +40,17 @@ url = "2"
 [dev-dependencies]
 # net + io-util power the raw TcpListener mock server in llm tests.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+# MockRuntime + get_ipc_response for the capability-ACL regression test
+# (tests/capability_acl.rs, MEM115). Dev-only: feature unification does not
+# leak `test` into plain `cargo check`/release builds (resolver v2).
+tauri = { version = "2", features = ["test"] }
+
+# TLS-terminating mock HTTPS provider for the S03 cloud-client wire proof
+# (tests/cloud_client_live.rs). Wraps the SAME native-tls already in the tree
+# via reqwest (schannel on the Windows msvc cross-check, SecureTransport on
+# macOS, openssl on Linux) — no new TLS backend, no C/asm dep.
+tokio-native-tls = "0.3"
 
 # SQLite binding for the S02 memory store, split across two target tables per
 # D021 (probe-proven): `bundled` compiles the vendored sqlite3.c with FTS5 on
@@ -61,6 +73,11 @@ tauri-plugin-autostart = "2"
 # Hotkey persistence (settings.json); S07 reuses this store for lane models
 # and privacy mode — desktop only
 tauri-plugin-store = "2"
+# OS credential store for cloud API keys (M004 S02). Default v1 features are
+# the platform trio: macOS Keychain, Windows Credential Manager (windows-sys
+# bindings — no C, msvc cross-check safe), Linux secret-service over zbus
+# (pure Rust — no libdbus apt dep in scripts/linux-check.sh).
+keyring = "4"
 
 # Nonactivating NSPanel conversion — macOS only, git-pinned (v2.1 branch is not on crates.io)
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -8,6 +8,9 @@
 #   src-tauri/src/llm/commands.rs  x1 — the /v1/models probe client (GET-only,
 #                                       carries no user content; allowlisted
 #                                       by the S02 slice plan)
+#   src-tauri/src/cloud/client.rs  x1 — the M004 S03 guarded cloud-client
+#                                       construction choke point, wrapped in
+#                                       GuardedClient at an External endpoint
 #   src-tauri/src/memory/mod.rs    x1 — the single embedder site, wrapped in
 #                                       GuardedEmbedder
 #
@@ -58,7 +61,8 @@ then extend the allowlist above."
 
 echo "== phase 1/3: OpenAiClient::new appears only at guarded choke points =="
 check_allowlist "OpenAiClient::new" \
-"src-tauri/src/llm/commands.rs x1
+"src-tauri/src/cloud/client.rs x1
+src-tauri/src/llm/commands.rs x1
 src-tauri/src/llm/router.rs x4"
 
 echo "== phase 2/3: OpenAiEmbedder::new appears only at the guarded embedder site =="
@@ -71,6 +75,8 @@ echo "== phase 3/3: the guard wraps still exist at the allowlisted sites =="
 # counts alone would not notice — these do.
 [[ $(prod_hits "GuardedClient::new" | grep -c "^src-tauri/src/llm/router.rs:") -ge 2 ]] ||
   fail "router.rs no longer wraps lane clients in GuardedClient::new (need one wrap in thin_heavy and one in set_lane_model)"
+[[ $(prod_hits "GuardedClient::new" | grep -c "^src-tauri/src/cloud/client.rs:") -ge 1 ]] ||
+  fail "cloud/client.rs no longer wraps the cloud client in GuardedClient::new"
 [[ $(prod_hits "GuardedEmbedder::new" | grep -c "^src-tauri/src/memory/mod.rs:") -ge 1 ]] ||
   fail "memory/mod.rs no longer wraps the embedder in GuardedEmbedder::new"
 
