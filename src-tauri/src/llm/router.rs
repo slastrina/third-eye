@@ -18,8 +18,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use serde::Serialize;
 
+use super::guard::{GuardState, GuardedClient};
 use super::openai::OpenAiClient;
-use super::{ChatMessage, LlmClient, LlmError, LlmHealth, StreamOutcome, TokenSink};
+use super::{ChatRequest, LlmClient, LlmError, LlmHealth, StreamOutcome, TokenSink};
 
 /// Lane for quick, low-latency prompts (small model). The default lane.
 pub const THIN_LANE: &str = "thin";
@@ -85,33 +86,55 @@ pub struct ModelRouter {
     /// All lanes target the same LM Studio instance; cached so `endpoint()`
     /// can return a borrow without touching the lock.
     endpoint: String,
+    /// Shared privacy-guard telemetry (M003 S02). `set_lane_model` rebuilds
+    /// lane clients at runtime, so the router must hold the same
+    /// [`GuardState`] its construction path wrapped with — otherwise a re-pin
+    /// would silently produce an unguarded client.
+    guard: Arc<GuardState>,
 }
 
 impl ModelRouter {
     /// Build a router over `lanes`; the first lane is active. Panics on an
     /// empty lane list — a router with nothing to route to is a wiring bug.
+    /// Callers providing pre-built (mock) lanes get a private guard state;
+    /// production goes through [`thin_heavy`](Self::thin_heavy), which wires
+    /// the app-shared one.
     pub fn new(lanes: Vec<Lane>) -> Self {
+        Self::with_guard(lanes, Arc::new(GuardState::new()))
+    }
+
+    /// [`new`](Self::new) with an explicit shared [`GuardState`].
+    pub fn with_guard(lanes: Vec<Lane>, guard: Arc<GuardState>) -> Self {
         assert!(!lanes.is_empty(), "ModelRouter requires at least one lane");
         let endpoint = lanes[0].client.endpoint().to_string();
-        Self { lanes: RwLock::new(lanes), active: RwLock::new(0), endpoint }
+        Self { lanes: RwLock::new(lanes), active: RwLock::new(0), endpoint, guard }
     }
 
     /// The canonical thin/heavy pair against one OpenAI-compatible endpoint.
     /// A lane with `None` sends no `model` field, so a single-model
     /// deployment keeps working with whatever LM Studio has loaded.
+    ///
+    /// This is the production construction choke point (M003 S02): every
+    /// lane client is wrapped in [`GuardedClient`] here, so the active-lane
+    /// path (chat, tool loop) and the [`lane_client`](Self::lane_client) path
+    /// (distillation, nudge classification) can only ever reach guarded
+    /// clients.
     pub fn thin_heavy(
         endpoint: &str,
         thin_model: Option<String>,
         heavy_model: Option<String>,
+        guard: Arc<GuardState>,
     ) -> Self {
         let lane = |name: &str, model: &Option<String>| {
             let client = match model {
                 Some(id) => OpenAiClient::new(endpoint).with_model(id.clone()),
                 None => OpenAiClient::new(endpoint),
             };
-            Lane::new(name, model.clone(), Arc::new(client))
+            let guarded = GuardedClient::new(Arc::new(client), guard.clone());
+            Lane::new(name, model.clone(), Arc::new(guarded))
         };
-        Self::new(vec![lane(THIN_LANE, &thin_model), lane(HEAVY_LANE, &heavy_model)])
+        let lanes = vec![lane(THIN_LANE, &thin_model), lane(HEAVY_LANE, &heavy_model)];
+        Self::with_guard(lanes, guard)
     }
 
     /// Switch the active lane. Unknown lane names are rejected with an error
@@ -150,8 +173,11 @@ impl ModelRouter {
             Some(id) => OpenAiClient::new(&self.endpoint).with_model(id.clone()),
             None => OpenAiClient::new(&self.endpoint),
         };
+        // Rebuilt clients go through the same guard wrap as construction —
+        // a runtime re-pin must never produce an unguarded client.
+        let guarded = GuardedClient::new(Arc::new(client), self.guard.clone());
         lanes[idx].model_id = model;
-        lanes[idx].client = Arc::new(client);
+        lanes[idx].client = Arc::new(guarded);
         log::info!("llm: lane {name} re-pin {old} → {}", lanes[idx].model_label());
         drop(lanes);
         Ok(self.info())
@@ -169,6 +195,24 @@ impl ModelRouter {
                 .map(|l| LaneInfo { name: l.name.clone(), model_id: l.model_id.clone() })
                 .collect(),
         }
+    }
+
+    /// Snapshot a named lane's model label and client regardless of the
+    /// active lane — the S02 ingestion seam: distillation stays pinned to
+    /// the thin lane even while the user chats on heavy. Callers snapshot
+    /// per request, so a runtime re-pin applies to their *next* call, exactly
+    /// like [`set_lane_model`](Self::set_lane_model)'s in-flight semantics.
+    /// Unknown lanes are rejected naming the lane and the known set.
+    pub fn lane_client(&self, name: &str) -> Result<(String, Arc<dyn LlmClient>), String> {
+        let lanes = self.lanes.read().unwrap();
+        let idx = lane_index(&lanes, name)?;
+        Ok((lanes[idx].model_label().to_string(), lanes[idx].client.clone()))
+    }
+
+    /// The shared guard telemetry this router's clients record into — the
+    /// S02→S03 boundary artifact.
+    pub fn guard_state(&self) -> Arc<GuardState> {
+        self.guard.clone()
     }
 
     /// Snapshot the active lane without holding the lock across an await.
@@ -198,7 +242,7 @@ impl LlmClient for ModelRouter {
 
     async fn stream_chat(
         &self,
-        messages: &[ChatMessage],
+        request: &ChatRequest,
         on_token: TokenSink<'_>,
     ) -> Result<StreamOutcome, LlmError> {
         let (lane, model, client) = self.active_lane();
@@ -206,7 +250,7 @@ impl LlmClient for ModelRouter {
             "llm: routing via lane={lane} model={model} endpoint={}",
             client.endpoint()
         );
-        client.stream_chat(messages, on_token).await
+        client.stream_chat(request, on_token).await
     }
 
     async fn health(&self) -> LlmHealth {
@@ -219,7 +263,18 @@ impl LlmClient for ModelRouter {
 mod tests {
     use super::super::openai::test_support::*;
     use super::*;
+    use crate::llm::ChatMessage;
     use std::sync::Mutex;
+
+    fn req(messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest::new(messages)
+    }
+
+    /// Fresh guard telemetry for tests that construct through the production
+    /// choke point.
+    fn test_guard() -> Arc<GuardState> {
+        Arc::new(GuardState::new())
+    }
 
     /// Mock lane client that answers with its tag, so tests can see which
     /// lane a request was delegated to.
@@ -247,14 +302,14 @@ mod tests {
 
         async fn stream_chat(
             &self,
-            _messages: &[ChatMessage],
+            _request: &ChatRequest,
             on_token: TokenSink<'_>,
         ) -> Result<StreamOutcome, LlmError> {
             if let Some(err) = &self.fail_with {
                 return Err(err.clone());
             }
             on_token(self.tag);
-            Ok(StreamOutcome { text: self.tag.into(), token_count: 1 })
+            Ok(StreamOutcome { text: self.tag.into(), token_count: 1, tool_calls: Vec::new() })
         }
 
         async fn health(&self) -> LlmHealth {
@@ -272,7 +327,9 @@ mod tests {
     async fn chat(router: &ModelRouter) -> (Result<StreamOutcome, LlmError>, Vec<String>) {
         let seen = Mutex::new(Vec::new());
         let result = router
-            .stream_chat(&[ChatMessage::user("hi")], &|t| seen.lock().unwrap().push(t.to_string()))
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|t| {
+                seen.lock().unwrap().push(t.to_string())
+            })
             .await;
         (result, seen.into_inner().unwrap())
     }
@@ -385,8 +442,8 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let router =
-            ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), Some("heavy-7b".into()));
-        router.stream_chat(&[ChatMessage::user("quick one")], &|_| {}).await.unwrap();
+            ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), Some("heavy-7b".into()), test_guard());
+        router.stream_chat(&req(vec![ChatMessage::user("quick one")]), &|_| {}).await.unwrap();
         assert_eq!(captured_body_json(&captured)["model"], "thin-1b");
     }
 
@@ -396,15 +453,34 @@ mod tests {
         // outbound JSON has no "model" key at all.
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
-        let router = ModelRouter::thin_heavy(&endpoint, None, None);
-        router.stream_chat(&[ChatMessage::user("hi")], &|_| {}).await.unwrap();
+        let router = ModelRouter::thin_heavy(&endpoint, None, None, test_guard());
+        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
         let body = captured_body_json(&captured);
         assert!(!body.as_object().unwrap().contains_key("model"), "got: {body}");
     }
 
+    #[tokio::test]
+    async fn router_forwards_tools_over_the_wire_unchanged() {
+        // The router is a pass-through for the whole ChatRequest: tool
+        // definitions reach the wire exactly as the caller attached them.
+        let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
+        let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
+        let router = ModelRouter::thin_heavy(&endpoint, None, None, test_guard());
+        let request = req(vec![ChatMessage::user("hi")]).with_tools(vec![
+            crate::llm::ToolDefinition {
+                name: "memory_search".into(),
+                description: "d".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ]);
+        router.stream_chat(&request, &|_| {}).await.unwrap();
+        let body = captured_body_json(&captured);
+        assert_eq!(body["tools"][0]["function"]["name"], "memory_search");
+    }
+
     #[test]
     fn thin_heavy_builds_the_canonical_lane_pair() {
-        let router = ModelRouter::thin_heavy("http://x:1/", Some("a".into()), None);
+        let router = ModelRouter::thin_heavy("http://x:1/", Some("a".into()), None, test_guard());
         let info = router.info();
         assert_eq!(info.active_lane, "thin");
         assert_eq!(info.endpoint, "http://x:1", "endpoint must be normalized");
@@ -425,9 +501,9 @@ mod tests {
         // on that lane carries the new "model" key.
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
-        let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None);
+        let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None, test_guard());
         router.set_lane_model(THIN_LANE, Some("qwen2.5-14b".into())).unwrap();
-        router.stream_chat(&[ChatMessage::user("hi")], &|_| {}).await.unwrap();
+        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
         assert_eq!(captured_body_json(&captured)["model"], "qwen2.5-14b");
     }
 
@@ -437,9 +513,9 @@ mod tests {
         // at all, so a single-model LM Studio serves whatever it has loaded.
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
-        let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None);
+        let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None, test_guard());
         router.set_lane_model(THIN_LANE, None).unwrap();
-        router.stream_chat(&[ChatMessage::user("hi")], &|_| {}).await.unwrap();
+        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
         let body = captured_body_json(&captured);
         assert!(!body.as_object().unwrap().contains_key("model"), "got: {body}");
     }
@@ -467,6 +543,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lane_client_returns_the_named_lane_regardless_of_active() {
+        // The S02 ingestion contract: distillation pins the thin lane even
+        // while the user chats on heavy.
+        let router = thin_heavy_mock();
+        router.set_active(HEAVY_LANE).unwrap();
+        let (model, client) = router.lane_client(THIN_LANE).unwrap();
+        assert_eq!(model, "thin-1b");
+        let seen = Mutex::new(Vec::new());
+        let outcome = client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|t| {
+                seen.lock().unwrap().push(t.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "thin-reply");
+        assert_eq!(*seen.lock().unwrap(), vec!["thin-reply"]);
+    }
+
+    #[test]
+    fn lane_client_labels_an_unpinned_lane_default() {
+        let router = ModelRouter::new(vec![Lane::new(THIN_LANE, None, TaggedClient::ok("t"))]);
+        let (model, _) = router.lane_client(THIN_LANE).unwrap();
+        assert_eq!(model, "default");
+    }
+
+    #[test]
+    fn lane_client_rejects_unknown_lane_naming_known_set() {
+        let router = thin_heavy_mock();
+        let err = router.lane_client("turbo").err().expect("unknown lane must be rejected");
+        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
+        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+    }
+
+    #[tokio::test]
     async fn in_flight_stream_is_unaffected_by_a_concurrent_repin() {
         // A stream snapshots its client Arc at start; re-pinning the lane
         // mid-stream must not touch it. The gated mock blocks until released,
@@ -483,12 +593,16 @@ mod tests {
 
             async fn stream_chat(
                 &self,
-                _messages: &[ChatMessage],
+                _request: &ChatRequest,
                 on_token: TokenSink<'_>,
             ) -> Result<StreamOutcome, LlmError> {
                 self.gate.notified().await;
                 on_token("old-client-reply");
-                Ok(StreamOutcome { text: "old-client-reply".into(), token_count: 1 })
+                Ok(StreamOutcome {
+                    text: "old-client-reply".into(),
+                    token_count: 1,
+                    tool_calls: Vec::new(),
+                })
             }
 
             async fn health(&self) -> LlmHealth {
@@ -505,7 +619,7 @@ mod tests {
 
         let stream_router = router.clone();
         let handle = tokio::spawn(async move {
-            stream_router.stream_chat(&[ChatMessage::user("hi")], &|_| {}).await
+            stream_router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await
         });
         tokio::task::yield_now().await;
 
@@ -515,5 +629,93 @@ mod tests {
         gate.notify_one();
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome.text, "old-client-reply", "in-flight stream must finish on its snapshot");
+    }
+
+    // --- M003 S02 integration proof: the guard is mounted at construction,
+    // --- so every call path a consumer can reach is guarded.
+
+    /// TEST-NET-1 (RFC 5737): reserved documentation address — nothing can
+    /// listen there, so an actual connect attempt surfaces as `offline`.
+    const TEST_NET_1: &str = "http://192.0.2.1:9";
+
+    /// A request the guard must refuse on an external endpoint: the pinned
+    /// Low-confidence redaction condition (Luhn-failing digits beside card
+    /// context, see privacy::mod tests).
+    fn low_confidence_req() -> ChatRequest {
+        req(vec![ChatMessage::user("credit card: 4111 1111 1111 1112")])
+    }
+
+    #[tokio::test]
+    async fn guarded_router_blocks_external_on_active_lane_path() {
+        // The chat/tool-loop path: stream_chat on the router itself.
+        let guard = test_guard();
+        let router = ModelRouter::thin_heavy(TEST_NET_1, None, None, guard.clone());
+        let err = router.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "guard-blocked",
+            "guarded path must block before connect; offline would mean a connect was attempted"
+        );
+        assert_eq!(err.endpoint(), TEST_NET_1);
+        assert_eq!(guard.blocked_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_router_blocks_external_on_lane_client_path() {
+        // The distillation/nudge path: lane_client hands back the inner
+        // per-lane client — which must already be the guarded one.
+        let guard = test_guard();
+        let router =
+            ModelRouter::thin_heavy(TEST_NET_1, Some("thin-test".into()), None, guard.clone());
+        let (_, client) = router.lane_client(THIN_LANE).unwrap();
+        let err = client.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        assert_eq!(err.kind(), "guard-blocked");
+        assert_eq!(guard.blocked_count(), 1);
+        assert_eq!(
+            guard.last_error().unwrap().kind(),
+            "guard-blocked",
+            "the shared GuardState must have recorded the lane_client block"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_router_blocks_attachments_after_runtime_repin() {
+        // set_lane_model rebuilds the lane client — the rebuilt client must
+        // be guarded too, or a re-pin would reopen the pipe.
+        let guard = test_guard();
+        let router = ModelRouter::thin_heavy(TEST_NET_1, None, None, guard.clone());
+        router.set_lane_model(THIN_LANE, Some("repinned".into())).unwrap();
+        let request = req(vec![ChatMessage::user("look at this")
+            .with_attachments(vec![crate::llm::Attachment { base64_png: "QUJD".into() }])]);
+        let err = router.stream_chat(&request, &|_| {}).await.unwrap_err();
+        assert_eq!(err.kind(), "guard-blocked");
+        assert_eq!(guard.blocked_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unguarded_client_against_test_net_returns_offline_not_guard_blocked() {
+        // The kind difference is the proof: an unguarded client actually
+        // attempts the connect (offline after the connect timeout), while the
+        // guarded paths above return guard-blocked without ever connecting.
+        let client = OpenAiClient::new(TEST_NET_1);
+        let err = client.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        assert_eq!(err.kind(), "offline");
+    }
+
+    #[tokio::test]
+    async fn guarded_router_loopback_wire_body_is_byte_identical() {
+        // Loopback pass-through end-to-end through the mounted guard: a
+        // secret-carrying message reaches the capture server unredacted,
+        // exactly as today (the existing wire tests above prove shape; this
+        // one pins content through the guard specifically).
+        let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
+        let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
+        let router = ModelRouter::thin_heavy(&endpoint, None, None, test_guard());
+        router
+            .stream_chat(&req(vec![ChatMessage::user("password: hunter2")]), &|_| {})
+            .await
+            .unwrap();
+        let body = captured_body_json(&captured);
+        assert_eq!(body["messages"][0]["content"], "password: hunter2");
     }
 }

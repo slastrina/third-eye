@@ -8,10 +8,18 @@ pub mod config;
 #[cfg(desktop)]
 pub mod hotkey;
 pub mod llm;
+#[cfg(desktop)]
+pub mod memory;
+#[cfg(desktop)]
+pub mod nudge;
+pub mod ocr;
 pub mod overlay;
+pub mod privacy;
 pub mod settings_window;
 #[cfg(desktop)]
 pub mod tray;
+#[cfg(desktop)]
+pub mod watcher;
 
 /// Label of the pre-existing overlay window declared in tauri.conf.json.
 /// The window is created hidden at launch so summoning it later (T02/T03)
@@ -21,6 +29,11 @@ pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+
+    // Privacy-guard telemetry (M003 S02): one shared GuardState behind every
+    // guarded lane client and the guarded embedder, incremented by the
+    // watcher's redaction site, and managed so S03's IPC surface can read it.
+    let guard = std::sync::Arc::new(llm::guard::GuardState::new());
 
     let builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
@@ -44,10 +57,26 @@ pub fn run() {
     // rebind survives restart; S07 adds lane models and privacy mode.
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_store::Builder::default().build());
+    // Continuous watcher (M002 S01): one shared toggle/status core serving
+    // the tray check item (T04) and the set_watcher_enabled IPC; the loop
+    // task reads it every tick. Persisted state applied in setup().
+    #[cfg(desktop)]
+    let builder = builder.manage(watcher::WatcherState::new());
+    // Memory core (M002 S02): one managed state holding the store handle
+    // (installed in setup() once the app data dir is known) and the
+    // ingestion status surface — memory_status and the ingest loop share it.
+    #[cfg(desktop)]
+    let builder = builder.manage(memory::MemoryState::new(guard.clone()));
+    // Nudge core (M002 S05): managed before any command or the hotkey
+    // handler can run — the nudge-aware toggle reads it on every press.
+    // The detector loop and persisted-toggle apply run from setup().
+    #[cfg(desktop)]
+    let builder = builder.manage(nudge::NudgeState::new());
 
     builder
         .manage(overlay::OverlayManager::new())
-        .manage(llm::commands::LlmState::with_default_endpoint())
+        .manage(guard.clone())
+        .manage(llm::commands::LlmState::with_default_endpoint(guard))
         .manage(capture::commands::CaptureState::with_platform_backend())
         // Privacy mode (S07): one shared toggle core serving the tray check
         // item and the set_privacy_mode IPC; persisted state applied in
@@ -67,11 +96,22 @@ pub fn run() {
             llm::commands::set_lane_model,
             llm::commands::list_models,
             llm::commands::model_info,
+            llm::commands::guard_status,
             capture::commands::capture_screen,
             capture::commands::capture_permission_status,
             capture::commands::open_capture_settings,
             capture::commands::set_privacy_mode,
             capture::commands::privacy_status,
+            watcher::commands::set_watcher_enabled,
+            watcher::commands::watcher_status,
+            memory::commands::memory_search,
+            memory::commands::memory_list,
+            memory::commands::memory_update,
+            memory::commands::memory_delete,
+            memory::commands::memory_wipe,
+            memory::commands::memory_status,
+            nudge::commands::set_nudges_enabled,
+            nudge::commands::nudge_status,
             settings_window::show_settings_window,
             settings_window::hide_settings_window
         ])
@@ -104,6 +144,18 @@ pub fn run() {
             #[cfg(desktop)]
             capture::commands::apply_persisted_privacy_mode(app.handle());
 
+            // Persisted watcher toggle (S01) follows the same contract:
+            // applied after privacy (the loop's gating input), before the
+            // tray builds so the T04 check item reflects it.
+            #[cfg(desktop)]
+            watcher::commands::apply_persisted_watcher_enabled(app.handle());
+
+            // Persisted nudges toggle (S05, D019): same in-memory-only
+            // startup contract, applied before the detector spawns so its
+            // first round already sees the user's choice.
+            #[cfg(desktop)]
+            nudge::commands::apply_persisted_nudges_enabled(app.handle());
+
             // Tray build failure is likewise non-fatal (Q5): the overlay
             // stays reachable via the hotkey and IPC; the cause is logged.
             #[cfg(desktop)]
@@ -115,6 +167,36 @@ pub fn run() {
             // over the THIRD_EYE_* env fallback the router booted with.
             #[cfg(desktop)]
             llm::commands::apply_persisted_lane_models(app.handle());
+
+            // Privacy-guard notifier (M003 S03): install the privacy://state
+            // emitter on the shared GuardState before the watcher loop
+            // spawns, so every mutation site — guarded forward, guard block,
+            // watcher redaction — broadcasts from its first occurrence.
+            llm::commands::install_guard_notifier(app.handle());
+
+            // The watcher loop runs for the app's lifetime; the toggle
+            // changes what a tick does, not whether the task exists. Spawned
+            // after the tray so watching-state animation (T04) has its
+            // target from the first tick.
+            #[cfg(desktop)]
+            watcher::spawn_loop(app.handle().clone());
+
+            // Memory ingestion (S02): opens app_data_dir/memory.db and
+            // consumes the watcher's observation broadcast, distilling
+            // batches via the thin lane. Spawned right after the watcher
+            // loop; any observation published before the subscription is
+            // live is missed by design (worthless to replay) and every
+            // failure path disables ingestion visibly, never fatally.
+            #[cfg(desktop)]
+            memory::ingest::spawn(app.handle());
+
+            // Nudge detector (S05): the observation broadcast's second
+            // consumer. Batches on a fixed interval, classifies via the
+            // thin lane behind the pure gate, and shows the click-through
+            // idle nudge — every failure path logs and waits for the next
+            // round, never fatal.
+            #[cfg(desktop)]
+            nudge::spawn(app.handle());
 
             log::debug!(
                 "overlay window ready (hidden at launch, visible={:?})",

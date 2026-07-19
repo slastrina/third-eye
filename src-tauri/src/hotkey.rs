@@ -88,10 +88,15 @@ impl HotkeyState {
 }
 
 /// Pure toggle decision: a hotkey press summons a hidden overlay and
-/// dismisses a visible one (idle or focused).
-pub fn toggle_event(current: OverlayState) -> OverlayEvent {
+/// dismisses a visible one (idle or focused) — with one nudge-aware row
+/// (S05): pressing the hotkey while a nudge is parked in `visible-idle`
+/// summons chat (`Focus`) instead of dismissing the banner, so a nudge is
+/// always one keystroke from a grounded conversation. `nudge_active` in any
+/// other state changes nothing.
+pub fn toggle_event(current: OverlayState, nudge_active: bool) -> OverlayEvent {
     match current {
         OverlayState::Hidden => OverlayEvent::Show,
+        OverlayState::VisibleIdle if nudge_active => OverlayEvent::Focus,
         OverlayState::VisibleIdle | OverlayState::VisibleFocused => OverlayEvent::Hide,
     }
 }
@@ -261,7 +266,8 @@ pub fn rebind(app: &AppHandle, state: &HotkeyState, new: &str) -> HotkeyStatus {
 fn on_hotkey_pressed(app: &AppHandle) {
     let pressed_at = Instant::now();
     let current = app.state::<OverlayManager>().current();
-    match toggle_event(current) {
+    let nudge_active = app.state::<crate::nudge::NudgeState>().nudge_active();
+    match toggle_event(current, nudge_active) {
         // Summon chains Show then Focus: visible-idle is click-through, so an
         // overlay left there can never be clicked into focus (clicks fall to
         // the desktop). The hotkey must land in visible-focused — clickable,
@@ -279,14 +285,41 @@ fn on_hotkey_pressed(app: &AppHandle) {
             }
         }
         OverlayEvent::Hide => match overlay::hide_overlay(app.clone()) {
-            Ok(state) => log::info!(
-                "hotkey: dismissed overlay in {:.2}ms (state={})",
-                pressed_at.elapsed().as_secs_f64() * 1000.0,
-                state.as_str()
-            ),
+            Ok(state) => {
+                // A stale active nudge (visible-focused row) goes down with
+                // the window — reason `hidden`, so the frontend banner state
+                // never survives a dismissed overlay.
+                crate::nudge::commands::dismiss_active(app, crate::nudge::DismissReason::Hidden);
+                log::info!(
+                    "hotkey: dismissed overlay in {:.2}ms (state={})",
+                    pressed_at.elapsed().as_secs_f64() * 1000.0,
+                    state.as_str()
+                );
+            }
             Err(e) => log::error!("hotkey: dismiss failed: {e}"),
         },
-        OverlayEvent::Focus => unreachable!("toggle_event never yields Focus"),
+        // Summon-from-nudge (S05): the window is already visible-idle with
+        // a parked nudge, so only the Focus transition runs — clickable,
+        // panel key, input ready, banner yields to chat in the frontend.
+        OverlayEvent::Focus => match overlay::focus_overlay(app.clone()) {
+            Ok(state) => {
+                // The banner yields to chat: clear the summoned nudge and
+                // broadcast `nudge://dismiss` (reason `summoned`) — the
+                // frontend swaps the banner for chat preloaded from the
+                // retained `nudge://show` payload (no new IPC, R005/D019).
+                crate::nudge::commands::dismiss_active(
+                    app,
+                    crate::nudge::DismissReason::Summoned,
+                );
+                log::info!(
+                    "hotkey: summon-from-nudge latency: {:.2}ms (hotkey-press to input-ready, \
+                     state={})",
+                    pressed_at.elapsed().as_secs_f64() * 1000.0,
+                    state.as_str()
+                );
+            }
+            Err(e) => log::error!("hotkey: summon-from-nudge failed: {e}"),
+        },
     }
 }
 
@@ -316,14 +349,16 @@ mod tests {
 
     #[test]
     fn hotkey_summons_when_hidden() {
-        assert_eq!(toggle_event(Hidden), OverlayEvent::Show);
+        assert_eq!(toggle_event(Hidden, false), OverlayEvent::Show);
+        // An active-nudge flag while hidden is stale state; summon anyway.
+        assert_eq!(toggle_event(Hidden, true), OverlayEvent::Show);
     }
 
     #[test]
     fn summon_chain_lands_in_visible_focused() {
         // The handler chains Show → Focus; both transitions must be valid and
         // end in the only state that accepts clicks and typing.
-        let s = Hidden.apply(toggle_event(Hidden)).unwrap();
+        let s = Hidden.apply(toggle_event(Hidden, false)).unwrap();
         let s = s.apply(OverlayEvent::Focus).unwrap();
         assert_eq!(s, VisibleFocused);
         assert!(!crate::overlay::click_through(s));
@@ -331,8 +366,25 @@ mod tests {
 
     #[test]
     fn hotkey_dismisses_when_visible_idle_or_focused() {
-        assert_eq!(toggle_event(VisibleIdle), OverlayEvent::Hide);
-        assert_eq!(toggle_event(VisibleFocused), OverlayEvent::Hide);
+        assert_eq!(toggle_event(VisibleIdle, false), OverlayEvent::Hide);
+        assert_eq!(toggle_event(VisibleFocused, false), OverlayEvent::Hide);
+    }
+
+    #[test]
+    fn hotkey_summons_instead_of_dismissing_when_a_nudge_is_parked() {
+        // The S05 row: visible-idle + active nudge → Focus, and the
+        // transition lands in the clickable chat state.
+        assert_eq!(toggle_event(VisibleIdle, true), OverlayEvent::Focus);
+        let s = VisibleIdle.apply(toggle_event(VisibleIdle, true)).unwrap();
+        assert_eq!(s, VisibleFocused);
+        assert!(!crate::overlay::click_through(s));
+    }
+
+    #[test]
+    fn active_nudge_never_shields_a_focused_chat_from_dismiss() {
+        // A stale active-nudge flag must not make the hotkey a no-op-ish
+        // Focus in visible-focused — dismissing an open chat always works.
+        assert_eq!(toggle_event(VisibleFocused, true), OverlayEvent::Hide);
     }
 
     #[test]
@@ -340,7 +392,12 @@ mod tests {
         // The toggle decision must never produce an event the state machine
         // rejects — otherwise a hotkey press could be silently dropped.
         for state in [Hidden, VisibleIdle, VisibleFocused] {
-            assert!(state.apply(toggle_event(state)).is_ok(), "from {state:?}");
+            for nudge_active in [false, true] {
+                assert!(
+                    state.apply(toggle_event(state, nudge_active)).is_ok(),
+                    "from {state:?} (nudge_active={nudge_active})"
+                );
+            }
         }
     }
 

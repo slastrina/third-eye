@@ -12,6 +12,14 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export const TOKEN_EVENT = "llm://token";
 export const DONE_EVENT = "llm://done";
 export const ERROR_EVENT = "llm://error";
+/** Tool-phase events (S03): emitted by the backend dispatch loop when the
+ *  model requests a tool and when its execution settles. These drive the
+ *  memory-consulted indicator — the UI-facing observability surface. Keep in
+ *  sync with TOOL_CALL_EVENT/TOOL_RESULT_EVENT in src-tauri/src/llm/toolloop.rs. */
+export const TOOL_CALL_EVENT = "llm://tool-call";
+export const TOOL_RESULT_EVENT = "llm://tool-result";
+/** The one tool S03 ships; results under this name flip the indicator. */
+export const MEMORY_SEARCH_TOOL = "memory_search";
 /** Routing-state broadcast (S07): mutation responses only reach the calling
  *  window, so the backend emits the updated ModelInfo app-wide after every
  *  successful set_model / set_lane_model. The overlay consumes this to stay
@@ -48,15 +56,57 @@ export interface DonePayload {
   totalMs: number;
 }
 
-/** Kind-tagged error JSON — the serde serialization of Rust's LlmError. */
+/** Kind-tagged error JSON — the serde serialization of Rust's LlmError.
+ *  "tools-unsupported" is a 4xx rejection of a tools-carrying request whose
+ *  body names tools: the loaded model can't call tools, distinct from
+ *  "no-model" so the banner can say so instead of "no model loaded".
+ *  "guard-blocked" is the privacy guard refusing to send a request to a
+ *  non-loopback endpoint (R016 fail closed): it carries a kebab-case
+ *  machine-readable `reason` instead of free-text `detail` — never any
+ *  request text. */
 export type LlmError =
   | { kind: "offline"; endpoint: string; detail: string }
   | { kind: "no-model"; endpoint: string; detail: string }
-  | { kind: "interrupted"; endpoint: string; partialText: string; detail: string };
+  | { kind: "tools-unsupported"; endpoint: string; detail: string }
+  | { kind: "interrupted"; endpoint: string; partialText: string; detail: string }
+  | { kind: "guard-blocked"; endpoint: string; reason: string };
 
 export interface ErrorPayload {
   requestId: number;
   error: LlmError;
+}
+
+/** One complete tool call the model requested — the serde camelCase
+ *  serialization of Rust's ToolCall. `arguments` is the raw JSON string
+ *  exactly as the model produced it. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** How a memory search ranked its results (S02 degrade contract). */
+export type SearchMode = "semantic" | "keyword";
+
+/** llm://tool-call payload: a model-requested call about to execute. */
+export interface ToolCallPayload {
+  requestId: number;
+  round: number;
+  call: ToolCall;
+}
+
+/** llm://tool-result payload: one executed call's outcome. `ok: false`
+ *  carries the typed failure kind; a successful memory search carries its
+ *  result count and ranking mode. */
+export interface ToolResultPayload {
+  requestId: number;
+  round: number;
+  callId: string;
+  name: string;
+  ok: boolean;
+  resultCount: number | null;
+  mode: SearchMode | null;
+  failure: string | null;
 }
 
 export interface LlmHealth {
@@ -117,6 +167,14 @@ export function onLlmDone(cb: (payload: DonePayload) => void): Promise<UnlistenF
 
 export function onLlmError(cb: (payload: ErrorPayload) => void): Promise<UnlistenFn> {
   return listen<ErrorPayload>(ERROR_EVENT, (e) => cb(e.payload));
+}
+
+export function onLlmToolCall(cb: (payload: ToolCallPayload) => void): Promise<UnlistenFn> {
+  return listen<ToolCallPayload>(TOOL_CALL_EVENT, (e) => cb(e.payload));
+}
+
+export function onLlmToolResult(cb: (payload: ToolResultPayload) => void): Promise<UnlistenFn> {
+  return listen<ToolResultPayload>(TOOL_RESULT_EVENT, (e) => cb(e.payload));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,10 +261,94 @@ export function toCaptureFlowError(err: unknown): CaptureFlowError {
 }
 
 // ---------------------------------------------------------------------------
+// Nudge IPC (S05) — contract defined in src-tauri/src/nudge
+// ---------------------------------------------------------------------------
+
+/** Nudge lifecycle events. Keep in sync with SHOW_EVENT/DISMISS_EVENT/
+ *  STATE_EVENT in src-tauri/src/nudge/mod.rs (pinned by a Rust test). */
+export const NUDGE_SHOW_EVENT = "nudge://show";
+export const NUDGE_DISMISS_EVENT = "nudge://dismiss";
+export const NUDGE_STATE_EVENT = "nudge://state";
+
+/** The `nudge://show` payload — the serde camelCase serialization of Rust's
+ *  NudgePayload. Pixel-free by construction: text, app context, timestamps,
+ *  and memory-context strings only. */
+export interface NudgePayload {
+  /** Always "nudge" today; lets the UI switch on kind if later slices add
+   *  more overlay callouts. */
+  kind: string;
+  /** The one-line banner message from the classifier. */
+  message: string;
+  /** Text of the triggering observation — the screen context a
+   *  summon-from-nudge chat is grounded in. */
+  screenText: string;
+  appContext: string | null;
+  capturedAtMs: number;
+  /** Relevant memory summaries fetched at classification time; empty when
+   *  the memory search degraded. */
+  memoryContext: string[];
+}
+
+/** Why the active nudge went away — the `nudge://dismiss` payload (Rust's
+ *  DismissReason, kebab-case). "summoned" is the one that stages the chat
+ *  context preload. */
+export type NudgeDismissReason = "auto-timeout" | "summoned" | "disabled" | "hidden";
+
+/** Per-reason suppression counters riding NudgeStatus (observability: "why
+ *  has it never nudged me" is answerable from status alone). */
+export interface NudgeSuppressedCounts {
+  disabled: number;
+  overlayVisible: number;
+  coolingDown: number;
+  emptyBatch: number;
+}
+
+/** The `nudge_status` / `nudge://state` shape — health-as-value, never an
+ *  IPC error; persist failures and classification errors ride the fields. */
+export interface NudgeStatus {
+  enabled: boolean;
+  active: boolean;
+  lastNudgeAtMs: number | null;
+  lastError: LlmError | null;
+  suppressed: NudgeSuppressedCounts;
+  persistError: string | null;
+}
+
+/** Current nudge state (health-as-value, like `watcher_status`). */
+export function nudgeStatus(): Promise<NudgeStatus> {
+  return invoke<NudgeStatus>("nudge_status");
+}
+
+/** Set the nudges toggle. Never rejects backend-side — a persist failure
+ *  rides `persistError` on the returned authoritative status. */
+export function setNudgesEnabled(enable: boolean): Promise<NudgeStatus> {
+  return invoke<NudgeStatus>("set_nudges_enabled", { enable });
+}
+
+export function onNudgeShow(cb: (payload: NudgePayload) => void): Promise<UnlistenFn> {
+  return listen<NudgePayload>(NUDGE_SHOW_EVENT, (e) => cb(e.payload));
+}
+
+export function onNudgeDismiss(cb: (reason: NudgeDismissReason) => void): Promise<UnlistenFn> {
+  return listen<NudgeDismissReason>(NUDGE_DISMISS_EVENT, (e) => cb(e.payload));
+}
+
+/** Subscribe to the app-wide nudge status broadcast (`nudge://state`). */
+export function onNudgeState(cb: (status: NudgeStatus) => void): Promise<UnlistenFn> {
+  return listen<NudgeStatus>(NUDGE_STATE_EVENT, (e) => cb(e.payload));
+}
+
+// ---------------------------------------------------------------------------
 // Chat state machine (pure)
 // ---------------------------------------------------------------------------
 
 export type AssistantStatus = "streaming" | "done" | "interrupted";
+
+/** Memory-consulted lifecycle on an assistant answer (S03): "searching"
+ *  while a requested memory_search executes, "consulted" once a successful
+ *  result landed. A failed search clears back to undefined — the model still
+ *  answers, but the answer is not memory-grounded and must not claim so. */
+export type MemoryPhase = "searching" | "consulted";
 
 export interface UiMessage {
   role: "user" | "assistant";
@@ -215,6 +357,8 @@ export interface UiMessage {
   status: AssistantStatus;
   /** True when a screen attachment rode this user turn (renders the chip). */
   attached?: boolean;
+  /** Assistant only: memory_search tool phase (renders the indicator). */
+  memory?: MemoryPhase;
 }
 
 /** A typed backend error, or an IPC-level failure where the chat invoke
@@ -255,6 +399,13 @@ export interface ChatState {
    *  mount-time `privacy_status` query and the `capture://privacy` broadcast
    *  (null forever outside a Tauri runtime). */
   privacy: PrivacyStatus | null;
+  /** The nudge currently parked on the idle overlay (drives the edge
+   *  banner); null when none is showing. */
+  nudge: NudgePayload | null;
+  /** Context staged by a summon-from-nudge (`nudge://dismiss` reason
+   *  "summoned"): grounds the next submit via a prepended system message,
+   *  then clears — consume-once, like the screen attachment. */
+  nudgePreload: NudgePayload | null;
 }
 
 export const initialChatState: ChatState = {
@@ -270,12 +421,16 @@ export const initialChatState: ChatState = {
   captureError: null,
   capturePermission: null,
   privacy: null,
+  nudge: null,
+  nudgePreload: null,
 };
 
 export type LlmEvent =
   | { type: "token"; payload: TokenPayload }
   | { type: "done"; payload: DonePayload }
-  | { type: "error"; payload: ErrorPayload };
+  | { type: "error"; payload: ErrorPayload }
+  | { type: "tool-call"; payload: ToolCallPayload }
+  | { type: "tool-result"; payload: ToolResultPayload };
 
 export type ChatAction =
   | { type: "submit"; question: string; retry?: boolean }
@@ -289,6 +444,8 @@ export type ChatAction =
   | { type: "attach-clear" }
   | { type: "capture-permission"; permission: CapturePermission }
   | { type: "privacy"; status: PrivacyStatus }
+  | { type: "nudge-shown"; payload: NudgePayload }
+  | { type: "nudge-dismissed"; reason: NudgeDismissReason }
   | LlmEvent;
 
 function withLastAssistant(
@@ -298,6 +455,13 @@ function withLastAssistant(
   const idx = messages.length - 1;
   if (idx < 0 || messages[idx].role !== "assistant") return messages;
   return [...messages.slice(0, idx), update(messages[idx])];
+}
+
+/** A "searching" phase on a settling answer means the result never landed
+ *  (stream died or ended mid-dispatch) — clear it rather than leave a live
+ *  "searching memory" claim on a finished message. "consulted" survives. */
+function settleMemoryPhase(memory: MemoryPhase | undefined): MemoryPhase | undefined {
+  return memory === "searching" ? undefined : memory;
 }
 
 /** An offline/no-model error arrives before any token, so the streaming
@@ -310,7 +474,9 @@ function settleStreamingTail(messages: UiMessage[]): UiMessage[] {
     return messages.slice(0, -1);
   }
   return withLastAssistant(messages, (m) =>
-    m.status === "streaming" ? { ...m, status: "interrupted" } : m,
+    m.status === "streaming"
+      ? { ...m, status: "interrupted", memory: settleMemoryPhase(m.memory) }
+      : m,
   );
 }
 
@@ -325,16 +491,36 @@ export function stripFailedTail(messages: UiMessage[]): UiMessage[] {
   return messages.slice(0, end);
 }
 
+/** The prepended system message grounding a summon-from-nudge chat in the
+ *  triggering screen context and the memories fetched at classification
+ *  time (no new IPC on the hotkey path — everything rode `nudge://show`). */
+export function nudgeContextMessage(payload: NudgePayload): ChatMessage {
+  const parts = [
+    `The user pressed the hotkey on a proactive nudge: "${payload.message}". ` +
+      "Ground your answers in the screen context below.",
+    `Screen text at the time${payload.appContext ? ` (frontmost app: ${payload.appContext})` : ""}:\n${payload.screenText}`,
+  ];
+  if (payload.memoryContext.length > 0) {
+    parts.push(
+      `Relevant stored memories:\n${payload.memoryContext.map((m) => `- ${m}`).join("\n")}`,
+    );
+  }
+  return { role: "system", content: parts.join("\n\n") };
+}
+
 /** Build the wire history for a new question from completed turns only —
  *  interrupted partials and the streaming placeholder are excluded. Only the
  *  outgoing turn carries attachments: past screenshots are not resent as
- *  history (the answer they grounded already is), keeping requests small. */
+ *  history (the answer they grounded already is), keeping requests small.
+ *  A staged nudge preload prepends its system context message. */
 export function composeMessages(
   messages: UiMessage[],
   question: string,
   attachments: Attachment[] = [],
+  preload: NudgePayload | null = null,
 ): ChatMessage[] {
   const history: ChatMessage[] = [];
+  if (preload) history.push(nudgeContextMessage(preload));
   for (const m of messages) {
     if (m.role === "user") history.push({ role: "user", content: m.text });
     else if (m.status === "done") history.push({ role: "assistant", content: m.text });
@@ -352,7 +538,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       // mirror that by settling a still-streaming answer as interrupted.
       const base = action.retry ? stripFailedTail(state.messages) : state.messages;
       const settled = withLastAssistant(base, (m) =>
-        m.status === "streaming" ? { ...m, status: "interrupted" } : m,
+        m.status === "streaming"
+          ? { ...m, status: "interrupted", memory: settleMemoryPhase(m.memory) }
+          : m,
       );
       return {
         messages: [
@@ -375,6 +563,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         captureError: null,
         capturePermission: state.capturePermission,
         privacy: state.privacy,
+        nudge: state.nudge,
+        // The preload grounds exactly this submit (App.tsx read it into the
+        // composed history before dispatching) — consumed here so it can
+        // never ride a later, unrelated question.
+        nudgePreload: null,
       };
     }
     case "request-started": {
@@ -413,6 +606,32 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         })),
       };
     }
+    case "tool-call": {
+      // Same stale-filtering and pre-resolve buffering as tokens: a tool
+      // phase from an aborted predecessor must not touch the active answer.
+      if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
+      if (action.payload.requestId !== state.requestId) return state; // stale
+      if (action.payload.call.name !== MEMORY_SEARCH_TOOL) return state;
+      return {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({ ...m, memory: "searching" })),
+      };
+    }
+    case "tool-result": {
+      if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
+      if (action.payload.requestId !== state.requestId) return state; // stale
+      if (action.payload.name !== MEMORY_SEARCH_TOOL) return state;
+      return {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({
+          ...m,
+          // A failed search clears "searching" without claiming consultation
+          // (the model still answers, ungrounded). It never downgrades a
+          // "consulted" earned by an earlier successful round.
+          memory: action.payload.ok ? "consulted" : settleMemoryPhase(m.memory),
+        })),
+      };
+    }
     case "done": {
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state;
@@ -425,6 +644,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           // frame-coalesced tail still buffered UI-side.
           text: action.payload.text,
           status: "done",
+          memory: settleMemoryPhase(m.memory),
         })),
       };
     }
@@ -439,6 +659,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
               // Preserve everything streamed before the drop (R006).
               text: error.partialText || m.text,
               status: "interrupted",
+              memory: settleMemoryPhase(m.memory),
             }))
           : settleStreamingTail(state.messages);
       return { ...state, requestId: null, messages, banner: { error, online: false } };
@@ -470,6 +691,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       // Both the mount-time query and every capture://privacy broadcast land
       // here — the backend's status is authoritative (cross-window sync).
       return { ...state, privacy: action.status };
+    case "nudge-shown":
+      // A new nudge supersedes any stale unconsumed preload: the context the
+      // next summon should ground in is this one's.
+      return { ...state, nudge: action.payload, nudgePreload: null };
+    case "nudge-dismissed": {
+      // The backend only emits nudge://dismiss when a nudge was actually
+      // cleared, but guard anyway — a dismiss with nothing showing is a no-op
+      // so it can't wipe a preload staged by an earlier summon.
+      if (state.nudge === null) return state;
+      return {
+        ...state,
+        nudge: null,
+        // "summoned" hands the banner's context to the upcoming chat; every
+        // other reason (auto-timeout, disabled, hidden) just clears.
+        nudgePreload: action.reason === "summoned" ? state.nudge : state.nudgePreload,
+      };
+    }
   }
 }
 
@@ -484,16 +722,24 @@ export function bannerTitle(error: BannerError): string {
       return "Local AI offline";
     case "no-model":
       return "No model loaded";
+    case "tools-unsupported":
+      return "This model can't search memory";
     case "interrupted":
       return "Answer interrupted";
+    case "guard-blocked":
+      return "Blocked by privacy guard";
     case "ipc":
       return "Chat unavailable";
   }
 }
 
-/** Detail line naming the endpoint that was tried (R006). */
+/** Detail line naming the endpoint that was tried (R006). "guard-blocked"
+ *  carries a kebab-case reason instead of free-text detail — surface it
+ *  verbatim so the machine-readable vocabulary stays greppable. */
 export function bannerDetail(error: BannerError): string {
-  return error.kind === "ipc" ? error.detail : `${error.endpoint} — ${error.detail}`;
+  if (error.kind === "ipc") return error.detail;
+  if (error.kind === "guard-blocked") return `${error.endpoint} — ${error.reason}`;
+  return `${error.endpoint} — ${error.detail}`;
 }
 
 /** Short human title for a capture failure (R007 — every kind gets a name). */

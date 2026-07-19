@@ -27,6 +27,10 @@ pub const HEAVY_MODEL_KEY: &str = "heavyModel";
 /// default; there is no env fallback for privacy.
 pub const PRIVACY_MODE_KEY: &str = "privacyMode";
 
+/// Store key holding the continuous-watcher toggle (M002 S01). Absent means
+/// off — the default; there is no env fallback.
+pub const WATCHER_ENABLED_KEY: &str = "watcherEnabled";
+
 /// The store key for a lane name, or `None` for a lane with no persistence
 /// slot (the settings surface only knows thin/heavy).
 pub fn lane_model_key(lane: &str) -> Option<&'static str> {
@@ -178,6 +182,149 @@ pub fn save_privacy_mode(app: &AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Read the persisted watcher toggle. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller
+/// keeps the default (off).
+pub fn load_watcher_enabled(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(WATCHER_ENABLED_KEY)?;
+    Some(stored_watcher_enabled(&value))
+}
+
+/// Interpret one stored watcher-toggle value. Only a JSON boolean is
+/// trusted; anything else is logged and treated as off rather than silently
+/// starting continuous capture on garbage data.
+fn stored_watcher_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!(
+                "config: {WATCHER_ENABLED_KEY} holds non-boolean value {other}; treating as off"
+            );
+            false
+        }
+    }
+}
+
+/// Persist the watcher toggle. The error names the failed persist path; the
+/// caller (the watcher applier) rolls the in-memory toggle back so an
+/// unpersisted watcher state can never silently revert on restart.
+pub fn save_watcher_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(WATCHER_ENABLED_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {WATCHER_ENABLED_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {WATCHER_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Store key holding the nudges off-switch (M002 S05, D019). Unlike the
+/// watcher/privacy toggles the default is ON — nudges only fire while the
+/// watcher runs, so the off-switch is the feature, not the default.
+pub const NUDGES_ENABLED_KEY: &str = "nudgesEnabled";
+
+/// Default for [`NUDGES_ENABLED_KEY`] when the store has nothing usable.
+pub const NUDGES_ENABLED_DEFAULT: bool = true;
+
+/// Store key holding the nudge cooldown in seconds (D019's configurable
+/// cooldown: a settings.json key read at startup, no UI). Read-only from
+/// the app's perspective — there is deliberately no save fn.
+pub const NUDGE_COOLDOWN_SECS_KEY: &str = "nudgeCooldownSecs";
+
+/// Default for [`NUDGE_COOLDOWN_SECS_KEY`]: at most one nudge per 5 min.
+pub const NUDGE_COOLDOWN_SECS_DEFAULT: u64 = 300;
+
+/// Read the persisted nudges toggle. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller
+/// keeps [`NUDGES_ENABLED_DEFAULT`].
+pub fn load_nudges_enabled(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(NUDGES_ENABLED_KEY)?;
+    Some(stored_nudges_enabled(&value))
+}
+
+/// Interpret one stored nudges-toggle value. Only a JSON boolean is
+/// trusted; anything else is logged and yields the default (on) — garbage
+/// in the store must not silently flip a user-facing setting, and unlike
+/// the capture toggles there is no safety reason to force off (nudges are
+/// display-only; the watcher gate governs capture).
+fn stored_nudges_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!(
+                "config: {NUDGES_ENABLED_KEY} holds non-boolean value {other}; \
+                 using default ({NUDGES_ENABLED_DEFAULT})"
+            );
+            NUDGES_ENABLED_DEFAULT
+        }
+    }
+}
+
+/// Persist the nudges toggle. The error names the failed persist path; the
+/// caller (the nudge applier) rolls the in-memory toggle back so an
+/// unpersisted nudge state can never silently revert on restart.
+pub fn save_nudges_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(NUDGES_ENABLED_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {NUDGES_ENABLED_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {NUDGES_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Read the persisted nudge cooldown in seconds, falling back to
+/// [`NUDGE_COOLDOWN_SECS_DEFAULT`] when nothing usable is persisted.
+pub fn load_nudge_cooldown_secs(app: &AppHandle) -> u64 {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return NUDGE_COOLDOWN_SECS_DEFAULT;
+        }
+    };
+    match store.get(NUDGE_COOLDOWN_SECS_KEY) {
+        Some(value) => stored_nudge_cooldown_secs(&value),
+        None => NUDGE_COOLDOWN_SECS_DEFAULT,
+    }
+}
+
+/// Interpret one stored cooldown value. Only a positive JSON integer is
+/// trusted; zero, negatives, fractions, and non-numbers are logged and
+/// yield the default rather than letting garbage disable rate limiting.
+fn stored_nudge_cooldown_secs(value: &serde_json::Value) -> u64 {
+    match value.as_u64() {
+        Some(secs) if secs > 0 => secs,
+        _ => {
+            log::warn!(
+                "config: {NUDGE_COOLDOWN_SECS_KEY} holds non-positive-integer value {value}; \
+                 using default ({NUDGE_COOLDOWN_SECS_DEFAULT}s)"
+            );
+            NUDGE_COOLDOWN_SECS_DEFAULT
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +374,67 @@ mod tests {
         assert!(!stored_privacy_mode(&serde_json::json!(1)));
         assert!(!stored_privacy_mode(&serde_json::Value::Null));
         assert!(!stored_privacy_mode(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_watcher_booleans_round_trip() {
+        assert!(stored_watcher_enabled(&serde_json::json!(true)));
+        assert!(!stored_watcher_enabled(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_nudges_booleans_round_trip() {
+        assert!(stored_nudges_enabled(&serde_json::json!(true)));
+        assert!(!stored_nudges_enabled(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_non_boolean_nudges_value_falls_back_to_default_on() {
+        // Q7: garbage must not flip the user-facing setting — the default
+        // (on) is safe here because nudges are display-only and capture is
+        // governed by the watcher gate.
+        assert!(NUDGES_ENABLED_DEFAULT);
+        assert!(stored_nudges_enabled(&serde_json::json!("false")));
+        assert!(stored_nudges_enabled(&serde_json::json!(0)));
+        assert!(stored_nudges_enabled(&serde_json::Value::Null));
+        assert!(stored_nudges_enabled(&serde_json::json!({"enabled": false})));
+    }
+
+    #[test]
+    fn stored_positive_integer_cooldown_is_trusted() {
+        assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(60)), 60);
+        assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(1)), 1);
+        assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(86_400)), 86_400);
+    }
+
+    #[test]
+    fn stored_garbage_cooldown_falls_back_to_default() {
+        // Q7: zero/negative/fractional/non-number values must not disable
+        // or corrupt rate limiting — only a positive integer is trusted.
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-30),
+            serde_json::json!(2.5),
+            serde_json::json!("300"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!({"secs": 300}),
+        ] {
+            assert_eq!(
+                stored_nudge_cooldown_secs(&bad),
+                NUDGE_COOLDOWN_SECS_DEFAULT,
+                "bad value: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_non_boolean_watcher_value_is_treated_as_off() {
+        // Q7: garbage in the store must never silently start continuous
+        // screen capture — off is the only safe fallback.
+        assert!(!stored_watcher_enabled(&serde_json::json!("true")));
+        assert!(!stored_watcher_enabled(&serde_json::json!(1)));
+        assert!(!stored_watcher_enabled(&serde_json::Value::Null));
+        assert!(!stored_watcher_enabled(&serde_json::json!({"enabled": true})));
     }
 }

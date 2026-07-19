@@ -45,6 +45,7 @@ pub const MENU_ID_AUTOSTART: &str = "launch-at-login";
 pub const MENU_ID_SETTINGS: &str = "settings";
 pub const MENU_ID_CONFIGURE_MODELS: &str = "configure-models";
 pub const MENU_ID_PRIVACY_MODE: &str = "privacy-mode";
+pub const MENU_ID_WATCH_SCREEN: &str = "watch-screen";
 pub const MENU_ID_QUIT: &str = "quit";
 /// Prefix of the Hotkey preset submenu item ids: `hotkey:<shortcut>` (T04).
 pub const MENU_ID_HOTKEY_PREFIX: &str = "hotkey:";
@@ -62,6 +63,10 @@ pub enum MenuAction {
     /// Flip privacy mode through the shared applier (S07) — same core as
     /// the `set_privacy_mode` IPC, so the entry points cannot drift.
     TogglePrivacy,
+    /// Flip the continuous watcher through the shared applier (M002 S01) —
+    /// same core as the `set_watcher_enabled` IPC, so the entry points
+    /// cannot drift.
+    ToggleWatcher,
     /// Show the settings window (S07). Settings… and Configure Models… both
     /// land here — the window is one surface for both.
     OpenSettings,
@@ -91,6 +96,7 @@ pub fn menu_action(id: &str) -> MenuAction {
         MENU_ID_SETTINGS => MenuAction::OpenSettings,
         MENU_ID_CONFIGURE_MODELS => MenuAction::OpenSettings,
         MENU_ID_PRIVACY_MODE => MenuAction::TogglePrivacy,
+        MENU_ID_WATCH_SCREEN => MenuAction::ToggleWatcher,
         MENU_ID_QUIT => MenuAction::Quit,
         _ => MenuAction::Ignore,
     }
@@ -221,6 +227,10 @@ impl TrayStatus {
 pub enum ActivityKind {
     Stream,
     Capture,
+    /// The continuous watcher loop while its run state is `watching` (M002
+    /// S01 T04) — one guard held across ticks, so the eye animates for the
+    /// whole watching span, not per capture.
+    Watcher,
 }
 
 impl ActivityKind {
@@ -228,6 +238,7 @@ impl ActivityKind {
         match self {
             ActivityKind::Stream => "stream",
             ActivityKind::Capture => "capture",
+            ActivityKind::Watcher => "watcher",
         }
     }
 }
@@ -399,6 +410,13 @@ fn privacy_enabled(app: &AppHandle) -> bool {
     app.try_state::<crate::capture::PrivacyState>().map(|s| s.enabled()).unwrap_or(false)
 }
 
+/// True when the continuous watcher toggle is on — the managed
+/// [`crate::watcher::WatcherState`] is the single truth (M002 S01);
+/// unmanaged state reads as off.
+fn watcher_enabled(app: &AppHandle) -> bool {
+    app.try_state::<crate::watcher::WatcherState>().map(|s| s.enabled()).unwrap_or(false)
+}
+
 /// The frame the icon rests on when no activity runs: the privacy frame
 /// while privacy mode is on (a user-visible state indicator, S07), the
 /// sleeping frame otherwise.
@@ -469,6 +487,7 @@ pub struct TrayUi {
     autostart_item: CheckMenuItem<Wry>,
     hotkey_items: Vec<(&'static str, CheckMenuItem<Wry>)>,
     privacy_item: CheckMenuItem<Wry>,
+    watcher_item: CheckMenuItem<Wry>,
 }
 
 /// Build the tray icon and menu. Errors bubble to the caller, which logs
@@ -529,6 +548,18 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         None::<&str>,
     )
     .map_err(err)?;
+    // Checked state comes from the shared WatcherState, which setup()
+    // seeded from settings.json (after privacy, before this build) — so the
+    // item reflects the persisted watcher toggle across restarts (S01).
+    let watcher_item = CheckMenuItem::with_id(
+        app,
+        MENU_ID_WATCH_SCREEN,
+        "Watch Screen",
+        true,
+        watcher_enabled(app),
+        None::<&str>,
+    )
+    .map_err(err)?;
     let quit =
         MenuItem::with_id(app, MENU_ID_QUIT, "Quit Third Eye", true, None::<&str>).map_err(err)?;
     let menu = Menu::with_items(
@@ -541,6 +572,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
             &settings,
             &models,
             &privacy_item,
+            &watcher_item,
             &PredefinedMenuItem::separator(app).map_err(err)?,
             &quit,
         ],
@@ -560,12 +592,13 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     let builder = builder.icon_as_template(true);
     builder.build(app).map_err(err)?;
 
-    app.manage(TrayUi { autostart_item, hotkey_items, privacy_item });
+    app.manage(TrayUi { autostart_item, hotkey_items, privacy_item, watcher_item });
 
     log::info!(
         "tray: initialized (menu: {MENU_ID_ACTIVATE}, {MENU_ID_AUTOSTART}, \
          {MENU_ID_HOTKEY_PREFIX}<{} presets>, {MENU_ID_SETTINGS}, \
-         {MENU_ID_CONFIGURE_MODELS}, {MENU_ID_PRIVACY_MODE}, {MENU_ID_QUIT})",
+         {MENU_ID_CONFIGURE_MODELS}, {MENU_ID_PRIVACY_MODE}, \
+         {MENU_ID_WATCH_SCREEN}, {MENU_ID_QUIT})",
         hotkey::HOTKEY_PRESETS.len()
     );
     Ok(())
@@ -601,6 +634,14 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             // visibly flips the clicked item back (Q5, never silent).
             let desired = !privacy_enabled(app);
             crate::capture::commands::apply_privacy_mode(app, desired, "tray");
+        }
+        MenuAction::ToggleWatcher => {
+            // The shared applier persists (rolling back on failure), logs
+            // naming this entry point, broadcasts watcher://state, wakes the
+            // loop, and resyncs the check item — so a failed persist visibly
+            // flips the clicked item back (Q5, never silent).
+            let desired = !watcher_enabled(app);
+            crate::watcher::commands::apply_watcher_enabled(app, desired, "tray");
         }
         MenuAction::OpenSettings => {
             // show logs "settings: panel shown (via tray)" on success; a
@@ -647,6 +688,18 @@ pub fn sync_privacy_check(app: &AppHandle, enabled: bool) {
     };
     if let Err(e) = ui.privacy_item.set_checked(enabled) {
         log::warn!("tray: failed to sync privacy-mode check state: {e}");
+    }
+}
+
+/// Reflect the shared watcher toggle on the check item. Failure to redraw
+/// is cosmetic (the truth stays queryable via `watcher_status`), so it is
+/// logged, never bubbled.
+pub fn sync_watcher_check(app: &AppHandle, enabled: bool) {
+    let Some(ui) = app.try_state::<TrayUi>() else {
+        return;
+    };
+    if let Err(e) = ui.watcher_item.set_checked(enabled) {
+        log::warn!("tray: failed to sync watch-screen check state: {e}");
     }
 }
 
@@ -697,13 +750,16 @@ mod tests {
         assert_eq!(menu_action(MENU_ID_SETTINGS), MenuAction::OpenSettings);
         assert_eq!(menu_action(MENU_ID_CONFIGURE_MODELS), MenuAction::OpenSettings);
         assert_eq!(menu_action(MENU_ID_PRIVACY_MODE), MenuAction::TogglePrivacy);
+        assert_eq!(menu_action(MENU_ID_WATCH_SCREEN), MenuAction::ToggleWatcher);
         assert_eq!(menu_action(MENU_ID_QUIT), MenuAction::Quit);
     }
 
     #[test]
     fn unknown_menu_id_maps_to_no_action() {
         // Q7: a stale or foreign menu id must never trigger a real action.
-        for bad in ["", "settngs", "ACTIVATE", "quit ", "tray://notice", "launch-at-login "] {
+        for bad in
+            ["", "settngs", "ACTIVATE", "quit ", "tray://notice", "launch-at-login ", "watch-screen "]
+        {
             assert_eq!(menu_action(bad), MenuAction::Ignore, "id: {bad:?}");
         }
     }
@@ -839,6 +895,7 @@ mod tests {
         }
         assert_eq!(ActivityKind::Stream.as_str(), "stream");
         assert_eq!(ActivityKind::Capture.as_str(), "capture");
+        assert_eq!(ActivityKind::Watcher.as_str(), "watcher");
     }
 
     #[test]

@@ -177,14 +177,25 @@ export function modelsErrorTitle(error: ModelsError): string {
       return "Can't reach the model endpoint";
     case "no-model":
       return "No model loaded";
+    // A model-list fetch never carries tools, so this kind can't arise here;
+    // the case exists because ModelsError shares the full LlmError taxonomy.
+    case "tools-unsupported":
+      return "This model can't search memory";
     case "interrupted":
       return "Model list fetch interrupted";
+    // The model-list probe is GET-only with no user content, so the privacy
+    // guard never blocks it; the case exists for the shared taxonomy.
+    case "guard-blocked":
+      return "Blocked by privacy guard";
     case "ipc":
       return "Model list unavailable";
   }
 }
 
-/** Detail line naming the endpoint that was tried (R006). */
+/** Detail line naming the endpoint that was tried (R006). "guard-blocked"
+ *  carries a kebab-case reason instead of free-text detail. */
 export function modelsErrorDetail(error: ModelsError): string {
-  return error.kind === "ipc" ? error.detail : `${error.endpoint} — ${error.detail}`;
+  if (error.kind === "ipc") return error.detail;
+  if (error.kind === "guard-blocked") return `${error.endpoint} — ${error.reason}`;
+  return `${error.endpoint} — ${error.detail}`;
 }

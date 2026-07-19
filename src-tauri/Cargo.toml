@@ -29,10 +29,28 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # and the pipeline is unit-tested cross-platform with synthetic pixels.
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+# Redaction engine (privacy/, D028): pure Rust, no C — safe for the Windows
+# msvc cross-check and the Linux container check.
+regex = "1"
+# Endpoint trust classification for the privacy guard (llm/guard.rs): URL
+# parsing only, no DNS. Already in the tree via reqwest — zero new compile cost.
+url = "2"
 
 [dev-dependencies]
 # net + io-util power the raw TcpListener mock server in llm tests.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+# SQLite binding for the S02 memory store, split across two target tables per
+# D021 (probe-proven): `bundled` compiles the vendored sqlite3.c with FTS5 on
+# macOS/Linux, while the Windows table disables default features so the msvc
+# cross-check from macOS emits only a link directive and never compiles C.
+# Do NOT collapse this into a plain [dependencies] entry — that breaks
+# `cargo check --target x86_64-pc-windows-msvc`.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rusqlite = { version = "0.32", default-features = false }
 
 # Global hotkey registration — desktop only (plugin does not build for mobile)
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
@@ -51,3 +69,20 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e
 # backend. macos_14_0 unlocks SCScreenshotManager (single-shot capture without
 # a stream); the app already requires a modern macOS.
 screencapturekit = { version = "8.0", features = ["macos_14_0"] }
+# Apple Vision OCR backend (S01 watcher): generated typed ObjC bindings — no
+# second Swift bridge stage (objc2 links no Swift; the MEM034 rpath already
+# covers screencapturekit's bridge). objc2-core-graphics carries the CGImage
+# type Vision reads; the capture crate's CGImage is cast to it in ocr/macos.rs.
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-foundation = "0.3"
+objc2-vision = "0.3"
+# Frontmost-app name for TextObservation.appContext (S01 watcher):
+# NSWorkspace/NSRunningApplication — two message sends, no AX spelunking.
+objc2-app-kit = "0.3"
+
+# CoreText renders the synthetic in-memory image the NON-ignored Vision test
+# recognizes — Vision on an in-memory CGImage needs no TCC permission.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-core-text = "0.3"

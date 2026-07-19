@@ -15,6 +15,10 @@
 //! ScreenCaptureKit one-shot capture, self-excluded by PID, encoded via
 //! [`encode`]); every other OS gets [`fallback::FallbackCapture`], which
 //! returns typed `unsupported` errors so Windows/Linux builds stay clean.
+//! The capture pipeline's first stage —
+//! [`macos::capture_display_image_blocking`], producing a raw `CGImage` — is
+//! exported separately so the S01 watcher's OCR path can consume pixels
+//! in-memory without ever touching the PNG encode path.
 
 pub mod commands;
 pub mod encode;

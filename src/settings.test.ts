@@ -165,4 +165,14 @@ describe("models error copy", () => {
     expect(modelsErrorTitle(ipc)).toMatch(/unavailable/i);
     expect(modelsErrorDetail(ipc)).toBe("no Tauri runtime");
   });
+
+  it("surfaces guard-blocked with its kebab-case reason, not a detail field", () => {
+    const blocked: ModelsError = {
+      kind: "guard-blocked",
+      endpoint: "http://192.0.2.1:9",
+      reason: "redaction-failed",
+    };
+    expect(modelsErrorTitle(blocked)).toBe("Blocked by privacy guard");
+    expect(modelsErrorDetail(blocked)).toBe("http://192.0.2.1:9 — redaction-failed");
+  });
 });

@@ -8,16 +8,21 @@
 //!   `false` without UI, which is why the T04 walkthrough deep-links to
 //!   System Settings instead of re-prompting.
 //!
-//! The ScreenCaptureKit frame backend lives here too: [`MacosCapture`]
-//! captures one frame of the primary display with every window owned by this
-//! process excluded (R008), then hands tightly-packed RGBA pixels to
-//! [`super::encode`] for the downscale → PNG → base64 pipeline.
+//! The ScreenCaptureKit frame backend lives here too, split into two stages:
+//! - [`capture_display_image_blocking`] — the reusable pixel-free-exit stage:
+//!   one `CGImage` of the primary display with every window owned by this
+//!   process excluded (R008). The S01 watcher's OCR path consumes this
+//!   directly (Vision reads a `CGImage`), so watcher pixels never meet the
+//!   PNG encoder.
+//! - [`MacosCapture`] — the "Attach my screen" path: runs the stage, then
+//!   hands tightly-packed RGBA pixels to [`super::encode`] for the
+//!   downscale → PNG → base64 pipeline.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
+use screencapturekit::screenshot_manager::{CGImage, CGImageExt, SCScreenshotManager};
 use screencapturekit::shareable_content::{SCShareableContent, SCWindow};
 use screencapturekit::stream::configuration::SCStreamConfiguration;
 use screencapturekit::stream::content_filter::SCContentFilter;
@@ -88,14 +93,6 @@ impl ScreenCapture for MacosCapture {
 }
 
 async fn capture_primary_inner() -> Result<CapturedFrame, CaptureError> {
-    // Preflight is read-only and cheap; failing here yields the typed
-    // permission-denied the walkthrough keys on, instead of an opaque
-    // ScreenCaptureKit stream error (R007). Never prompts.
-    if !has_permission() {
-        return Err(CaptureError::PermissionDenied {
-            detail: "CGPreflightScreenCaptureAccess returned false".into(),
-        });
-    }
     // SCShareableContent::get and SCScreenshotManager::capture_image both
     // block on Swift completion handlers; run them off the async runtime so
     // a capture can never stall the overlay's IPC thread.
@@ -105,6 +102,33 @@ async fn capture_primary_inner() -> Result<CapturedFrame, CaptureError> {
 }
 
 fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
+    let image = capture_display_image_blocking(encode::MAX_DIMENSION)?;
+    let (width, height) = (image.width() as u32, image.height() as u32);
+    let rgba = image.rgba_data().map_err(|e| CaptureError::CaptureFailed {
+        detail: format!("pixel render failed: {e}"),
+    })?;
+    encode::encode_rgba_frame(RawRgbaFrame { width, height, rgba })
+}
+
+/// The reusable capture stage: one `CGImage` of the primary display, capped
+/// to `max_dimension` on its longest edge (GPU scaling), with every window
+/// owned by this process excluded by PID (R008).
+///
+/// Blocks on Swift completion handlers — call from `spawn_blocking` (or the
+/// watcher's dedicated blocking tick), never on the async runtime. The
+/// permission preflight lives here so every consumer — the PNG frame path
+/// and the S01 OCR path — inherits the typed `permission-denied` instead of
+/// an opaque ScreenCaptureKit error (R007). The returned image is a plain
+/// in-memory bitmap: dropping it releases the pixels; nothing here encodes
+/// or writes them.
+pub fn capture_display_image_blocking(max_dimension: u32) -> Result<CGImage, CaptureError> {
+    // Preflight is read-only and cheap; never prompts.
+    if !has_permission() {
+        return Err(CaptureError::PermissionDenied {
+            detail: "CGPreflightScreenCaptureAccess returned false".into(),
+        });
+    }
+
     let content = SCShareableContent::get().map_err(|e| CaptureError::CaptureFailed {
         detail: format!("shareable content query failed: {e}"),
     })?;
@@ -142,24 +166,19 @@ fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
         .build();
 
     // Ask ScreenCaptureKit for the capped size directly (GPU scaling at
-    // native pixel density); encode::fit_within re-caps as a safety net.
+    // native pixel density); encode::fit_within re-caps as a safety net on
+    // the frame path.
     let scale = f64::from(filter.point_pixel_scale().max(1.0));
     let px = |points: u32| (f64::from(points) * scale).round() as u32;
     let (target_w, target_h) =
-        encode::fit_within(px(display.width()), px(display.height()), encode::MAX_DIMENSION);
+        encode::fit_within(px(display.width()), px(display.height()), max_dimension);
     let config = SCStreamConfiguration::new()
         .with_width(target_w)
         .with_height(target_h)
         .with_shows_cursor(true);
 
-    let image = SCScreenshotManager::capture_image(&filter, &config)
-        .map_err(|e| CaptureError::CaptureFailed { detail: format!("screenshot failed: {e}") })?;
-
-    let (width, height) = (image.width() as u32, image.height() as u32);
-    let rgba = image.rgba_data().map_err(|e| CaptureError::CaptureFailed {
-        detail: format!("pixel render failed: {e}"),
-    })?;
-    encode::encode_rgba_frame(RawRgbaFrame { width, height, rgba })
+    SCScreenshotManager::capture_image(&filter, &config)
+        .map_err(|e| CaptureError::CaptureFailed { detail: format!("screenshot failed: {e}") })
 }
 
 // Keeps the trait bound explicit: the T03 commands hold Arc<dyn ScreenCapture>.
@@ -182,6 +201,27 @@ mod tests {
         let status = permission_status();
         assert!(status.supported);
         assert_eq!(status.granted, first);
+    }
+
+    /// Live run of the reusable `CGImage` stage the S01 watcher OCR path
+    /// consumes. Needs Screen Recording permission and a display, so it is
+    /// ignored in the default suite (slice UAT runs it). Without permission
+    /// it must still fail *typed* — never a panic or hang.
+    #[test]
+    #[ignore = "requires Screen Recording permission and a live display (slice UAT)"]
+    fn real_cgimage_stage_smoke() {
+        let cap = 640;
+        match capture_display_image_blocking(cap) {
+            Ok(image) => {
+                let (w, h) = (image.width() as u32, image.height() as u32);
+                assert!(w > 0 && h > 0, "empty image: {w}x{h}");
+                assert!(w <= cap && h <= cap, "cap not honored: {w}x{h} > {cap}");
+            }
+            Err(err) => {
+                assert_eq!(err.kind(), "permission-denied", "unexpected: {err}");
+                assert!(!permission_status().granted);
+            }
+        }
     }
 
     /// Live one-frame capture through the full trait surface. Needs Screen

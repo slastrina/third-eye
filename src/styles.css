@@ -296,6 +296,32 @@ body,
   letter-spacing: 0.04em;
 }
 
+/* --- Chat: memory-consulted indicator (S03) -------------------------------- */
+
+.chat-memory-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(64, 200, 120, 0.2);
+  color: rgba(190, 240, 210, 0.95);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chat-memory-tag[data-phase="searching"] {
+  background: rgba(255, 214, 120, 0.18);
+  color: rgba(255, 232, 178, 0.95);
+}
+
+/* tools-unsupported: a capability gap, not an outage — amber, so it reads
+   distinctly from the red offline/no-model failures. */
+.chat-banner[data-kind="tools-unsupported"] {
+  background: rgba(255, 214, 120, 0.12);
+  border-color: rgba(255, 214, 120, 0.45);
+}
+
 /* --- Model routing indicator (R003) --------------------------------------- */
 
 .model-indicator {
@@ -506,6 +532,228 @@ body,
   font-size: 12px;
 }
 
+/* Privacy Guard sub-surface (S03): active state, per-kind redaction
+   counters, blocked count — kinds and counts only, never text. */
+.guard-subsection {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.guard-subheading {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-status-value[data-guard-active="true"] {
+  color: #8fd18f;
+}
+
+/* Watch Screen diagnostics (S01): rolling last-N extracted snippets,
+   newest first. */
+.watcher-snippets {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.watcher-snippet {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.watcher-snippet-meta {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.watcher-snippet-text {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+  overflow-wrap: anywhere;
+}
+
+/* The live run state doubles as a visibility surface: watching glows,
+   paused-privacy warns (R027) — same palette as the privacy hint. */
+.settings-status-value[data-watcher-state="watching"] {
+  color: #8fd18f;
+}
+
+.settings-status-value[data-watcher-state="paused-privacy"] {
+  color: rgba(255, 200, 120, 0.9);
+}
+
+/* Memory section (S04): browse/edit/delete/wipe over stored memories. */
+.settings-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(122, 162, 255, 0.14);
+  border: 1px solid rgba(122, 162, 255, 0.35);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.settings-error .settings-dismiss {
+  align-self: flex-end;
+}
+
+.settings-dismiss {
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.settings-dismiss:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.memory-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* The summary doubles as the edit affordance: a full-width text button. */
+.memory-summary {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+  text-align: left;
+  padding: 0;
+  cursor: text;
+  overflow-wrap: anywhere;
+}
+
+.memory-summary:hover {
+  color: rgba(255, 255, 255, 1);
+}
+
+.memory-meta {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.memory-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.memory-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.memory-edit-input {
+  width: 100%;
+  min-height: 48px;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(122, 162, 255, 0.5);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.memory-edit-error {
+  margin: 0;
+  font-size: 11px;
+  color: rgba(255, 130, 130, 0.95);
+}
+
+.memory-delete {
+  border: 1px solid rgba(255, 92, 92, 0.35);
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 130, 130, 0.9);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.memory-delete:hover {
+  background: rgba(255, 92, 92, 0.12);
+}
+
+/* The armed second step reads as the destructive action it is. */
+.memory-delete-confirm {
+  border: 1px solid rgba(255, 92, 92, 0.6);
+  border-radius: 6px;
+  background: rgba(255, 92, 92, 0.2);
+  color: rgba(255, 210, 210, 0.95);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.memory-delete-confirm:hover {
+  background: rgba(255, 92, 92, 0.32);
+}
+
+.memory-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.memory-wipe-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.memory-wipe-warning {
+  font-size: 11px;
+  color: rgba(255, 200, 120, 0.9);
+}
+
 /* Attach affordance privacy hint (S07): the button stays live so an
    attempted capture surfaces the typed privacy-mode error. */
 .attach-privacy-hint {
@@ -527,5 +775,64 @@ body,
 @keyframes chat-caret-blink {
   50% {
     opacity: 0;
+  }
+}
+
+/* --- Nudge banner (S05) ----------------------------------------------------
+   A small self-dismissing callout parked at the screen edge while the overlay
+   is visible-idle with an active nudge. The window is click-through natively
+   in that state; pointer-events stays none (inherited from .overlay-root) so
+   the DOM mirrors it. No .overlay-panel chrome renders alongside it. */
+
+.nudge-banner {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 360px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: rgba(28, 28, 30, 0.82);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(122, 162, 255, 0.35);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  line-height: 1.4;
+  animation: nudge-slide-in 240ms ease-out;
+}
+
+.nudge-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7aa2ff;
+}
+
+.nudge-message {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.nudge-hint {
+  flex-shrink: 0;
+  font-size: 11px;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+@keyframes nudge-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }

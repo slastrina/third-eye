@@ -1,6 +1,7 @@
 //! Tauri IPC surface for chat (R002) and model routing (R003): the `chat`,
 //! `llm_health`, `set_model`, and `model_info` commands plus the
-//! `llm://token` / `llm://done` / `llm://error` event stream.
+//! `llm://token` / `llm://done` / `llm://error` event stream and the S03
+//! tool-phase events `llm://tool-call` / `llm://tool-result`.
 //!
 //! The webview never talks HTTP to the model endpoint — this module is the
 //! whole contract. A `chat` invoke returns a request id immediately; tokens
@@ -21,9 +22,13 @@ use std::time::Instant;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use super::guard::{GuardState, GuardTelemetry};
 use super::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
-use super::{ChatMessage, LlmClient, LlmError, LlmHealth};
+use super::toolloop::{
+    run_tool_loop, MemorySearchTool, ToolEvent, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
+};
+use super::{ChatMessage, ChatRequest, LlmClient, LlmError, LlmHealth};
 
 /// Event names — the string half of the IPC contract with `src/chat.ts`.
 pub const TOKEN_EVENT: &str = "llm://token";
@@ -34,6 +39,12 @@ pub const ERROR_EVENT: &str = "llm://error";
 /// updated [`ModelInfo`] app-wide — the overlay stays truthful when the
 /// settings window changes routing.
 pub const MODEL_INFO_EVENT: &str = "llm://model-info";
+/// Privacy-guard telemetry broadcast (M003 S03): every [`GuardState`]
+/// mutation — guarded forward with detections, guard block, watcher
+/// redaction — emits the fresh kinds-and-counts-only [`GuardTelemetry`]
+/// snapshot app-wide, so the Settings guard surface stays truthful without
+/// polling. The string half of the contract with `src/privacy-state.ts`.
+pub const PRIVACY_STATE_EVENT: &str = "privacy://state";
 
 /// One content delta. Fired per token in arrival order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -95,18 +106,50 @@ impl LlmState {
         Self { router, probe, next_request_id: AtomicU64::new(1), active: Mutex::new(None) }
     }
 
-    /// State backed by the project-default LM Studio endpoint with the
-    /// canonical thin/heavy lane pair. Lane model ids come from the
-    /// `THIRD_EYE_THIN_MODEL` / `THIRD_EYE_HEAVY_MODEL` env vars — the single
-    /// override site until S05 ships real configurability. An unset (or
-    /// blank) var leaves that lane unpinned: requests omit the `model` key
-    /// and a single-model LM Studio serves whatever it has loaded.
-    pub fn with_default_endpoint() -> Self {
+    /// State backed by the configured LM Studio endpoint with the canonical
+    /// thin/heavy lane pair. The endpoint comes from `THIRD_EYE_ENDPOINT`
+    /// (unset or blank → [`DEFAULT_ENDPOINT`], see [`env_endpoint`]); lane
+    /// model ids come from the `THIRD_EYE_THIN_MODEL` /
+    /// `THIRD_EYE_HEAVY_MODEL` env vars — the single override site until S05
+    /// ships real configurability. An unset (or blank) var leaves that lane
+    /// unpinned: requests omit the `model` key and a single-model LM Studio
+    /// serves whatever it has loaded.
+    ///
+    /// `guard` is the app-shared privacy-guard telemetry (M003 S02): every
+    /// lane client the router builds — now and on runtime re-pins — is
+    /// wrapped against it.
+    pub fn with_default_endpoint(guard: Arc<GuardState>) -> Self {
+        Self::from_env(
+            std::env::var("THIRD_EYE_ENDPOINT").ok(),
+            std::env::var("THIRD_EYE_THIN_MODEL").ok(),
+            std::env::var("THIRD_EYE_HEAVY_MODEL").ok(),
+            guard,
+        )
+    }
+
+    /// The whole construction path of [`Self::with_default_endpoint`] minus
+    /// the process-global env reads, so tests can drive the exact production
+    /// delegation (router → guarded lane clients → probe) with pinned
+    /// values instead of racing on `std::env`.
+    fn from_env(
+        endpoint: Option<String>,
+        thin: Option<String>,
+        heavy: Option<String>,
+        guard: Arc<GuardState>,
+    ) -> Self {
         Self::new(Arc::new(ModelRouter::thin_heavy(
-            DEFAULT_ENDPOINT,
-            env_model(std::env::var("THIRD_EYE_THIN_MODEL").ok()),
-            env_model(std::env::var("THIRD_EYE_HEAVY_MODEL").ok()),
+            &env_endpoint(endpoint),
+            env_model(thin),
+            env_model(heavy),
+            guard,
         )))
+    }
+
+    /// The routing seam itself — S02 ingestion holds this to snapshot the
+    /// thin lane's client per batch via [`ModelRouter::lane_client`], so
+    /// runtime re-pins apply to the next distillation without new plumbing.
+    pub fn router(&self) -> Arc<ModelRouter> {
+        self.router.clone()
     }
 
     /// Switch the active routing lane — the validated core of the
@@ -242,7 +285,35 @@ pub async fn chat(
             }
         };
 
-        let result = client.stream_chat(&messages, &on_token).await;
+        // Tool phases surface as llm://tool-call / llm://tool-result — the
+        // UI's memory-consulted indicator (T04). Emission failure is logged,
+        // never fatal, same policy as tokens.
+        let on_event = |event: &ToolEvent| {
+            let emitted = match event {
+                ToolEvent::Call(e) => task_app.emit(TOOL_CALL_EVENT, e.clone()),
+                ToolEvent::Result(e) => task_app.emit(TOOL_RESULT_EVENT, e.clone()),
+            };
+            if let Err(e) = emitted {
+                log::warn!("llm: request {id} tool event emit failed: {e}");
+            }
+        };
+
+        // memory_search is available exactly when the S02 store opened this
+        // run; without it the request runs tools-free (the pre-S03 path) and
+        // the absence is logged, not silent.
+        let memory = task_app.state::<crate::memory::MemoryState>();
+        let result = match memory.store() {
+            Some(store) => {
+                let tool = MemorySearchTool::new(store, memory.embedder(client.endpoint()));
+                run_tool_loop(client.as_ref(), &tool, messages, id, &on_token, &on_event).await
+            }
+            None => {
+                log::info!(
+                    "llm: request {id} runs without tools (memory store unavailable)"
+                );
+                client.stream_chat(&ChatRequest::new(messages), &on_token).await
+            }
+        };
         let total_ms = started.elapsed().as_millis() as u64;
 
         match result {
@@ -383,11 +454,55 @@ pub fn model_info(state: State<'_, LlmState>) -> ModelInfo {
     state.model_info()
 }
 
+/// Current privacy-guard telemetry (S03 mount-time query) — health-as-value
+/// beside `watcher_status` and `model_info`: a kinds-and-counts-only
+/// snapshot at any time, never an error.
+#[tauri::command]
+pub fn guard_status(state: State<'_, Arc<GuardState>>) -> GuardTelemetry {
+    let snapshot = state.snapshot();
+    log::debug!(
+        "guard: status query redactionKinds={} blocked={} lastBlockReason={:?}",
+        snapshot.redactions.len(),
+        snapshot.blocked_count,
+        snapshot.last_block_reason
+    );
+    snapshot
+}
+
+/// Install the `privacy://state` emitter on the shared [`GuardState`]
+/// (called once from `setup()`): the one choke point that makes all three
+/// mutation sites — guarded forward, guard block, watcher redaction —
+/// user-visible. Broadcast failure is cosmetic (the truth stays queryable
+/// via `guard_status`), so it is logged, never bubbled — the `watcher://state`
+/// posture.
+pub fn install_guard_notifier(app: &AppHandle) {
+    let handle = app.clone();
+    let state: Arc<GuardState> = app.state::<Arc<GuardState>>().inner().clone();
+    state.set_notifier(Arc::new(move |snapshot: GuardTelemetry| {
+        if let Err(e) = handle.emit(PRIVACY_STATE_EVENT, snapshot) {
+            log::warn!("guard: privacy state broadcast failed: {e}");
+        }
+    }));
+    log::debug!("guard: privacy://state notifier installed");
+}
+
 /// Treat unset, empty, and whitespace-only env values as "no pinned model"
 /// so `THIRD_EYE_THIN_MODEL=""` behaves like an absent var instead of
 /// pinning a nameless model.
 fn env_model(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// `THIRD_EYE_ENDPOINT` semantics — trim whitespace, drop trailing slashes,
+/// and treat unset/blank as [`DEFAULT_ENDPOINT`]. Public so the live test
+/// harnesses (`tests/nudge_live.rs`, `tests/privacy_live.rs`) resolve their
+/// endpoint through the same rules as production instead of re-implementing
+/// them.
+pub fn env_endpoint(value: Option<String>) -> String {
+    value
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
 }
 
 #[cfg(test)]
@@ -406,10 +521,14 @@ mod tests {
 
         async fn stream_chat(
             &self,
-            _messages: &[ChatMessage],
+            _request: &ChatRequest,
             _on_token: super::super::TokenSink<'_>,
         ) -> Result<super::super::StreamOutcome, LlmError> {
-            Ok(super::super::StreamOutcome { text: String::new(), token_count: 0 })
+            Ok(super::super::StreamOutcome {
+                text: String::new(),
+                token_count: 0,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
@@ -506,6 +625,13 @@ mod tests {
         assert_eq!(DONE_EVENT, "llm://done");
         assert_eq!(ERROR_EVENT, "llm://error");
         assert_eq!(MODEL_INFO_EVENT, "llm://model-info");
+    }
+
+    #[test]
+    fn privacy_state_event_name_is_contract_locked() {
+        // src/privacy-state.ts pins the same string on the TS side — the
+        // two const tests are the contract-lock pair (S03).
+        assert_eq!(PRIVACY_STATE_EVENT, "privacy://state");
     }
 
     #[test]
@@ -623,5 +749,65 @@ mod tests {
         assert_eq!(env_model(Some(String::new())), None);
         assert_eq!(env_model(Some("   ".into())), None);
         assert_eq!(env_model(Some(" qwen2.5-7b ".into())), Some("qwen2.5-7b".into()));
+    }
+
+    #[test]
+    fn env_endpoint_trims_strips_trailing_slash_and_defaults_when_blank() {
+        // Aligned with the historical test-side read in tests/nudge_live.rs:
+        // trim, drop trailing slashes, unset/blank → project default.
+        assert_eq!(env_endpoint(None), DEFAULT_ENDPOINT);
+        assert_eq!(env_endpoint(Some(String::new())), DEFAULT_ENDPOINT);
+        assert_eq!(env_endpoint(Some("   ".into())), DEFAULT_ENDPOINT);
+        assert_eq!(env_endpoint(Some(" http://127.0.0.1:9999/ ".into())), "http://127.0.0.1:9999");
+        assert_eq!(env_endpoint(Some("http://192.0.2.1:9".into())), "http://192.0.2.1:9");
+    }
+
+    /// TEST-NET-1 (RFC 5737): reserved documentation address — nothing can
+    /// listen there, so a connect attempt would surface as `offline`, and
+    /// `guard-blocked` proves the guard fired before any connect.
+    const TEST_NET_1: &str = "http://192.0.2.1:9";
+
+    #[test]
+    fn from_env_unset_endpoint_routes_to_the_project_default() {
+        let s = LlmState::from_env(None, None, None, Arc::new(GuardState::new()));
+        let client: Arc<dyn LlmClient> = s.router();
+        assert_eq!(client.endpoint(), DEFAULT_ENDPOINT);
+    }
+
+    /// S04 T01 must-have: the *production constructor path* — not a
+    /// hand-built router — pointed at an external endpoint returns typed
+    /// guard-blocked (never offline) on a block-triggering chat, and the
+    /// shared GuardState records the block for the Settings surface.
+    #[tokio::test]
+    async fn production_constructor_blocks_external_endpoint_fail_closed() {
+        let guard = Arc::new(GuardState::new());
+        let s = LlmState::from_env(
+            Some(TEST_NET_1.into()),
+            Some("thin-test".into()),
+            None,
+            guard.clone(),
+        );
+        let client: Arc<dyn LlmClient> = s.router();
+        assert_eq!(client.endpoint(), TEST_NET_1);
+
+        // The pinned Low-confidence redaction condition (Luhn-failing digits
+        // beside card context) — a request the guard must refuse externally.
+        let request =
+            ChatRequest::new(vec![ChatMessage::user("credit card: 4111 1111 1111 1112")]);
+        let err = client.stream_chat(&request, &|_| {}).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "guard-blocked",
+            "production-constructed state must block before connect; \
+             offline would mean a connect was attempted"
+        );
+        assert_eq!(err.endpoint(), TEST_NET_1);
+
+        let snapshot = guard.snapshot();
+        assert_eq!(snapshot.blocked_count, 1);
+        assert_eq!(
+            snapshot.last_block_reason,
+            Some(super::super::guard::GuardBlockReason::LowConfidence)
+        );
     }
 }

@@ -5,24 +5,33 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  bannerDetail,
+  bannerTitle,
   captureErrorTitle,
   chatReducer,
   composeMessages,
   initialChatState,
+  nudgeContextMessage,
   nextProbeDelay,
   startHealthProbe,
   stripFailedTail,
   toCaptureFlowError,
   HEALTH_PROBE_INITIAL_MS,
   HEALTH_PROBE_MAX_MS,
+  MEMORY_SEARCH_TOOL,
   MODEL_INFO_EVENT,
   PRIVACY_EVENT,
+  TOOL_CALL_EVENT,
+  TOOL_RESULT_EVENT,
   type CaptureError,
   type CapturedFrame,
   type ChatState,
   type LlmError,
   type LlmHealth,
+  type ToolCallPayload,
+  type ToolResultPayload,
   type ModelInfo,
+  type NudgePayload,
   type PrivacyStatus,
 } from "./chat";
 
@@ -483,6 +492,147 @@ describe("chatReducer privacy mode (S07)", () => {
   });
 });
 
+describe("chatReducer tool events (S03)", () => {
+  const toolCall = (requestId: number, name = MEMORY_SEARCH_TOOL): ToolCallPayload => ({
+    requestId,
+    round: 0,
+    call: { id: "call_0", name, arguments: `{"query":"this morning"}` },
+  });
+  const toolResult = (
+    requestId: number,
+    overrides: Partial<ToolResultPayload> = {},
+  ): ToolResultPayload => ({
+    requestId,
+    round: 0,
+    callId: "call_0",
+    name: MEMORY_SEARCH_TOOL,
+    ok: true,
+    resultCount: 3,
+    mode: "semantic",
+    failure: null,
+    ...overrides,
+  });
+
+  it("keeps the tool event names in sync with the Rust contract", () => {
+    expect(TOOL_CALL_EVENT).toBe("llm://tool-call");
+    expect(TOOL_RESULT_EVENT).toBe("llm://tool-result");
+    expect(MEMORY_SEARCH_TOOL).toBe("memory_search");
+  });
+
+  it("a memory_search tool-call marks the streaming answer as searching", () => {
+    let s = started("what was I working on?", 1);
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    expect(lastMessage(s)).toMatchObject({ role: "assistant", memory: "searching" });
+  });
+
+  it("a successful result flips searching to consulted, and done keeps it", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(1) });
+    expect(lastMessage(s).memory).toBe("consulted");
+    s = chatReducer(s, {
+      type: "done",
+      payload: { requestId: 1, text: "grounded answer", tokenCount: 3, firstTokenMs: 5, totalMs: 9 },
+    });
+    expect(lastMessage(s)).toMatchObject({ status: "done", memory: "consulted" });
+  });
+
+  it("a failed result clears searching without claiming consultation", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    s = chatReducer(s, {
+      type: "tool-result",
+      payload: toolResult(1, { ok: false, resultCount: null, mode: null, failure: "db-failure" }),
+    });
+    expect(lastMessage(s).memory).toBeUndefined();
+  });
+
+  it("a failed later round never downgrades a consulted earned earlier", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(1) });
+    s = chatReducer(s, {
+      type: "tool-result",
+      payload: toolResult(1, { round: 1, ok: false, resultCount: null, mode: null, failure: "db-failure" }),
+    });
+    expect(lastMessage(s).memory).toBe("consulted");
+  });
+
+  it("stale tool events from a superseded request cannot touch the active answer", () => {
+    let s = started("hi", 2);
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(1) });
+    expect(lastMessage(s).memory).toBeUndefined();
+  });
+
+  it("a non-memory tool result does not flip the memory indicator", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1, "web_search") });
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(1, { name: "web_search" }) });
+    expect(lastMessage(s).memory).toBeUndefined();
+  });
+
+  it("tool events that beat the invoke's resolution are buffered, then replayed", () => {
+    let s = chatReducer(initialChatState, { type: "submit", question: "hi" });
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(5) });
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(5) });
+    s = chatReducer(s, { type: "tool-result", payload: toolResult(4) }); // stale sibling
+    expect(lastMessage(s).memory).toBeUndefined();
+    s = chatReducer(s, { type: "request-started", requestId: 5 });
+    expect(lastMessage(s).memory).toBe("consulted");
+    expect(s.buffered).toEqual([]);
+  });
+
+  it("an interruption settles a dangling searching phase — no live claim on a dead stream", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "token", payload: { requestId: 1, token: "part" } });
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    s = chatReducer(s, { type: "error", payload: { requestId: 1, error: interrupted("part") } });
+    expect(lastMessage(s)).toMatchObject({ status: "interrupted", memory: undefined });
+  });
+
+  it("resubmitting settles the superseded answer's searching phase", () => {
+    let s = started("first", 1);
+    s = chatReducer(s, { type: "token", payload: { requestId: 1, token: "part" } });
+    s = chatReducer(s, { type: "tool-call", payload: toolCall(1) });
+    s = chatReducer(s, { type: "submit", question: "second" });
+    const superseded = s.messages[s.messages.length - 3];
+    expect(superseded).toMatchObject({ status: "interrupted", memory: undefined });
+  });
+
+  it("tools-unsupported raises a distinct visible banner naming the endpoint", () => {
+    const toolsUnsupported: LlmError = {
+      kind: "tools-unsupported",
+      endpoint: ENDPOINT,
+      detail: "model does not support tools",
+    };
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "error", payload: { requestId: 1, error: toolsUnsupported } });
+    expect(s.banner?.error).toEqual(toolsUnsupported);
+    expect(s.requestId).toBeNull();
+    // Distinct copy: must not read as offline or no-model.
+    expect(bannerTitle(toolsUnsupported)).toMatch(/memory|tool/i);
+    expect(bannerTitle(toolsUnsupported)).not.toBe(bannerTitle(noModel));
+  });
+
+  it("guard-blocked raises a distinct privacy-guard banner naming endpoint and reason", () => {
+    // The M003 S02 wire shape: `reason` is a kebab-case machine token, no
+    // free-text `detail` field (never any request text).
+    const guardBlocked: LlmError = {
+      kind: "guard-blocked",
+      endpoint: "http://192.0.2.1:9",
+      reason: "low-confidence",
+    };
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "error", payload: { requestId: 1, error: guardBlocked } });
+    expect(s.banner?.error).toEqual(guardBlocked);
+    expect(s.requestId).toBeNull();
+    expect(bannerTitle(guardBlocked)).toBe("Blocked by privacy guard");
+    expect(bannerTitle(guardBlocked)).not.toBe(bannerTitle(offline));
+    // Detail names the blocked endpoint (R006) and the kebab-case reason.
+    expect(bannerDetail(guardBlocked)).toBe("http://192.0.2.1:9 — low-confidence");
+  });
+});
+
 describe("health probe backoff", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -541,5 +691,93 @@ describe("health probe backoff", () => {
     await vi.advanceTimersByTimeAsync(120000);
     expect(results).toEqual([]);
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nudge lifecycle (S05): banner state, summon preload, consume-once
+// ---------------------------------------------------------------------------
+
+const nudge: NudgePayload = {
+  kind: "nudge",
+  message: "Looks like a tricky stack trace — want help?",
+  screenText: "TypeError: cannot read properties of undefined",
+  appContext: "Terminal",
+  capturedAtMs: 1_700_000_000_000,
+  memoryContext: ["Working on the Third Eye overlay app"],
+};
+
+describe("chatReducer nudge lifecycle", () => {
+  it("nudge-shown parks the payload behind the banner", () => {
+    const s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    expect(s.nudge).toEqual(nudge);
+    expect(s.nudgePreload).toBeNull();
+  });
+
+  it("auto-timeout dismiss clears the banner without staging a preload", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "auto-timeout" });
+    expect(s.nudge).toBeNull();
+    expect(s.nudgePreload).toBeNull();
+  });
+
+  it("summoned dismiss stages the banner's payload as the chat preload", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
+    expect(s.nudge).toBeNull();
+    expect(s.nudgePreload).toEqual(nudge);
+  });
+
+  it("a dismiss with no nudge showing is a no-op and cannot wipe a staged preload", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
+    const again = chatReducer(s, { type: "nudge-dismissed", reason: "hidden" });
+    expect(again).toBe(s);
+    expect(again.nudgePreload).toEqual(nudge);
+  });
+
+  it("a new nudge supersedes a stale unconsumed preload", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
+    const fresh: NudgePayload = { ...nudge, message: "New context", memoryContext: [] };
+    s = chatReducer(s, { type: "nudge-shown", payload: fresh });
+    expect(s.nudge).toEqual(fresh);
+    expect(s.nudgePreload).toBeNull();
+  });
+
+  it("submit consumes the preload so it cannot ride a later question", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
+    s = chatReducer(s, { type: "submit", question: "what does this error mean?" });
+    expect(s.nudgePreload).toBeNull();
+  });
+});
+
+describe("nudge context preload composition", () => {
+  it("prepends exactly one system message carrying screen and memory context", () => {
+    const wire = composeMessages([], "what does this error mean?", [], nudge);
+    expect(wire).toHaveLength(2);
+    expect(wire[0].role).toBe("system");
+    expect(wire[0].content).toContain(nudge.screenText);
+    expect(wire[0].content).toContain("Terminal");
+    expect(wire[0].content).toContain(nudge.memoryContext[0]);
+    expect(wire[1]).toEqual({ role: "user", content: "what does this error mean?" });
+  });
+
+  it("composes without a system message when no preload is staged", () => {
+    const wire = composeMessages([], "hi", [], null);
+    expect(wire).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  it("omits the memory block and app label when the payload has neither", () => {
+    const bare = nudgeContextMessage({
+      ...nudge,
+      appContext: null,
+      memoryContext: [],
+    });
+    expect(bare.role).toBe("system");
+    expect(bare.content).not.toContain("Relevant stored memories");
+    expect(bare.content).not.toContain("frontmost app");
+    expect(bare.content).toContain(nudge.screenText);
   });
 });

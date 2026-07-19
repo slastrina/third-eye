@@ -38,9 +38,11 @@ test("privacy toggle and status readouts render their unavailable states", async
   // privacy_status rejects → the toggle is disabled with a named note.
   const toggle = page.getByLabel("Privacy Mode");
   await expect(toggle).toBeDisabled();
-  await expect(page.locator(".settings-unavailable").last()).toContainText(
-    "Privacy state is unavailable",
-  );
+  // Matched by text, not position — the watcher section renders its own
+  // unavailable note after this one.
+  await expect(
+    page.locator(".settings-unavailable", { hasText: "Privacy state is unavailable" }),
+  ).toBeVisible();
   // hotkey_status / autostart_status reject → read-only rows say so.
   await expect(page.locator(".settings-status-value").first()).toHaveText("unavailable");
   await expect(page.locator(".settings-status-value").last()).toHaveText("unavailable");

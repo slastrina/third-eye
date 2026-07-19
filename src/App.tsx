@@ -13,7 +13,11 @@ import {
   onLlmDone,
   onLlmError,
   onLlmToken,
+  onLlmToolCall,
+  onLlmToolResult,
   onModelInfoBroadcast,
+  onNudgeDismiss,
+  onNudgeShow,
   onPrivacyChanged,
   openCaptureSettings,
   privacyStatus,
@@ -130,6 +134,11 @@ function App() {
       }),
       onLlmDone((payload) => dispatchChat({ type: "done", payload })),
       onLlmError((payload) => dispatchChat({ type: "error", payload })),
+      // Tool phases (S03) dispatch directly like terminal events — they carry
+      // no text, so the frame-coalesced token buffer can't reorder anything
+      // user-visible past them.
+      onLlmToolCall((payload) => dispatchChat({ type: "tool-call", payload })),
+      onLlmToolResult((payload) => dispatchChat({ type: "tool-result", payload })),
     ];
     return () => {
       unlistens.forEach((u) => u.then((f) => f()));
@@ -213,6 +222,21 @@ function App() {
     };
   }, []);
 
+  // Nudge lifecycle (S05): the backend parks a nudge on the idle overlay via
+  // nudge://show and takes it down via nudge://dismiss — a "summoned" dismiss
+  // (hotkey pressed on the banner) stages the payload as the next submit's
+  // context preload in the reducer. Self-dismissing by contract: the banner
+  // renders purely from chat.nudge, so the dismiss event is the whole story.
+  useEffect(() => {
+    const unlistens = [
+      onNudgeShow((payload) => dispatchChat({ type: "nudge-shown", payload })),
+      onNudgeDismiss((reason) => dispatchChat({ type: "nudge-dismissed", reason })),
+    ];
+    return () => {
+      unlistens.forEach((u) => u.then((f) => f()));
+    };
+  }, []);
+
   // R007: walkthrough opens are observable without a debugger attached.
   const walkthroughOpen = chat.captureError?.kind === "permission-denied";
   useEffect(() => {
@@ -251,10 +275,13 @@ function App() {
     // The staged frame rides this message; the submit action consumes it, so
     // a retry after a failure re-asks the question without the screenshot.
     const staged = chatRef.current.attachment;
+    // A summon-from-nudge preload grounds exactly this question; the submit
+    // action consumes it reducer-side.
     const history = composeMessages(
       base,
       trimmed,
       staged ? [{ base64Png: staged.base64Png }] : [],
+      chatRef.current.nudgePreload,
     );
     dispatchChat({ type: "submit", question: trimmed, retry });
     sendChat(history).then(
@@ -275,6 +302,23 @@ function App() {
   const activeModelId = routing
     ? routing.lanes.find((lane) => lane.name === routing.activeLane)?.modelId
     : null;
+
+  // Idle-because-of-a-nudge renders ONLY the small edge banner — the full
+  // chat chrome would read as a ghost panel parked over the user's work. In
+  // visible-focused (summoned) or plain visible-idle the panel is unchanged.
+  const parkedNudge = state === "visible-idle" ? chat.nudge : null;
+
+  if (parkedNudge) {
+    return (
+      <div className="overlay-root" data-state={state} data-nudge="true">
+        <div className="nudge-banner" role="status" aria-live="polite">
+          <span className="nudge-dot" aria-hidden="true" />
+          <span className="nudge-message">{parkedNudge.message}</span>
+          <span className="nudge-hint">press the hotkey to ask</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="overlay-root" data-state={state}>
@@ -374,7 +418,12 @@ function App() {
             </div>
           ))}
         {chat.banner && (
-          <div className="chat-banner" data-online={chat.banner.online} role="alert">
+          <div
+            className="chat-banner"
+            data-online={chat.banner.online}
+            data-kind={chat.banner.error.kind}
+            role="alert"
+          >
             <div className="chat-banner-text">
               <strong>
                 {chat.banner.online
@@ -405,6 +454,19 @@ function App() {
                 {message.role === "user" && message.attached && (
                   <span className="chat-attached-tag" title="A screenshot rode this message">
                     screen
+                  </span>
+                )}
+                {message.role === "assistant" && message.memory && (
+                  <span
+                    className="chat-memory-tag"
+                    data-phase={message.memory}
+                    title={
+                      message.memory === "searching"
+                        ? "The model is searching your stored memories"
+                        : "This answer consulted your stored memories"
+                    }
+                  >
+                    {message.memory === "searching" ? "searching memory…" : "memory consulted"}
                   </span>
                 )}
                 {message.role === "assistant" && message.status === "streaming" && (
