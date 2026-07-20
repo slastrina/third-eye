@@ -456,6 +456,65 @@ pub fn save_cloud_heavy_provider(
     Ok(())
 }
 
+/// Store key holding the first-run onboarding flag (M006). Absent/garbage means
+/// the user has not been onboarded yet — the default — so the onboarding
+/// explainer shows. Set to `true` once the user completes or skips onboarding so
+/// it never shows again. This flag governs only whether the explainer is shown;
+/// it grants nothing on its own (the OS TCC prompt does), so the safe default
+/// (`false` = show again) can at worst re-show the panel, never leak a grant.
+pub const FIRST_RUN_COMPLETE_KEY: &str = "firstRunComplete";
+
+/// Read the persisted first-run onboarding flag. `false` (the default) means
+/// nothing usable is persisted (no store, no key — both logged where relevant),
+/// so onboarding should show; `true` means the user already completed or skipped
+/// it. A missing store must not suppress onboarding, so failures fall to `false`.
+pub fn load_first_run_complete(app: &AppHandle) -> bool {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return false;
+        }
+    };
+    match store.get(FIRST_RUN_COMPLETE_KEY) {
+        Some(value) => stored_first_run_complete(&value),
+        None => false,
+    }
+}
+
+/// Interpret one stored first-run value. Only a JSON boolean is trusted;
+/// anything else is logged and treated as `false` (not yet onboarded) so a
+/// garbage value re-shows the harmless explainer rather than silently
+/// suppressing it — the fail-safe direction here is "show again".
+fn stored_first_run_complete(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!(
+                "config: {FIRST_RUN_COMPLETE_KEY} holds non-boolean value {other}; treating as not-complete"
+            );
+            false
+        }
+    }
+}
+
+/// Persist the first-run onboarding flag. The error names the failed persist
+/// path; the caller decides whether an unpersisted flag is fatal (it is not —
+/// re-showing the explainer once more is harmless), so this only surfaces the
+/// error for logging, mirroring the other config savers.
+pub fn save_first_run_complete(app: &AppHandle, complete: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(FIRST_RUN_COMPLETE_KEY, serde_json::json!(complete));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {FIRST_RUN_COMPLETE_KEY}={complete} to {path}: {e}"))?;
+    log::info!("config: persisted {FIRST_RUN_COMPLETE_KEY}={complete} to {path}");
+    Ok(())
+}
+
 /// Store key holding the nudges off-switch (M002 S05, D019). Unlike the
 /// watcher/privacy toggles the default is ON — nudges only fire while the
 /// watcher runs, so the off-switch is the feature, not the default.
@@ -551,6 +610,282 @@ fn stored_nudge_cooldown_secs(value: &serde_json::Value) -> u64 {
             NUDGE_COOLDOWN_SECS_DEFAULT
         }
     }
+}
+
+/// Store key holding the overlay presentation config (M006 S04). A single
+/// composite object — `mode` + per-edge `edgeExtents` + `modalSize` — so the
+/// corrupt-value fallback lives in one interpreter and a mode switch restores
+/// that edge's preferred extent atomically (D040). Absent/garbage means the
+/// safe default (modal at [`MODAL_DEFAULT_WIDTH`]×[`MODAL_DEFAULT_HEIGHT`]): a
+/// corrupted geometry value must never yield an off-screen window, so every
+/// field fails safe inside [`stored_overlay_presentation`].
+pub const OVERLAY_PRESENTATION_KEY: &str = "overlayPresentation";
+
+/// The smallest logical width/height the overlay may take — mirrors the
+/// frontend `OVERLAY_MIN_WIDTH`/`OVERLAY_MIN_HEIGHT` (overlay-geometry.ts) so a
+/// sub-min persisted extent is rejected here rather than clipping the chrome.
+pub const OVERLAY_MIN_WIDTH: f64 = 360.0;
+pub const OVERLAY_MIN_HEIGHT: f64 = 120.0;
+
+/// Default drawer extents (logical px): variable width for left/right, variable
+/// height for top/bottom. Both sit comfortably above the mins so the fallback
+/// value is itself a valid, on-screen extent.
+pub const DRAWER_WIDTH_DEFAULT: f64 = 420.0;
+pub const DRAWER_HEIGHT_DEFAULT: f64 = 320.0;
+
+/// Default modal size (logical px) — the free-floating (non-docked) shape.
+pub const MODAL_DEFAULT_WIDTH: f64 = 720.0;
+pub const MODAL_DEFAULT_HEIGHT: f64 = 480.0;
+
+/// The overlay presentation mode: a free `modal` window or a drawer docked flush
+/// against one display edge. The kebab-case wire tags mirror the frontend `Edge`
+/// union plus a `modal` tag; the whole value is the store's presentation record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PresentationMode {
+    Modal,
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// A logical-pixel size for the modal (free) presentation.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySizeConfig {
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A logical-pixel point — the modal (free) presentation's remembered top-left
+/// origin. Unlike [`OverlaySizeConfig`], a point carries NO minimum floor:
+/// legal multi-monitor virtual desktops place monitors at negative origins, so
+/// a negative x/y is a valid coordinate, not garbage (see the finite-only
+/// interpreter [`stored_point`]).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPointConfig {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// The per-edge drawer extents (logical px): width for left/right, height for
+/// top/bottom. Carrying all four lets a mode switch restore that edge's last
+/// preferred extent without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeExtents {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
+}
+
+/// The whole persisted overlay-presentation record: which mode is active plus
+/// the remembered extent for every edge, the modal size, and the modal's
+/// remembered position, so switching modes is lossless. [`Default`] is the safe
+/// fallback the interpreter returns on garbage — modal at the default size with
+/// no remembered position (`modal_position: None` → the frontend centers it),
+/// never an off-screen shape. `modal_position` is `None` until the user first
+/// drags the modal: absent means "never moved → center", preserving today's
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPresentation {
+    pub mode: PresentationMode,
+    pub edge_extents: EdgeExtents,
+    pub modal_size: OverlaySizeConfig,
+    pub modal_position: Option<OverlayPointConfig>,
+}
+
+impl Default for OverlayPresentation {
+    fn default() -> Self {
+        Self {
+            mode: PresentationMode::Modal,
+            edge_extents: EdgeExtents {
+                top: DRAWER_HEIGHT_DEFAULT,
+                bottom: DRAWER_HEIGHT_DEFAULT,
+                left: DRAWER_WIDTH_DEFAULT,
+                right: DRAWER_WIDTH_DEFAULT,
+            },
+            modal_size: OverlaySizeConfig {
+                width: MODAL_DEFAULT_WIDTH,
+                height: MODAL_DEFAULT_HEIGHT,
+            },
+            modal_position: None,
+        }
+    }
+}
+
+/// Read the persisted overlay presentation. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller keeps
+/// [`OverlayPresentation::default`]. A present-but-garbage value is repaired
+/// field-by-field inside [`stored_overlay_presentation`], never rejected whole.
+pub fn load_overlay_presentation(app: &AppHandle) -> Option<OverlayPresentation> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(OVERLAY_PRESENTATION_KEY)?;
+    Some(stored_overlay_presentation(&value))
+}
+
+/// Interpret one stored dimension (an extent or a modal side). Only a finite
+/// number at or above `min` is trusted; a non-number, NaN/∞, negative, or
+/// sub-min value is logged and replaced with `default` — the acceptance-critical
+/// seam that keeps a corrupted geometry value from producing an off-screen or
+/// chrome-clipping window. `default` is always ≥ `min`, so the fallback is itself
+/// a valid extent.
+fn stored_dimension(value: Option<&serde_json::Value>, label: &str, min: f64, default: f64) -> f64 {
+    match value.and_then(serde_json::Value::as_f64) {
+        Some(n) if n.is_finite() && n >= min => n,
+        _ => {
+            log::warn!(
+                "config: {OVERLAY_PRESENTATION_KEY}.{label} is not a finite number >= {min} \
+                 (got {value:?}); using default {default}"
+            );
+            default
+        }
+    }
+}
+
+/// Interpret the stored modal position. Unlike [`stored_dimension`], a point
+/// has NO minimum floor: legal multi-monitor virtual desktops place monitors at
+/// negative origins, so a floor would corrupt a valid negative coordinate. Only
+/// a JSON object with a finite `x` AND a finite `y` is trusted; an absent value,
+/// an explicit null, a non-object, a missing coordinate, or a non-finite value
+/// (NaN/∞) all yield `None` — "never moved / unusable → center". This repairs
+/// the CORRUPT half of the off-screen guard (the frontend `isOnScreen` guard
+/// repairs the off-screen-but-finite half). A present-but-garbage value is
+/// logged; an absent/null value is the common no-op case and stays quiet.
+fn stored_point(value: Option<&serde_json::Value>) -> Option<OverlayPointConfig> {
+    match value {
+        // Absent or explicit null: never moved (or explicitly cleared) — center.
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let parsed = v.as_object().and_then(|obj| {
+                let x = obj.get("x").and_then(serde_json::Value::as_f64)?;
+                let y = obj.get("y").and_then(serde_json::Value::as_f64)?;
+                (x.is_finite() && y.is_finite()).then_some(OverlayPointConfig { x, y })
+            });
+            if parsed.is_none() {
+                log::warn!(
+                    "config: {OVERLAY_PRESENTATION_KEY}.modalPosition is not an object with \
+                     finite x and y (got {v}); centering"
+                );
+            }
+            parsed
+        }
+    }
+}
+
+/// Interpret the whole stored presentation object with per-field fallback: an
+/// unknown/missing mode → `modal`; a non-number, negative, or sub-min extent or
+/// modal side → its floored default. A non-object value collapses every field to
+/// its default. The corrupt-value contract lives entirely here, so a single
+/// garbage field can never take the window off-screen — the rest of the record
+/// still applies and the bad field falls back to a sane on-screen value.
+fn stored_overlay_presentation(value: &serde_json::Value) -> OverlayPresentation {
+    let obj = value.as_object();
+    if obj.is_none() {
+        log::warn!(
+            "config: {OVERLAY_PRESENTATION_KEY} is not a JSON object (got {value}); using all defaults"
+        );
+    }
+
+    let mode = obj
+        .and_then(|m| m.get("mode"))
+        .and_then(|v| serde_json::from_value::<PresentationMode>(v.clone()).ok())
+        .unwrap_or_else(|| {
+            log::warn!(
+                "config: {OVERLAY_PRESENTATION_KEY}.mode is missing or not a known mode; using modal"
+            );
+            PresentationMode::Modal
+        });
+
+    let edges = obj
+        .and_then(|m| m.get("edgeExtents"))
+        .and_then(serde_json::Value::as_object);
+    let edge_extents = EdgeExtents {
+        top: stored_dimension(
+            edges.and_then(|m| m.get("top")),
+            "edgeExtents.top",
+            OVERLAY_MIN_HEIGHT,
+            DRAWER_HEIGHT_DEFAULT,
+        ),
+        bottom: stored_dimension(
+            edges.and_then(|m| m.get("bottom")),
+            "edgeExtents.bottom",
+            OVERLAY_MIN_HEIGHT,
+            DRAWER_HEIGHT_DEFAULT,
+        ),
+        left: stored_dimension(
+            edges.and_then(|m| m.get("left")),
+            "edgeExtents.left",
+            OVERLAY_MIN_WIDTH,
+            DRAWER_WIDTH_DEFAULT,
+        ),
+        right: stored_dimension(
+            edges.and_then(|m| m.get("right")),
+            "edgeExtents.right",
+            OVERLAY_MIN_WIDTH,
+            DRAWER_WIDTH_DEFAULT,
+        ),
+    };
+
+    let modal = obj
+        .and_then(|m| m.get("modalSize"))
+        .and_then(serde_json::Value::as_object);
+    let modal_size = OverlaySizeConfig {
+        width: stored_dimension(
+            modal.and_then(|m| m.get("width")),
+            "modalSize.width",
+            OVERLAY_MIN_WIDTH,
+            MODAL_DEFAULT_WIDTH,
+        ),
+        height: stored_dimension(
+            modal.and_then(|m| m.get("height")),
+            "modalSize.height",
+            OVERLAY_MIN_HEIGHT,
+            MODAL_DEFAULT_HEIGHT,
+        ),
+    };
+
+    let modal_position = stored_point(obj.and_then(|m| m.get("modalPosition")));
+
+    OverlayPresentation {
+        mode,
+        edge_extents,
+        modal_size,
+        modal_position,
+    }
+}
+
+/// Persist the overlay presentation record as one composite JSON object. The
+/// error names the failed persist path; the caller (the presentation applier,
+/// T02) rolls the in-memory value back and surfaces the failure as data
+/// (`persistError`, health-as-value) so an unpersisted shape can never silently
+/// revert on restart (hotkey/opt-in precedent).
+pub fn save_overlay_presentation(
+    app: &AppHandle,
+    presentation: &OverlayPresentation,
+) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    let wire = serde_json::to_value(presentation)
+        .map_err(|e| format!("failed to serialize {OVERLAY_PRESENTATION_KEY}: {e}"))?;
+    store.set(OVERLAY_PRESENTATION_KEY, wire.clone());
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {OVERLAY_PRESENTATION_KEY}={wire} to {path}: {e}"))?;
+    log::info!("config: persisted {OVERLAY_PRESENTATION_KEY}={wire} to {path}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -761,6 +1096,23 @@ mod tests {
     }
 
     #[test]
+    fn stored_first_run_booleans_round_trip() {
+        assert!(stored_first_run_complete(&serde_json::json!(true)));
+        assert!(!stored_first_run_complete(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_non_boolean_first_run_value_is_treated_as_not_complete() {
+        // The fail-safe direction is "show the explainer again" — garbage must
+        // never silently suppress onboarding, and the flag grants nothing on its
+        // own, so re-showing is harmless while suppressing hides the walkthrough.
+        assert!(!stored_first_run_complete(&serde_json::json!("true")));
+        assert!(!stored_first_run_complete(&serde_json::json!(1)));
+        assert!(!stored_first_run_complete(&serde_json::Value::Null));
+        assert!(!stored_first_run_complete(&serde_json::json!({"complete": true})));
+    }
+
+    #[test]
     fn stored_non_boolean_watcher_value_is_treated_as_off() {
         // Q7: garbage in the store must never silently start continuous
         // screen capture — off is the only safe fallback.
@@ -768,5 +1120,228 @@ mod tests {
         assert!(!stored_watcher_enabled(&serde_json::json!(1)));
         assert!(!stored_watcher_enabled(&serde_json::Value::Null));
         assert!(!stored_watcher_enabled(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_overlay_presentation_round_trips_a_serialized_record() {
+        // The persist round-trip proven at the interpreter level (the level every
+        // config test proves at): the JSON save_overlay_presentation writes reads
+        // back to the same record, for every mode.
+        for mode in [
+            PresentationMode::Modal,
+            PresentationMode::Top,
+            PresentationMode::Bottom,
+            PresentationMode::Left,
+            PresentationMode::Right,
+        ] {
+            let record = OverlayPresentation {
+                mode,
+                ..OverlayPresentation::default()
+            };
+            let wire = serde_json::to_value(record).unwrap();
+            assert_eq!(stored_overlay_presentation(&wire), record, "mode: {mode:?}");
+        }
+    }
+
+    #[test]
+    fn stored_overlay_presentation_trusts_in_range_extents() {
+        // A user-set extent at or above the axis min (even below the default) is
+        // honoured — only sub-min/garbage falls back. 380 > 360 min for left/right;
+        // 200 > 120 min for top/bottom; the modal size sits above both mins.
+        let value = serde_json::json!({
+            "mode": "left",
+            "edgeExtents": { "top": 200, "bottom": 260, "left": 380, "right": 500 },
+            "modalSize": { "width": 640, "height": 400 }
+        });
+        let got = stored_overlay_presentation(&value);
+        assert_eq!(got.mode, PresentationMode::Left);
+        assert_eq!(got.edge_extents.top, 200.0);
+        assert_eq!(got.edge_extents.bottom, 260.0);
+        assert_eq!(got.edge_extents.left, 380.0);
+        assert_eq!(got.edge_extents.right, 500.0);
+        assert_eq!(got.modal_size.width, 640.0);
+        assert_eq!(got.modal_size.height, 400.0);
+    }
+
+    #[test]
+    fn stored_overlay_presentation_unknown_mode_falls_back_to_modal() {
+        // Slice acceptance: an unknown mode tag must never leave the mode in a
+        // limbo state — modal is the safe default.
+        for bad_mode in [
+            serde_json::json!("center"),
+            serde_json::json!("Modal"),
+            serde_json::json!("top-left"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!(["top"]),
+        ] {
+            let value = serde_json::json!({ "mode": bad_mode });
+            assert_eq!(
+                stored_overlay_presentation(&value).mode,
+                PresentationMode::Modal,
+                "bad mode: {bad_mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_overlay_presentation_garbage_extents_fall_back_to_floored_defaults() {
+        // The acceptance-critical seam: a corrupted geometry value must fall back
+        // to a sane default, never an off-screen or chrome-clipping window.
+        // Non-number, negative, NaN-ish, and sub-min values all collapse to the
+        // per-axis default (which is itself above the min).
+        let value = serde_json::json!({
+            "mode": "top",
+            "edgeExtents": {
+                "top": -50,          // negative
+                "bottom": "320",     // non-number (string)
+                "left": 10,          // sub-min (< 360)
+                "right": null        // null
+            },
+            "modalSize": {
+                "width": 0,          // sub-min (< 360)
+                "height": {}         // non-number (object)
+            }
+        });
+        let got = stored_overlay_presentation(&value);
+        assert_eq!(got.edge_extents.top, DRAWER_HEIGHT_DEFAULT);
+        assert_eq!(got.edge_extents.bottom, DRAWER_HEIGHT_DEFAULT);
+        assert_eq!(got.edge_extents.left, DRAWER_WIDTH_DEFAULT);
+        assert_eq!(got.edge_extents.right, DRAWER_WIDTH_DEFAULT);
+        assert_eq!(got.modal_size.width, MODAL_DEFAULT_WIDTH);
+        assert_eq!(got.modal_size.height, MODAL_DEFAULT_HEIGHT);
+        // Every fallback dimension is a valid, on-screen extent.
+        assert!(got.edge_extents.left >= OVERLAY_MIN_WIDTH);
+        assert!(got.edge_extents.top >= OVERLAY_MIN_HEIGHT);
+        assert!(got.modal_size.width >= OVERLAY_MIN_WIDTH);
+        assert!(got.modal_size.height >= OVERLAY_MIN_HEIGHT);
+    }
+
+    #[test]
+    fn stored_overlay_presentation_missing_fields_use_defaults() {
+        // A partially-written object (only mode present) fills every absent field
+        // from the default record rather than erroring the whole value out.
+        let value = serde_json::json!({ "mode": "bottom" });
+        let got = stored_overlay_presentation(&value);
+        assert_eq!(got.mode, PresentationMode::Bottom);
+        assert_eq!(got.edge_extents, OverlayPresentation::default().edge_extents);
+        assert_eq!(got.modal_size, OverlayPresentation::default().modal_size);
+    }
+
+    #[test]
+    fn stored_overlay_presentation_round_trips_a_remembered_modal_position() {
+        // SC4 foundation: a dragged-to position must survive the persist
+        // round-trip. A record with a set modalPosition serializes and reads
+        // back identically — the wire shape the frontend restore path reads.
+        let record = OverlayPresentation {
+            modal_position: Some(OverlayPointConfig { x: 512.0, y: 384.0 }),
+            ..OverlayPresentation::default()
+        };
+        let wire = serde_json::to_value(record).unwrap();
+        assert_eq!(stored_overlay_presentation(&wire), record);
+        assert_eq!(
+            stored_overlay_presentation(&wire).modal_position,
+            Some(OverlayPointConfig { x: 512.0, y: 384.0 })
+        );
+    }
+
+    #[test]
+    fn stored_point_trusts_a_finite_point_with_no_floor() {
+        // Position, unlike a floored dimension, has NO minimum: a legal
+        // multi-monitor virtual desktop places monitors at negative origins, so
+        // negative x/y is a valid coordinate that must survive untouched.
+        assert_eq!(
+            stored_point(Some(&serde_json::json!({ "x": 100.0, "y": 200.0 }))),
+            Some(OverlayPointConfig { x: 100.0, y: 200.0 })
+        );
+        assert_eq!(
+            stored_point(Some(&serde_json::json!({ "x": -1920.0, "y": -128.0 }))),
+            Some(OverlayPointConfig { x: -1920.0, y: -128.0 })
+        );
+        // Integers coerce to f64; zero is a legal origin.
+        assert_eq!(
+            stored_point(Some(&serde_json::json!({ "x": 0, "y": 0 }))),
+            Some(OverlayPointConfig { x: 0.0, y: 0.0 })
+        );
+    }
+
+    #[test]
+    fn stored_point_absent_or_null_means_never_moved() {
+        // The common no-op case: no stored position → None → the frontend
+        // centers the modal. Absent and explicit null are equivalent.
+        assert_eq!(stored_point(None), None);
+        assert_eq!(stored_point(Some(&serde_json::Value::Null)), None);
+    }
+
+    #[test]
+    fn stored_point_corrupt_value_falls_back_to_none() {
+        // The CORRUPT half of the off-screen guard, repaired in Rust: a
+        // non-object, a missing coordinate, or a non-finite value must yield
+        // None (center), never a garbage point that could land off-screen.
+        for bad in [
+            serde_json::json!("512,384"),      // string
+            serde_json::json!(512),            // bare number
+            serde_json::json!(true),           // boolean
+            serde_json::json!([512, 384]),     // array
+            serde_json::json!({ "x": 512 }),   // missing y
+            serde_json::json!({ "y": 384 }),   // missing x
+            serde_json::json!({ "x": "512", "y": 384 }), // non-number x
+            serde_json::json!({ "x": 512, "y": null }),  // null y
+        ] {
+            assert_eq!(stored_point(Some(&bad)), None, "bad value: {bad}");
+        }
+    }
+
+    #[test]
+    fn stored_overlay_presentation_picks_up_a_valid_modal_position() {
+        // The interpreter threads modalPosition through: a full record with a
+        // finite negative-origin point restores it alongside every other field.
+        let value = serde_json::json!({
+            "mode": "modal",
+            "edgeExtents": { "top": 320, "bottom": 320, "left": 420, "right": 420 },
+            "modalSize": { "width": 720, "height": 480 },
+            "modalPosition": { "x": -256.0, "y": 40.0 }
+        });
+        assert_eq!(
+            stored_overlay_presentation(&value).modal_position,
+            Some(OverlayPointConfig { x: -256.0, y: 40.0 })
+        );
+    }
+
+    #[test]
+    fn stored_overlay_presentation_absent_modal_position_is_none() {
+        // Absent modalPosition preserves today's behavior: None → center. A
+        // corrupt modalPosition never takes the record down — only that field
+        // falls back while the rest applies.
+        let absent = serde_json::json!({ "mode": "modal" });
+        assert_eq!(stored_overlay_presentation(&absent).modal_position, None);
+
+        let corrupt = serde_json::json!({
+            "mode": "left",
+            "modalPosition": { "x": "nope", "y": 40.0 }
+        });
+        let got = stored_overlay_presentation(&corrupt);
+        assert_eq!(got.mode, PresentationMode::Left);
+        assert_eq!(got.modal_position, None);
+    }
+
+    #[test]
+    fn stored_overlay_presentation_non_object_is_all_defaults() {
+        // Q7: a wholesale-garbage value (string, number, array, null) yields the
+        // full safe default — modal at the default size, never off-screen.
+        for bad in [
+            serde_json::json!("modal"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!(["left", 420]),
+        ] {
+            assert_eq!(
+                stored_overlay_presentation(&bad),
+                OverlayPresentation::default(),
+                "bad value: {bad}"
+            );
+        }
     }
 }

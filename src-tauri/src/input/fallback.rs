@@ -42,7 +42,8 @@ mod tests {
         let backend: Arc<dyn InputControl> = Arc::new(FallbackInput);
         let actions = [
             InputAction::MouseMove { x: 1, y: 2 },
-            InputAction::MouseClick { button: MouseButton::Left },
+            InputAction::click(MouseButton::Left),
+            InputAction::click_at(MouseButton::Left, 5, 6),
             InputAction::TypeText { text: "hi".into() },
             InputAction::KeyPress { key: "return".into() },
         ];

@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+pub mod appfocus;
 #[cfg(desktop)]
 pub mod autostart;
 pub mod capture;
@@ -16,6 +17,8 @@ pub mod memory;
 #[cfg(desktop)]
 pub mod nudge;
 pub mod ocr;
+#[cfg(desktop)]
+pub mod onboarding;
 pub mod overlay;
 pub mod screenquery;
 pub mod privacy;
@@ -32,7 +35,26 @@ pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    // Logs go to stderr by default. When THIRD_EYE_LOG_FILE names a path, tee
+    // them to that file instead — a durable diagnostic seam that survives app
+    // relaunches (a `npm run tauri dev` started from a terminal otherwise sends
+    // stderr to that terminal, unreadable by an out-of-band observer). Opt-in:
+    // an unset var keeps the plain stderr behavior for normal runs.
+    {
+        let mut builder =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"));
+        if let Ok(path) = std::env::var("THIRD_EYE_LOG_FILE") {
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => {
+                    builder.target(env_logger::Target::Pipe(Box::new(file)));
+                }
+                Err(e) => {
+                    eprintln!("third-eye: cannot open THIRD_EYE_LOG_FILE {path:?}: {e} — logging to stderr");
+                }
+            }
+        }
+        builder.init();
+    }
 
     // Privacy-guard telemetry (M003 S02): one shared GuardState behind every
     // guarded lane client and the guarded embedder, incremented by the
@@ -91,6 +113,14 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.manage(cloud::optin::CloudHeavyProvider::new());
 
+    // Persisted overlay presentation (M006 S04): the mode + per-edge extents +
+    // modal size the overlay webview applies. Defaults to modal at the default
+    // size; the persisted shape is restored in setup(). Owned in Rust so the
+    // ACL-less Settings webview can drive it via IPC while only the overlay
+    // webview applies geometry (D040/MEM148).
+    #[cfg(desktop)]
+    let builder = builder.manage(overlay::presentation::OverlayPresentationState::new());
+
     builder
         .manage(overlay::OverlayManager::new())
         .manage(guard.clone())
@@ -111,6 +141,11 @@ pub fn run() {
         // unsupported elsewhere. Advertised unconditionally alongside input_action;
         // returns transient on-screen coordinates that never reach the store (R011).
         .manage(screenquery::commands::ScreenQueryState::with_platform_backend())
+        // App focus (M005): the managed AppFocus backend the composite executor's
+        // FocusAppTool draws from — NSWorkspace-backed on macOS, typed unsupported
+        // elsewhere. Activation needs no TCC; the tool is gated as a HID-class
+        // action (ActionKind::FocusApp) through the same ApprovalGate as input.
+        .manage(appfocus::commands::AppFocusState::with_platform_backend())
         // Privacy mode (S07): one shared toggle core serving the tray check
         // item and the set_privacy_mode IPC; persisted state applied in
         // setup() before the tray builds.
@@ -119,6 +154,10 @@ pub fn run() {
             overlay::show_overlay,
             overlay::hide_overlay,
             overlay::focus_overlay,
+            overlay::presentation::set_overlay_presentation,
+            overlay::presentation::set_overlay_extent,
+            overlay::presentation::set_overlay_position,
+            overlay::presentation::overlay_presentation,
             hotkey::hotkey_status,
             hotkey::set_hotkey,
             autostart::set_autostart,
@@ -160,7 +199,15 @@ pub fn run() {
             cloud::optin::set_cloud_optin,
             cloud::optin::cloud_optin_status,
             cloud::optin::set_cloud_heavy_provider,
-            cloud::optin::cloud_heavy_provider
+            cloud::optin::cloud_heavy_provider,
+            // First-run onboarding (M006): the overlay's first-launch explainer
+            // requests the OS permissions with context, then marks onboarding
+            // done so it never shows again. Requesting Accessibility here does
+            // not arm HID (D038/R019).
+            onboarding::first_run_status,
+            onboarding::request_capture_permission,
+            onboarding::request_input_permission,
+            onboarding::complete_first_run
         ])
         .setup(|app| {
             // Accessory policy: no Dock icon, and the app can never become
@@ -224,6 +271,15 @@ pub fn run() {
             #[cfg(desktop)]
             cloud::optin::apply_persisted_cloud_heavy_provider(app.handle());
 
+            // Persisted overlay presentation (M006 S04): a present settings.json
+            // key restores the overlay shape; absent keeps the safe default
+            // (modal), garbage is repaired field-by-field in config so it can
+            // never adopt an off-screen shape. In-memory only — no broadcast
+            // yet; the overlay webview reads it via `overlay_presentation` on
+            // mount and applies the geometry itself (the ACL split).
+            #[cfg(desktop)]
+            overlay::presentation::apply_persisted_overlay_presentation(app.handle());
+
             // Tray build failure is likewise non-fatal (Q5): the overlay
             // stays reachable via the hotkey and IPC; the cause is logged.
             #[cfg(desktop)]
@@ -274,6 +330,23 @@ pub fn run() {
             // round, never fatal.
             #[cfg(desktop)]
             nudge::spawn(app.handle());
+
+            // First-run onboarding (M006): if the user has not been onboarded,
+            // summon the overlay focused so the one-time explainer is visible
+            // and clickable without the user first pressing the hotkey. Focused
+            // (not idle) because idle overlays are click-through — the grant
+            // buttons must accept clicks. Non-fatal: a show failure is logged
+            // and the app still runs; the panel then appears on first summon.
+            #[cfg(desktop)]
+            if onboarding::should_show_on_launch(app.handle()) {
+                if let Err(e) = overlay::show_overlay(app.handle().clone()) {
+                    log::warn!("onboarding: could not show overlay for first run: {e}");
+                } else if let Err(e) = overlay::focus_overlay(app.handle().clone()) {
+                    log::warn!("onboarding: could not focus overlay for first run: {e}");
+                } else {
+                    log::info!("onboarding: showed overlay for first-run explainer");
+                }
+            }
 
             log::debug!(
                 "overlay window ready (hidden at launch, visible={:?})",

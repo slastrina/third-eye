@@ -50,6 +50,12 @@ pub struct ScreenElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// The localized name of the app owning the on-screen window this element's
+    /// center falls inside — `None` when no attributable window covers it (the
+    /// desktop, a menu bar extra, or the primary display's own chrome). Lets the
+    /// model tell "the Submit button in Chrome" from an identically-labelled one
+    /// elsewhere, and pair with `focus_app` to operate the right app (M005).
+    pub app: Option<String>,
 }
 
 /// The full screen-query failure taxonomy (R007). Serialized with a `kind` tag
@@ -164,6 +170,7 @@ mod tests {
                 y: 20,
                 width: 30,
                 height: 40,
+                app: Some("Finder".to_string()),
             }])
         }
     }
@@ -188,13 +195,19 @@ mod tests {
 
     #[test]
     fn element_json_shape_is_camel_case() {
-        let el = ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4 };
+        let el =
+            ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) };
         let v = serde_json::to_value(&el).unwrap();
         assert_eq!(v["text"], "hi");
         assert_eq!(v["x"], 1);
         assert_eq!(v["y"], 2);
         assert_eq!(v["width"], 3);
         assert_eq!(v["height"], 4);
+        assert_eq!(v["app"], "Zed");
+
+        // A None app serializes as JSON null — the model reads "unattributed".
+        let bare = ScreenElement { text: "x".into(), x: 0, y: 0, width: 1, height: 1, app: None };
+        assert!(serde_json::to_value(&bare).unwrap()["app"].is_null());
     }
 
     #[test]

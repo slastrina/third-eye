@@ -26,7 +26,10 @@ use objc2_vision::{
 use screencapturekit::screenshot_manager::{CGImage as ScCGImage, CGImageExt};
 
 use super::{OcrEngine, OcrError};
-use crate::capture::macos::capture_display_image_blocking;
+use crate::capture::macos::{
+    capture_display_image_blocking, capture_display_image_with_geometry_blocking, CaptureGeometry,
+    WindowAppRect,
+};
 
 /// The live macOS backend: one capture of the primary display per
 /// `extract`, recognized with Apple Vision at accurate level.
@@ -139,6 +142,30 @@ pub struct TextElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// The localized name of the app whose on-screen window covers this
+    /// element's center, or `None` when no window is attributable (M005). Set by
+    /// [`attribute_app`] against the capture's [`WindowAppRect`] list; lets the
+    /// model distinguish same-labelled elements across apps and pair with the
+    /// `focus_app` tool.
+    pub app: Option<String>,
+}
+
+/// The topmost app owning a window that covers `(center_x, center_y)`, or `None`
+/// when no window does (the desktop, an unattributed menu-bar region). Pure:
+/// `windows` is expected already sorted topmost-first (ascending `layer`, as
+/// [`crate::capture::macos::WindowAppRect`]s arrive), so the first covering rect
+/// wins — the frontmost window at that point. Point-in-rect is half-open on the
+/// far edges so adjacent windows never both claim a shared boundary pixel.
+pub fn attribute_app(center_x: i32, center_y: i32, windows: &[WindowAppRect]) -> Option<String> {
+    windows
+        .iter()
+        .find(|w| {
+            center_x >= w.x
+                && center_x < w.x + w.w
+                && center_y >= w.y
+                && center_y < w.y + w.h
+        })
+        .map(|w| w.app.clone())
 }
 
 /// Run accurate-level Vision text recognition and return each observation's
@@ -148,12 +175,18 @@ pub struct TextElement {
 /// the image's LOWER-left corner; we scale by the pixel dimensions and flip
 /// Y so callers get the same top-left screen space the input backend uses.
 ///
+/// Each element is attributed to the app owning the topmost window covering its
+/// center via [`attribute_app`] against `windows` (M005) — the same pixel space
+/// the boxes land in. Passing an empty `windows` slice leaves every `app` as
+/// `None`, which is what the synthetic-image tests do.
+///
 /// Mirrors [`recognize_text`] but keeps geometry; the text-only path stays
 /// the R011 proof (no coordinate ever crosses [`OcrEngine::extract`]).
 fn recognize_text_with_bounds(
     image: &objc2_core_graphics::CGImage,
     cw: u32,
     ch: u32,
+    windows: &[WindowAppRect],
 ) -> Result<Vec<TextElement>, OcrError> {
     let request = VNRecognizeTextRequest::new();
     request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
@@ -197,7 +230,10 @@ fn recognize_text_with_bounds(
                 // space; the top edge in top-left space is
                 // (1 - origin.y - height) scaled to pixels.
                 let y = ((1.0 - bbox.origin.y - bbox.size.height) * chf).round() as i32;
-                elements.push(TextElement { text, x, y, width, height });
+                // Attribute to the app whose topmost window covers the box's
+                // center — the same pixel space the box lives in (M005).
+                let app = attribute_app(x + width / 2, y + height / 2, windows);
+                elements.push(TextElement { text, x, y, width, height, app });
             }
         }
     }
@@ -212,9 +248,18 @@ fn recognize_text_with_bounds(
 /// that dies at the end of this function — only the elements escape (R011).
 pub fn extract_elements_blocking(max_dimension: u32) -> Result<Vec<TextElement>, OcrError> {
     let start = Instant::now();
-    let image = capture_display_image_blocking(max_dimension)?;
+    // The window→app rects come back in the SAME pixel space the captured image
+    // is normalized to, so each element can be labelled with its owning app.
+    let (image, windows, geometry) =
+        capture_display_image_with_geometry_blocking(max_dimension)?;
     let (cw, ch) = (image.width() as u32, image.height() as u32);
-    let result = recognize_text_with_bounds(as_vision_cgimage(&image), cw, ch);
+    let result = recognize_text_with_bounds(as_vision_cgimage(&image), cw, ch, &windows)
+        // Attribution ran in captured-pixel space (windows are in that space);
+        // NOW map every box back to logical screen points so the model aims a
+        // click in the coordinate space the input backend actually clicks in.
+        .map(|elements| -> Vec<TextElement> {
+            elements.into_iter().map(|el| to_screen_points(el, geometry)).collect()
+        });
     match &result {
         Ok(elements) => log::debug!(
             "screen_query: {} element(s) in {} ms",
@@ -224,6 +269,29 @@ pub fn extract_elements_blocking(max_dimension: u32) -> Result<Vec<TextElement>,
         Err(err) => log::error!("screen_query: {} ({err})", err.kind()),
     }
     result
+}
+
+/// Convert one element's bounding box from captured-pixel space to logical
+/// screen points. The capture is taken at native density then capped to
+/// `max_dimension`, so the pixel→point scale is `point / pixel` on each axis;
+/// this is the exact inverse of the `point→pixel` scale the capture applied.
+/// A degenerate geometry (zero pixels) leaves the box unchanged rather than
+/// dividing by zero — the model then aims in pixel space, which is no worse than
+/// before and never panics.
+fn to_screen_points(el: TextElement, geom: CaptureGeometry) -> TextElement {
+    if geom.pixel_w == 0 || geom.pixel_h == 0 {
+        return el;
+    }
+    let sx = geom.point_w / geom.pixel_w as f64;
+    let sy = geom.point_h / geom.pixel_h as f64;
+    TextElement {
+        text: el.text,
+        x: (el.x as f64 * sx).round() as i32,
+        y: (el.y as f64 * sy).round() as i32,
+        width: (el.width as f64 * sx).round() as i32,
+        height: (el.height as f64 * sy).round() as i32,
+        app: el.app,
+    }
 }
 
 #[cfg(test)]
@@ -338,9 +406,14 @@ mod tests {
     fn recognize_text_with_bounds_returns_flipped_pixel_box() {
         let (w, h) = (900usize, 200usize);
         let image = render_text_image("TARGET", w, h, 64.0);
-        let elements = recognize_text_with_bounds(&image, w as u32, h as u32)
+        // No window rects for a synthetic in-memory image → every app is None.
+        let elements = recognize_text_with_bounds(&image, w as u32, h as u32, &[])
             .expect("recognition succeeds on in-memory image");
         assert!(!elements.is_empty(), "no elements recognized");
+        assert!(
+            elements.iter().all(|e| e.app.is_none()),
+            "empty windows must leave every app unattributed"
+        );
         let joined = elements
             .iter()
             .map(|e| e.text.as_str())
@@ -357,6 +430,134 @@ mod tests {
             assert!(el.x + el.width <= w as i32, "box exceeds width: {el:?}");
             assert!(el.y >= 0 && el.y < h as i32, "flipped y out of [0,h): {el:?}");
             assert!(el.y + el.height <= h as i32, "box exceeds height: {el:?}");
+        }
+    }
+
+    fn win(app: &str, x: i32, y: i32, w: i32, h: i32, layer: i32) -> WindowAppRect {
+        WindowAppRect { app: app.into(), x, y, w, h, layer }
+    }
+
+    #[test]
+    fn to_screen_points_maps_captured_pixels_back_to_logical_points() {
+        // A 3840x2160 captured image (Retina 1920x1080 @ 2x, under the 2048 cap
+        // it would actually be capped, but exercise the pure scale here): a box
+        // at pixel (1680, 480) 800x80 maps to point (840, 240) 400x40 — exactly
+        // the space the input backend clicks in. This is the fix: without it the
+        // model clicks pixel coords as if they were points and lands off-target.
+        let geom = CaptureGeometry { pixel_w: 3840, pixel_h: 2160, point_w: 1920.0, point_h: 1080.0 };
+        let el = TextElement {
+            text: "Search Google or type a URL".into(),
+            x: 1680,
+            y: 480,
+            width: 800,
+            height: 80,
+            app: Some("Google Chrome".into()),
+        };
+        let pt = to_screen_points(el, geom);
+        assert_eq!((pt.x, pt.y, pt.width, pt.height), (840, 240, 400, 40));
+        assert_eq!(pt.app.as_deref(), Some("Google Chrome"));
+    }
+
+    #[test]
+    fn to_screen_points_is_identity_when_pixels_equal_points() {
+        // Non-Retina 1:1 display: captured pixels already ARE points, so the box
+        // is unchanged.
+        let geom = CaptureGeometry { pixel_w: 1440, pixel_h: 900, point_w: 1440.0, point_h: 900.0 };
+        let el = TextElement { text: "x".into(), x: 100, y: 200, width: 60, height: 24, app: None };
+        let pt = to_screen_points(el.clone(), geom);
+        assert_eq!(pt, el);
+    }
+
+    #[test]
+    fn to_screen_points_leaves_box_unchanged_on_degenerate_geometry() {
+        // Zero-pixel geometry must not divide by zero — return the box as-is.
+        let geom = CaptureGeometry { pixel_w: 0, pixel_h: 0, point_w: 1920.0, point_h: 1080.0 };
+        let el = TextElement { text: "x".into(), x: 5, y: 6, width: 7, height: 8, app: None };
+        assert_eq!(to_screen_points(el.clone(), geom), el);
+    }
+
+    #[test]
+    fn attribute_app_center_inside_one_rect() {
+        let windows = vec![win("Google Chrome", 100, 100, 400, 300, 0)];
+        // A point well inside the single window is attributed to it.
+        assert_eq!(attribute_app(200, 200, &windows).as_deref(), Some("Google Chrome"));
+    }
+
+    #[test]
+    fn attribute_app_outside_all_rects_is_none() {
+        let windows = vec![win("Zed", 0, 0, 100, 100, 0)];
+        assert_eq!(attribute_app(200, 200, &windows), None, "the desktop is unattributed");
+        // No windows at all → None.
+        assert_eq!(attribute_app(10, 10, &[]), None);
+    }
+
+    #[test]
+    fn attribute_app_overlapping_rects_picks_topmost() {
+        // Two overlapping windows; the slice is topmost-first (ascending layer),
+        // exactly as WindowAppRects arrive, so the first covering rect wins.
+        let windows = vec![
+            win("Google Chrome", 0, 0, 500, 500, 0), // frontmost
+            win("Zed", 0, 0, 500, 500, 5),           // behind
+        ];
+        assert_eq!(
+            attribute_app(250, 250, &windows).as_deref(),
+            Some("Google Chrome"),
+            "the topmost (lowest layer) window must win the overlap"
+        );
+    }
+
+    #[test]
+    fn attribute_app_edges_are_half_open() {
+        // Half-open on the far edges so adjacent windows never both claim a
+        // boundary pixel: the left/top edge is inside, the right/bottom is not.
+        let windows = vec![win("App", 10, 10, 20, 20, 0)]; // covers x∈[10,30), y∈[10,30)
+        assert_eq!(attribute_app(10, 10, &windows).as_deref(), Some("App"), "top-left is inside");
+        assert_eq!(attribute_app(29, 29, &windows).as_deref(), Some("App"), "last inside pixel");
+        assert_eq!(attribute_app(30, 20, &windows), None, "right edge is exclusive");
+        assert_eq!(attribute_app(20, 30, &windows), None, "bottom edge is exclusive");
+    }
+
+    /// Live probe of the coordinate-space fix (M005 targeting): capture the real
+    /// screen, print the geometry, and assert every returned box falls within the
+    /// display's LOGICAL POINT bounds — the space the input backend clicks in.
+    /// Before the fix, boxes were in captured-pixel space (capped at 2048), so on
+    /// a Retina panel they exceeded the point bounds and the click landed
+    /// off-target. Ignored (needs Screen Recording + a live display).
+    #[test]
+    #[ignore = "requires Screen Recording permission and a live display (targeting UAT)"]
+    fn live_screen_query_coordinates_are_in_logical_points() {
+        use crate::capture::macos::capture_display_image_with_geometry_blocking;
+        let (_image, _windows, geom) =
+            match capture_display_image_with_geometry_blocking(super::super::OCR_MAX_DIMENSION) {
+                Ok(t) => t,
+                Err(err) => {
+                    assert_eq!(err.kind(), "permission-denied", "unexpected: {err}");
+                    return;
+                }
+            };
+        eprintln!(
+            "geometry: pixels {}x{}  points {}x{}  (scale {:.3}x {:.3}y)",
+            geom.pixel_w,
+            geom.pixel_h,
+            geom.point_w,
+            geom.point_h,
+            geom.pixel_w as f64 / geom.point_w,
+            geom.pixel_h as f64 / geom.point_h,
+        );
+        let elements = extract_elements_blocking(super::super::OCR_MAX_DIMENSION)
+            .expect("screen query succeeds with permission");
+        eprintln!("{} element(s); first few in LOGICAL POINTS:", elements.len());
+        for el in elements.iter().take(6) {
+            eprintln!("  {:?} @ ({},{}) {}x{} app={:?}", el.text, el.x, el.y, el.width, el.height, el.app);
+        }
+        // Every box must lie within the display's logical-point bounds (with a
+        // small margin for rounding) — proof the coordinates are clickable.
+        let (pw, ph) = (geom.point_w as i32, geom.point_h as i32);
+        for el in &elements {
+            assert!(
+                el.x >= 0 && el.x <= pw + 2 && el.y >= 0 && el.y <= ph + 2,
+                "box outside logical point bounds {pw}x{ph}: {el:?}",
+            );
         }
     }
 

@@ -7,11 +7,14 @@ import {
   captureErrorTitle,
   captureScreen,
   chatReducer,
+  completeFirstRun,
   composeMessages,
+  firstRunStatus,
   initialChatState,
   modelInfo,
   onLlmDone,
   onLlmError,
+  onLlmReasoning,
   onLlmToken,
   onLlmToolCall,
   onLlmToolResult,
@@ -21,7 +24,10 @@ import {
   onPrivacyChanged,
   onRunState,
   openCaptureSettings,
+  openInputSettings,
   privacyStatus,
+  requestCapturePermission,
+  requestInputPermission,
   runState,
   sendChat,
   setModel,
@@ -32,11 +38,77 @@ import {
   toCaptureFlowError,
 } from "./chat";
 import {
+  allSupportedGranted,
+  initialOnboardingState,
+  onboardingBlocked,
+  onboardingReducer,
+} from "./onboarding-state";
+import {
   hideOverlay,
   onOverlayStateChanged,
   type OverlayState,
 } from "./overlay-state";
+import {
+  centeredModalRect,
+  drawerRect,
+  extentFromSize,
+  isOnScreen,
+  RESIZE_GRIP_DIRECTION,
+  resizeDirectionForEdge,
+  type Edge,
+} from "./overlay-geometry";
+import {
+  drawerEdgeOf,
+  drawerExtentFor,
+  onOverlayPresentation,
+  overlayPresentation,
+  setOverlayExtent,
+  setOverlayPosition,
+  type PresentationStatus,
+} from "./overlay-presentation-state";
 import { onTrayNotice, type TrayNotice } from "./tray-notice";
+import {
+  availableMonitors,
+  currentMonitor,
+  getCurrentWindow,
+  LogicalPosition,
+  LogicalSize,
+} from "@tauri-apps/api/window";
+
+// The overlay-presentation config (M006/S04) is the authoritative geometry
+// source: `overlay_presentation` on mount restores the persisted shape and the
+// `overlay://presentation` broadcast pushes every live change. It replaces the
+// S02/S03 `?edge=` dev harness — which is now retained ONLY as a documented
+// TEST HOOK (below) that seeds the INITIAL drawer edge so Playwright can render
+// the drawer/modal DOM variants without a Tauri backend. The moment the real
+// config read resolves it overrides this seed, so there is no diverging runtime
+// source (S04 Integration Closure: "documented if kept as a test hook").
+
+// The default extents/size the ?edge= test seed carries. These mirror the Rust
+// OverlayPresentation::default fields (config.rs); the production values always
+// arrive via overlay_presentation() and supersede these.
+const SEED_EDGE_EXTENTS = { top: 320, bottom: 320, left: 420, right: 420 } as const;
+const SEED_MODAL_SIZE = { width: 720, height: 480 } as const;
+
+// TEST HOOK (not a production source): seed the initial presentation from
+// ?edge= so the overlay renders a drawer variant deterministically under
+// Playwright, where the Tauri invoke rejects and no config can load. An absent
+// or off-contract value yields null → the default modal (floating) DOM.
+function seedPresentationFromQuery(): PresentationStatus | null {
+  const raw = new URLSearchParams(window.location.search).get("edge");
+  const mode =
+    raw === "top" || raw === "bottom" || raw === "left" || raw === "right"
+      ? raw
+      : null;
+  if (!mode) return null;
+  return {
+    mode,
+    edgeExtents: { ...SEED_EDGE_EXTENTS },
+    modalSize: { ...SEED_MODAL_SIZE },
+    modalPosition: null,
+    persistError: null,
+  };
+}
 
 function App() {
   const [state, setState] = useState<OverlayState>("hidden");
@@ -51,11 +123,39 @@ function App() {
   const [draft, setDraft] = useState("");
   const messagesRef = useRef<HTMLDivElement>(null);
 
+  // Overlay presentation config (M006/S04): the persisted mode + per-edge
+  // extents + modal size that own the overlay's geometry. Seeded from the
+  // ?edge= test hook (null in production) and then made authoritative by the
+  // mount read + broadcast below. The docked drawer edge is derived from it —
+  // null in modal mode leaves the floating panel intact.
+  const [presentation, setPresentation] = useState<PresentationStatus | null>(
+    seedPresentationFromQuery,
+  );
+  const drawerEdge: Edge | null = presentation ? drawerEdgeOf(presentation) : null;
+
+  // First-run onboarding (M006): a one-time explainer that requests Screen
+  // Recording + Accessibility with context. All show/hide and per-permission
+  // lifecycle logic is pure (onboarding-state.ts); this component only fires the
+  // IPC. Requesting Accessibility here does not arm HID (D038/R019).
+  const [onboarding, dispatchOnboarding] = useReducer(
+    onboardingReducer,
+    initialOnboardingState,
+  );
+  // The once-registered blur/Escape dismiss handler needs live onboarding
+  // visibility without re-binding: while the explainer is up we must NOT
+  // dismiss on blur/Escape, or losing key focus (this app is Accessory and
+  // never frontmost, so blur is easy) drops the overlay out of visible-focused
+  // and the still-rendered panel goes click-through — dead Grant/Continue/Skip
+  // buttons. Keeping the overlay focused keeps native mouse events on.
+  const onboardingVisibleRef = useRef(onboarding.visible);
+  onboardingVisibleRef.current = onboarding.visible;
+
   // Token deltas are coalesced per animation frame so a fast stream costs at
   // most one render per frame, not one per token. Terminal events carry the
   // authoritative full text, so a tail left in this buffer is harmless — the
   // reducer drops it as stale once the request id is cleared.
   const tokenBufferRef = useRef(new Map<number, string>());
+  const reasoningBufferRef = useRef(new Map<number, string>());
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -96,6 +196,10 @@ function App() {
 
   useEffect(() => {
     const dismiss = () => {
+      // While the first-run explainer is up, blur/Escape must not tear the
+      // overlay down — dismissing drops it out of visible-focused and the
+      // still-rendered onboarding panel becomes click-through (dead buttons).
+      if (onboardingVisibleRef.current) return;
       if (stateRef.current === "hidden") return;
       // Optimistic: the Rust event will confirm, but marking hidden now
       // stops Escape+blur firing back-to-back from double-invoking hide.
@@ -131,11 +235,26 @@ function App() {
       for (const [requestId, token] of buffered) {
         dispatchChat({ type: "token", payload: { requestId, token } });
       }
+      // Reasoning deltas coalesce on the same frame — they target the transient
+      // Thinking… region (a different field than `text`), so flushing them after
+      // tokens can't reorder anything user-visible in the answer body.
+      const bufferedReasoning = reasoningBufferRef.current;
+      reasoningBufferRef.current = new Map();
+      for (const [requestId, delta] of bufferedReasoning) {
+        dispatchChat({ type: "reasoning", payload: { requestId, delta } });
+      }
     };
     const unlistens = [
       onLlmToken((payload) => {
         const buffer = tokenBufferRef.current;
         buffer.set(payload.requestId, (buffer.get(payload.requestId) ?? "") + payload.token);
+        if (rafRef.current === null) {
+          rafRef.current = requestAnimationFrame(flushTokens);
+        }
+      }),
+      onLlmReasoning((payload) => {
+        const buffer = reasoningBufferRef.current;
+        buffer.set(payload.requestId, (buffer.get(payload.requestId) ?? "") + payload.delta);
         if (rafRef.current === null) {
           rafRef.current = requestAnimationFrame(flushTokens);
         }
@@ -234,6 +353,24 @@ function App() {
     };
   }, []);
 
+  // First-run onboarding snapshot (M006). Decides whether to show the explainer;
+  // outside a Tauri runtime the invoke rejects and onboarding simply never
+  // shows (same absorb posture as the queries above). The backend also shows
+  // the overlay from setup() when onboarding is pending, so the panel is
+  // visible without the user summoning it.
+  useEffect(() => {
+    let cancelled = false;
+    firstRunStatus().then(
+      (status) => {
+        if (!cancelled) dispatchOnboarding({ type: "snapshot", status });
+      },
+      (err) => console.debug("onboarding: first_run_status unavailable:", err),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Cross-window sync (S07): mutation responses only reach the calling
   // window, so routing changes made in the settings window arrive here via
   // the llm://model-info broadcast, and privacy toggles (settings window or
@@ -279,6 +416,112 @@ function App() {
     if (walkthroughOpen) console.debug("capture: permission walkthrough opened");
   }, [walkthroughOpen]);
 
+  // Presentation config (M006/S04): the overlay webview is the sole geometry
+  // applier (it alone holds the setSize/setPosition/currentMonitor ACLs). Read
+  // `overlay_presentation` on mount to restore the persisted shape after a
+  // relaunch, then subscribe to the `overlay://presentation` broadcast so a
+  // change from Settings (or a live resize) is adopted immediately. Outside a
+  // Tauri runtime the invoke rejects and the seeded/default presentation holds
+  // (same absorb posture as model_info) — never a crash.
+  useEffect(() => {
+    let cancelled = false;
+    overlayPresentation().then(
+      (status) => {
+        if (!cancelled) setPresentation(status);
+      },
+      (err) => console.debug("overlay: overlay_presentation unavailable:", err),
+    );
+    const unlisten = onOverlayPresentation((status) => setPresentation(status));
+    // MEM115: a capability/ACL denial rejects listen() inside the real app —
+    // catch loudly so a dead subscription is visible, not a frozen surface.
+    unlisten.catch((err) => console.error("overlay: event subscription failed:", err));
+    return () => {
+      cancelled = true;
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // Apply the presentation geometry (M006/S02–S04): a direct window side-effect,
+  // never through OverlayState/dispatch (D040/MEM148, preserving D018 click-
+  // through). In a drawer mode, read the active display's WORK AREA (excludes
+  // menu bar / dock / notch) via currentMonitor() and snap flush with the
+  // per-edge extent (drawerRect converts physical→logical once). In modal mode,
+  // restore the free-floating size (no reposition — the user drags it). Runs on
+  // every presentation change, so a broadcast re-applies the persisted shape
+  // idempotently. Rejections are benign (no Tauri under vite dev, or a missing
+  // ACL grant) so absorb-and-log, mirroring startPanelDrag/startPanelResize.
+  useEffect(() => {
+    if (!presentation) return;
+    const edge = drawerEdgeOf(presentation);
+    if (edge) {
+      const extent = drawerExtentFor(presentation, edge);
+      currentMonitor()
+        .then((monitor) => {
+          if (!monitor) {
+            // No monitor resolved (headless / detached) — nothing to snap to.
+            console.debug("overlay: drawer snap skipped, no current monitor");
+            return;
+          }
+          const rect = drawerRect(
+            { ...monitor.workArea, scaleFactor: monitor.scaleFactor },
+            edge,
+            extent,
+          );
+          // getCurrentWindow() reads window.__TAURI_INTERNALS__.metadata
+          // synchronously — outside a Tauri runtime it THROWS, so it must stay
+          // inside this .then (never eager in the effect body) or a plain-browser
+          // render crashes. currentMonitor() has already rejected there.
+          const win = getCurrentWindow();
+          return Promise.all([
+            win.setPosition(new LogicalPosition(rect.x, rect.y)),
+            win.setSize(new LogicalSize(rect.width, rect.height)),
+          ]);
+        })
+        .catch((err) => console.debug("overlay: drawer snap no-op:", err));
+    } else {
+      // Modal (M006/S05): restore the free-floating size AND position. A stored
+      // modalPosition still on-screen is restored via setPosition; absent or
+      // off-screen (a point on a since-removed monitor — the OFF-SCREEN-BUT-
+      // FINITE half of SC4 the Rust interpreter can't see) falls back to a
+      // centered rect via centeredModalRect. Both fallbacks share that one
+      // centering computation. Re-applying the same stored point on a broadcast
+      // is a no-op move, so a live resize can't yank a modal the user just
+      // dragged. Defer getCurrentWindow() into the promise so its synchronous
+      // throw outside a Tauri runtime becomes a caught rejection.
+      const size = presentation.modalSize;
+      const position = presentation.modalPosition;
+      Promise.all([availableMonitors(), currentMonitor()])
+        .then(([monitors, monitor]) => {
+          const win = getCurrentWindow();
+          const apply = (
+            x: number,
+            y: number,
+            width: number,
+            height: number,
+          ): Promise<void> =>
+            Promise.all([
+              win.setSize(new LogicalSize(width, height)),
+              win.setPosition(new LogicalPosition(x, y)),
+            ]).then(() => {});
+          if (position && isOnScreen(position, monitors)) {
+            return apply(position.x, position.y, size.width, size.height);
+          }
+          if (!monitor) {
+            // No monitor resolved (headless / detached) — size only, no anchor
+            // to center against.
+            console.debug("overlay: modal center skipped, no current monitor");
+            return win.setSize(new LogicalSize(size.width, size.height));
+          }
+          const rect = centeredModalRect(
+            { ...monitor.workArea, scaleFactor: monitor.scaleFactor },
+            size,
+          );
+          return apply(rect.x, rect.y, rect.width, rect.height);
+        })
+        .catch((err) => console.debug("overlay: modal geometry no-op:", err));
+    }
+  }, [presentation]);
+
   const attachScreen = () => {
     if (chatRef.current.attachPending) return;
     dispatchChat({ type: "attach-start" });
@@ -298,10 +541,186 @@ function App() {
     );
   };
 
+  // Geometry (M006/S01): the header drags the whole panel, the corner grip
+  // resizes it — both via Tauri's native window drag on the same NSWindow the
+  // nonactivating NSPanel wraps, so moving/resizing never activates the app or
+  // voids click-through (D018). These live inside .overlay-panel, whose
+  // pointer-events is auto only in visible-focused, so an idle click-through
+  // overlay is not draggable — the correct security posture. Rejections here
+  // are benign (e.g. no Tauri runtime under vite dev), so absorb-and-log.
+  const startPanelDrag = (event: React.MouseEvent) => {
+    // Only a primary-button drag on the header moves the window; let clicks on
+    // interactive children (buttons) through unmolested.
+    if (event.button !== 0) return;
+    getCurrentWindow()
+      .startDragging()
+      .catch((err) => console.debug("overlay: startDragging no-op:", err));
+  };
+
+  const startPanelResize = (event: React.MouseEvent) => {
+    if (event.button !== 0) return;
+    getCurrentWindow()
+      .startResizeDragging(RESIZE_GRIP_DIRECTION)
+      .catch((err) => console.debug("overlay: startResizeDragging no-op:", err));
+  };
+
+  // Drawer resize (M006/S03): in drawer mode the draggable affordance is the
+  // INNER edge (the one facing the screen interior), which grows the drawer's
+  // variable dimension via native startResizeDragging toward that direction.
+  // resizeDirectionForEdge maps the docked edge to it (left→East, right→West,
+  // top→South, bottom→North) so the drag grows inward instead of fighting the
+  // anchor. Same native-resize, non-activating, absorb-and-log posture as
+  // startPanelResize (D018); releasing leaves the new extent (S04 reads it back
+  // via innerSize()+extentFromSize to persist). The guard also narrows drawerEdge
+  // to non-null — the handle only renders in drawer mode, so this never no-ops
+  // in practice, but keeps the type honest without a non-null assertion.
+  const startDrawerResize = (event: React.MouseEvent) => {
+    if (event.button !== 0 || !drawerEdge) return;
+    getCurrentWindow()
+      .startResizeDragging(resizeDirectionForEdge(drawerEdge))
+      .catch((err) => console.debug("overlay: startResizeDragging no-op:", err));
+  };
+
+  // Persist a live resize (M006/S04): consumes the S03 extentFromSize read-back
+  // seam. On the resize affordance's mouseup — after native startResizeDragging
+  // hands the window back — read innerSize() (PHYSICAL px), convert to logical
+  // via the window scale factor (the pixels-vs-points boundary drawerRect also
+  // honours), derive the mode's extent, and invoke set_overlay_extent so the new
+  // shape is saved. The backend floors + persists and broadcasts the result,
+  // which re-applies through the effect above — idempotent because extentFromSize
+  // matches drawerRect's flooring. Never rejects the UI: a persist failure rides
+  // persistError on the broadcast; a no-Tauri/ACL rejection is absorbed-and-logged.
+  const persistResizeEnd = () => {
+    if (!presentation) return;
+    const mode = presentation.mode;
+    // Defer getCurrentWindow() into the promise so its synchronous throw outside
+    // a Tauri runtime becomes a caught rejection (same guard as the apply effect).
+    Promise.resolve()
+      .then(() => {
+        const win = getCurrentWindow();
+        return Promise.all([win.innerSize(), win.scaleFactor()]);
+      })
+      .then(([size, scale]) => {
+        const logical = size.toLogical(scale);
+        if (mode === "modal") {
+          // Modal stores both axes as the free-floating size.
+          return setOverlayExtent("modal", logical.width, logical.height);
+        }
+        // A drawer stores only its variable axis; extentFromSize selects + floors
+        // it, and the backend reads the relevant axis from (width, height).
+        const extent = extentFromSize(mode, {
+          width: logical.width,
+          height: logical.height,
+        });
+        return setOverlayExtent(mode, extent, extent);
+      })
+      .then((status) => {
+        if (status) setPresentation(status);
+      })
+      .catch((err) => console.debug("overlay: persist resize no-op:", err));
+  };
+
+  // Persist a live modal move (M006/S05): mirrors persistResizeEnd on the
+  // drag-handle mouseup. After native startDragging hands the window back, read
+  // outerPosition() (PHYSICAL px) and convert to LOGICAL via the window scale
+  // factor (the pixels-vs-points boundary drawerRect/isOnScreen also honour),
+  // then invoke set_overlay_position so the landing spot is saved. The backend
+  // persists + broadcasts (no floor — a legal multi-monitor origin may be
+  // negative) but NEVER moves the window (the ACL split); the broadcast re-
+  // applies through the effect above, a no-op move onto the same point. Only
+  // meaningful in modal mode — a drawer is anchored, not dragged — so skip when
+  // docked. Never rejects the UI: a persist failure rides persistError; a no-
+  // Tauri/ACL rejection is absorbed-and-logged.
+  const persistMoveEnd = () => {
+    if (!presentation || drawerEdge) return;
+    // Defer getCurrentWindow() into the promise so its synchronous throw outside
+    // a Tauri runtime becomes a caught rejection (same guard as the apply effect).
+    Promise.resolve()
+      .then(() => {
+        const win = getCurrentWindow();
+        return Promise.all([win.outerPosition(), win.scaleFactor()]);
+      })
+      .then(([position, scale]) => {
+        const logical = position.toLogical(scale);
+        return setOverlayPosition(logical.x, logical.y);
+      })
+      .then((status) => {
+        if (status) setPresentation(status);
+      })
+      .catch((err) => console.debug("overlay: persist move no-op:", err));
+  };
+
   const openScreenRecordingSettings = () => {
     console.debug("capture: opening Screen Recording settings from walkthrough");
     openCaptureSettings().catch((err) =>
       console.warn("capture: open settings failed:", err),
+    );
+  };
+
+  // First-run onboarding actions (M006). Each request fires the OS prompt and
+  // folds the resulting live permission back into the pure reducer.
+  const requestCapture = () => {
+    dispatchOnboarding({ type: "request-start", which: "capture" });
+    requestCapturePermission().then(
+      (permission) =>
+        dispatchOnboarding({ type: "request-done", which: "capture", permission }),
+      (err) => {
+        console.warn("onboarding: request_capture_permission failed:", err);
+        // Leave the step in requesting? No — re-query the truthful state.
+        dispatchOnboarding({
+          type: "request-done",
+          which: "capture",
+          permission: chatRef.current.capturePermission ?? { granted: false, supported: true },
+        });
+      },
+    );
+  };
+
+  const requestInput = () => {
+    dispatchOnboarding({ type: "request-start", which: "input" });
+    requestInputPermission().then(
+      (permission) =>
+        dispatchOnboarding({ type: "request-done", which: "input", permission }),
+      (err) => {
+        console.warn("onboarding: request_input_permission failed:", err);
+        dispatchOnboarding({
+          type: "request-done",
+          which: "input",
+          permission: { granted: false, supported: true },
+        });
+      },
+    );
+  };
+
+  // Finish or skip onboarding — both persist the done flag so the panel never
+  // shows again. The overlay stays visible (the user summoned nothing); it
+  // dismisses on the next Escape/blur like any other panel.
+  const finishOnboarding = () => {
+    // Defense-in-depth: never persist "done" while a required permission is
+    // missing, even if the disabled Continue button were somehow bypassed. The
+    // block is enforced here, not just in the button's disabled state.
+    if (onboardingBlocked(onboarding)) {
+      console.debug("onboarding: finish blocked — Screen Recording not granted");
+      return;
+    }
+    completeFirstRun().then(
+      (status) => dispatchOnboarding({ type: "completed", status }),
+      // Outside Tauri the invoke rejects — dismiss anyway so the panel never
+      // wedges; the flag simply wasn't persisted (harmless, re-shows next run).
+      (err) => {
+        console.debug("onboarding: complete_first_run unavailable:", err);
+        dispatchOnboarding({
+          type: "completed",
+          status: { pending: false, capture: { granted: false, supported: true }, input: { granted: false, supported: true }, persistError: null },
+        });
+      },
+    );
+  };
+
+  const openAccessibilitySettings = () => {
+    console.debug("onboarding: opening Accessibility settings from explainer");
+    openInputSettings().catch((err) =>
+      console.debug("onboarding: open_input_settings unavailable:", err),
     );
   };
 
@@ -349,6 +768,140 @@ function App() {
     ? routing.lanes.find((lane) => lane.name === routing.activeLane)?.modelId
     : null;
 
+  // First-run onboarding takes over the overlay when pending — a one-time
+  // explainer requesting Screen Recording + Accessibility with context. It
+  // renders regardless of overlay state (the backend shows the overlay from
+  // setup() when onboarding is pending), ahead of the nudge/chat chrome.
+  if (onboarding.visible) {
+    const stepLabel = (step: (typeof onboarding)["capture"]): string => {
+      switch (step) {
+        case "granted":
+          return "Granted";
+        case "denied":
+          return "Not granted — open System Settings";
+        case "requesting":
+          return "Waiting for you…";
+        case "unsupported":
+          return "Not needed on this platform";
+        case "idle":
+          return "";
+      }
+    };
+    const allSet = allSupportedGranted(onboarding);
+    // A required permission (Screen Recording) is missing — the user must fix it
+    // before continuing. No Skip past a hard block; Continue stays disabled until
+    // the grant lands. Accessibility never blocks (it is HID's off-by-default
+    // grant, D038/R019).
+    const blocked = onboardingBlocked(onboarding);
+    return (
+      <div className="overlay-root" data-state={state} data-onboarding="true">
+        <div className="overlay-panel onboarding-panel" role="dialog" aria-labelledby="onboarding-title">
+          <h1 id="onboarding-title" className="onboarding-title">
+            Welcome to Third Eye
+          </h1>
+          <p className="onboarding-intro">
+            Third Eye watches your screen on-device to help, and can act for you
+            when you ask. It needs two macOS permissions to do that. You can grant
+            them now, or later in Settings.
+          </p>
+
+          <div className="onboarding-step" data-permission="capture" data-step={onboarding.capture}>
+            <div className="onboarding-step-text">
+              <strong>Screen Recording</strong>
+              <span>
+                Lets Third Eye read on-screen text to understand what you're
+                working on. Nothing leaves your Mac; no image is ever saved.
+              </span>
+              <span className="onboarding-step-status">{stepLabel(onboarding.capture)}</span>
+            </div>
+            {onboarding.capture === "denied" ? (
+              <button type="button" className="chat-retry" onClick={openScreenRecordingSettings}>
+                Open System Settings
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="chat-retry"
+                disabled={onboarding.capture !== "idle"}
+                onClick={requestCapture}
+              >
+                {onboarding.capture === "granted" ? "Granted ✓" : "Grant"}
+              </button>
+            )}
+          </div>
+
+          <div className="onboarding-step" data-permission="input" data-step={onboarding.input}>
+            <div className="onboarding-step-text">
+              <strong>Accessibility</strong>
+              <span>
+                Lets Third Eye move the pointer, click, and type on your behalf —
+                only after you turn on Input Control in Settings. Granting this now
+                does not turn it on.
+              </span>
+              <span className="onboarding-step-status">{stepLabel(onboarding.input)}</span>
+            </div>
+            {onboarding.input === "denied" ? (
+              <button type="button" className="chat-retry" onClick={openAccessibilitySettings}>
+                Open System Settings
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="chat-retry"
+                disabled={onboarding.input !== "idle"}
+                onClick={requestInput}
+              >
+                {onboarding.input === "granted" ? "Granted ✓" : "Grant"}
+              </button>
+            )}
+          </div>
+
+          {onboarding.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Couldn't save onboarding state</strong>
+              <span>{onboarding.persistError} — this welcome may show again next launch.</span>
+            </div>
+          )}
+
+          {blocked && (
+            // R007-style: the block is visible, never a silent disabled button.
+            // Screen Recording is required for the core screen-reading loop, so
+            // the user cannot proceed until it is granted.
+            <div className="settings-error" role="alert" data-onboarding-blocked="true">
+              <strong>Screen Recording is required</strong>
+              <span>
+                Third Eye can't read your screen without it. Grant Screen
+                Recording above{onboarding.capture === "denied"
+                  ? " — open System Settings, turn on Third Eye, then come back"
+                  : ""}{" "}
+                to continue.
+              </span>
+            </div>
+          )}
+
+          <div className="onboarding-actions">
+            <button
+              type="button"
+              className="chat-retry"
+              disabled={blocked}
+              title={blocked ? "Grant Screen Recording first" : undefined}
+              onClick={finishOnboarding}
+            >
+              {allSet ? "All set — continue" : "Continue"}
+            </button>
+            {/* Skip is only offered when nothing required is missing — a hard
+                block cannot be skipped. */}
+            {!blocked && (
+              <button type="button" className="onboarding-skip" onClick={finishOnboarding}>
+                Skip for now
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Idle-because-of-a-nudge renders ONLY the small edge banner — the full
   // chat chrome would read as a ghost panel parked over the user's work. In
   // visible-focused (summoned) or plain visible-idle the panel is unchanged.
@@ -367,8 +920,21 @@ function App() {
   }
 
   return (
-    <div className="overlay-root" data-state={state}>
+    <div
+      className="overlay-root"
+      data-state={state}
+      data-edge={drawerEdge ?? undefined}
+    >
       <div className="overlay-panel">
+        {/* Header drag region (M006/S01): grabs the whole panel to move the
+            window. onMouseDown starts Tauri's native drag; the app never
+            activates and click-through is untouched. */}
+        <div
+          className="overlay-drag-handle"
+          onMouseDown={startPanelDrag}
+          onMouseUp={persistMoveEnd}
+          aria-hidden="true"
+        />
         <form onSubmit={onSubmit}>
           <input
             ref={inputRef}
@@ -508,6 +1074,18 @@ function App() {
                 className={`chat-message chat-${message.role}`}
                 data-status={message.status}
               >
+                {message.role === "assistant" && message.reasoning && (
+                  <div
+                    className="chat-reasoning"
+                    data-streaming={message.status === "streaming"}
+                    title="The model's reasoning (not part of the answer)"
+                  >
+                    <span className="chat-reasoning-label">
+                      {message.status === "streaming" ? "Thinking…" : "Thought process"}
+                    </span>
+                    <span className="chat-reasoning-text">{message.reasoning}</span>
+                  </div>
+                )}
                 <span className="chat-text">{message.text}</span>
                 {message.role === "user" && message.attached && (
                   <span className="chat-attached-tag" title="A screenshot rode this message">
@@ -558,6 +1136,30 @@ function App() {
               ))}
             </div>
           </div>
+        )}
+        {/* Resize affordance (M006/S01+S03): mutually exclusive by mode. In
+            drawer mode the INNER edge (data-edge drives its position/cursor in
+            CSS, T03) grows the drawer's variable dimension; in floating mode the
+            SouthEast corner grip resizes it. Showing both would let the corner
+            grip resize a full-span left/right drawer's height and fight the anchor.
+            Both are children of .overlay-panel, so pointer-events tracks overlay
+            state — never data-edge (MEM148) — so an idle click-through overlay is
+            not resizable, preserving the security posture. */}
+        {drawerEdge ? (
+          <div
+            className="overlay-drawer-resize-edge"
+            data-edge={drawerEdge}
+            onMouseDown={startDrawerResize}
+            onMouseUp={persistResizeEnd}
+            aria-hidden="true"
+          />
+        ) : (
+          <div
+            className="overlay-resize-grip"
+            onMouseDown={startPanelResize}
+            onMouseUp={persistResizeEnd}
+            aria-hidden="true"
+          />
         )}
       </div>
     </div>

@@ -88,6 +88,21 @@ impl CaptureState {
     pub fn permission(&self) -> CapturePermission {
         self.backend.permission()
     }
+
+    /// Trigger the OS Screen Recording prompt through the backend and return
+    /// the resulting permission value — the first-run onboarding entry point.
+    /// Unlike [`Self::capture`] this never captures: it only spends the one-shot
+    /// TCC prompt (macOS shows it once per app lifetime) and reports the outcome.
+    /// On an unsupported platform the backend returns `false` and the value
+    /// stays `supported: false`, so the UI can present it truthfully.
+    pub fn request_permission(&self) -> CapturePermission {
+        // Only ask where a prompt can appear; on an unsupported backend the
+        // request is a logged no-op inside the backend.
+        if self.backend.permission().supported {
+            self.backend.request_permission();
+        }
+        self.backend.permission()
+    }
 }
 
 /// Capture one frame of the primary display with every Third Eye window
@@ -391,6 +406,39 @@ mod tests {
     fn platform_backend_binding_matches_this_os() {
         let state = CaptureState::with_platform_backend();
         assert_eq!(state.permission().supported, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn request_permission_prompts_on_supported_and_reports_live_permission() {
+        // First-run onboarding: a supported backend is prompted once, and the
+        // returned value is the backend's LIVE permission read after the prompt
+        // (on the real macOS backend that read reflects a fresh grant; the
+        // scripted backend holds its permission fixed, so we assert the prompt
+        // fired and the returned value equals that live read).
+        let (state, backend) = state_with(ScriptedCapture {
+            permission: CapturePermission { granted: true, supported: true },
+            grant_on_request: true,
+            prompt_requested: AtomicBool::new(false),
+            capture_result: Ok(ScriptedCapture::frame()),
+        });
+        let result = state.request_permission();
+        assert!(backend.prompt_requested.load(Ordering::SeqCst), "a supported backend must be prompted");
+        assert_eq!(result, CapturePermission { granted: true, supported: true });
+    }
+
+    #[test]
+    fn request_permission_never_prompts_on_unsupported() {
+        // Off macOS there is no prompt to spend — the request must be a no-op
+        // that still reports the truthful unsupported value.
+        let (state, backend) = state_with(ScriptedCapture {
+            permission: CapturePermission { granted: false, supported: false },
+            grant_on_request: true,
+            prompt_requested: AtomicBool::new(false),
+            capture_result: Err(CaptureError::unsupported_here()),
+        });
+        let result = state.request_permission();
+        assert!(!backend.prompt_requested.load(Ordering::SeqCst), "no prompt exists on unsupported platforms");
+        assert_eq!(result, CapturePermission { granted: false, supported: false });
     }
 
     #[test]

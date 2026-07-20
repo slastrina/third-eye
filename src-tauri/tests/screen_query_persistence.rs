@@ -23,7 +23,8 @@ use third_eye_lib::watcher::TextObservation;
 /// and present on the tool side of the persistence boundary.
 #[test]
 fn screen_element_payload_carries_coordinates() {
-    let element = ScreenElement { text: "Submit".into(), x: 100, y: 200, width: 60, height: 24 };
+    let element =
+        ScreenElement { text: "Submit".into(), x: 100, y: 200, width: 60, height: 24, app: None };
     let v = serde_json::to_value(&element).unwrap();
     // camelCase, and the coordinates the model reads are all present.
     assert_eq!(v["text"], "Submit");

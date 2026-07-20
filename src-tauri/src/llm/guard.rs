@@ -26,7 +26,7 @@ use crate::privacy::{
     self, Detection, DetectionKind, RedactionConfidence, RedactionError, RedactionOutcome,
 };
 
-use super::{ChatRequest, LlmClient, LlmError, LlmHealth, StreamOutcome, TokenSink};
+use super::{ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink};
 
 /// How much the guard trusts an endpoint. Classification is pure and
 /// deterministic: URL-string parsing only, no DNS — a hostname that *would*
@@ -344,6 +344,32 @@ impl LlmClient for GuardedClient {
                     &privacy::redact,
                 )?;
                 self.inner.stream_chat(&guarded, on_token).await
+            }
+        }
+    }
+
+    async fn stream_chat_reasoning(
+        &self,
+        request: &ChatRequest,
+        on_token: TokenSink<'_>,
+        on_reasoning: ReasoningSink<'_>,
+    ) -> Result<StreamOutcome, LlmError> {
+        // Identical guard posture as stream_chat — the reasoning sink is just an
+        // extra transient output channel and never changes what the guard does to
+        // the request. Loopback forwards byte-identically; external redacts first,
+        // failing closed (never reaching the inner client on a block).
+        match self.trust {
+            EndpointTrust::Loopback => {
+                self.inner.stream_chat_reasoning(request, on_token, on_reasoning).await
+            }
+            EndpointTrust::External => {
+                let guarded = guard_chat_request(
+                    &self.state,
+                    self.inner.endpoint(),
+                    request,
+                    &privacy::redact,
+                )?;
+                self.inner.stream_chat_reasoning(&guarded, on_token, on_reasoning).await
             }
         }
     }

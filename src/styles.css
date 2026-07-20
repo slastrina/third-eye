@@ -18,7 +18,7 @@ body,
   align-items: flex-start;
   justify-content: center;
   height: 100%;
-  padding-top: 15vh;
+  padding: 15vh 16px 16px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   -webkit-user-select: none;
   user-select: none;
@@ -34,14 +34,172 @@ body,
   pointer-events: auto;
 }
 
+/* First-run onboarding (M006) takes over the overlay and must be clickable in
+   every overlay state: the panel renders whenever onboarding is pending, and
+   the blur guard keeps the overlay in visible-focused, but this makes the DOM
+   layer agree even if a focus call ever loses the race. Native mouse-event
+   acceptance still follows from the overlay staying focused. */
+.overlay-root[data-onboarding="true"] {
+  pointer-events: auto;
+}
+
+/* The panel tracks the (now resizable, M006/S01) window width rather than a
+   fixed 560px, so dragging the corner grip visibly grows the chrome. position
+   relative anchors the absolutely-positioned resize grip to the panel corner. */
 .overlay-panel {
-  width: 560px;
+  position: relative;
+  width: 100%;
   border-radius: 12px;
   background: rgba(28, 28, 30, 0.82);
   backdrop-filter: blur(24px);
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
   padding: 12px;
   border: 1px solid transparent;
+}
+
+/* --- Overlay geometry: drag header + corner resize grip (M006/S01) --------- */
+
+/* Header drag region — grabs the whole panel to move the window. A quiet
+   grabber pill centered in a short bar; cursor: move signals it's draggable.
+   Only interactive when the overlay is visible-focused (pointer-events on the
+   root), matching the security posture that an idle click-through overlay must
+   not be movable. */
+.overlay-drag-handle {
+  height: 16px;
+  margin: -4px -4px 6px;
+  border-radius: 8px 8px 0 0;
+  cursor: move;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.overlay-drag-handle::after {
+  content: "";
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.overlay-drag-handle:hover::after {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+/* Bottom-right corner grip — starts native decoration-less resize (SouthEast).
+   Diagonal hatch marks it as a grabbable corner; nwse-resize cursor confirms. */
+.overlay-resize-grip {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  border-radius: 0 0 10px 0;
+  background:
+    linear-gradient(
+      135deg,
+      transparent 0%,
+      transparent 45%,
+      rgba(255, 255, 255, 0.28) 45%,
+      rgba(255, 255, 255, 0.28) 55%,
+      transparent 55%,
+      transparent 70%,
+      rgba(255, 255, 255, 0.28) 70%,
+      rgba(255, 255, 255, 0.28) 80%,
+      transparent 80%
+    );
+}
+
+.overlay-resize-grip:hover {
+  background:
+    linear-gradient(
+      135deg,
+      transparent 0%,
+      transparent 45%,
+      rgba(255, 255, 255, 0.5) 45%,
+      rgba(255, 255, 255, 0.5) 55%,
+      transparent 55%,
+      transparent 70%,
+      rgba(255, 255, 255, 0.5) 70%,
+      rgba(255, 255, 255, 0.5) 80%,
+      transparent 80%
+    );
+}
+
+/* --- Drawer mode: edge-anchored overlay (M006/S02) -------------------------
+   When the ?edge= harness snaps the window flush to a display edge, the window
+   itself IS the drawer: drop the centered floating-panel padding so the panel
+   fills the snapped rect, and give the panel full height (its default height is
+   content-driven, which would leave a left/right drawer's chrome short of the
+   full-height window). Square off the outer corner so the drawer reads as
+   docked to the edge, not floating. Click-through posture is unchanged —
+   pointer-events still follows overlay state, never data-edge. */
+.overlay-root[data-edge] {
+  padding: 0;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+.overlay-root[data-edge] .overlay-panel {
+  height: 100%;
+  border-radius: 0;
+  overflow-y: auto;
+}
+
+/* --- Drawer mode: inner-edge resize handle (M006/S03) ----------------------
+   The drawer's resize affordance is its INNER edge — the edge facing the
+   screen interior, opposite the docked edge. data-edge holds the DOCKED edge
+   (set in App.tsx, T02), so the handle hugs the OPPOSITE panel edge and shows
+   the matching axis cursor: a left/right drawer grows along X (ew-resize), a
+   top/bottom drawer along Y (ns-resize). pointer-events is intentionally NOT
+   set on these data-edge selectors — it tracks overlay state on the root
+   (MEM148), never data-edge, so an idle click-through drawer stays
+   non-resizable and the security posture is preserved. */
+.overlay-drawer-resize-edge {
+  position: absolute;
+  z-index: 2;
+  background: transparent;
+}
+
+.overlay-drawer-resize-edge:hover {
+  background: rgba(122, 162, 255, 0.28);
+}
+
+/* Left drawer docked at the left → inner edge is the panel's RIGHT side. */
+.overlay-drawer-resize-edge[data-edge="left"] {
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+/* Right drawer docked at the right → inner edge is the panel's LEFT side. */
+.overlay-drawer-resize-edge[data-edge="right"] {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+/* Top drawer docked at the top → inner edge is the panel's BOTTOM side. */
+.overlay-drawer-resize-edge[data-edge="top"] {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+/* Bottom drawer docked at the bottom → inner edge is the panel's TOP side. */
+.overlay-drawer-resize-edge[data-edge="bottom"] {
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 8px;
+  cursor: ns-resize;
 }
 
 .overlay-root[data-state="visible-focused"] .overlay-panel {
@@ -175,6 +333,87 @@ body,
   gap: 6px;
 }
 
+/* First-run onboarding panel (M006): a one-time explainer over the overlay,
+   requesting Screen Recording + Accessibility with context. Wider than the
+   chat input so the two permission rows breathe. */
+.onboarding-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+
+.onboarding-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.onboarding-intro {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.onboarding-step {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* A granted step reads as settled — green edge, no more action needed. */
+.onboarding-step[data-step="granted"] {
+  border-color: rgba(120, 220, 150, 0.4);
+  background: rgba(120, 220, 150, 0.1);
+}
+
+.onboarding-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.onboarding-step-text span {
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.onboarding-step-status {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.onboarding-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* Skip is deliberately quiet — a text button, not a primary action. */
+.onboarding-skip {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 5px 4px;
+}
+
+.onboarding-skip:hover {
+  color: rgba(255, 255, 255, 0.8);
+}
+
 /* Tag marking a user turn that carried a screenshot. */
 .chat-attached-tag {
   display: inline-block;
@@ -294,6 +533,55 @@ body,
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* --- Chat: reasoning ("Thinking…") region ---------------------------------- */
+
+/* A thinking model's chain-of-thought, rendered dimmed and distinct from the
+   answer so it reads as secondary context, not the reply. Sits above the answer
+   text; the whole block is de-emphasized (lower opacity, smaller, muted rule). */
+.chat-reasoning {
+  display: block;
+  margin-bottom: 6px;
+  padding: 4px 0 4px 8px;
+  border-left: 2px solid rgba(255, 255, 255, 0.14);
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.42);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 12vh;
+  overflow-y: auto;
+}
+
+.chat-reasoning-label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* While reasoning is live the label pulses gently so "Thinking…" reads as an
+   active state, not a finished transcript. */
+.chat-reasoning[data-streaming="true"] .chat-reasoning-label {
+  animation: reasoning-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes reasoning-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.chat-reasoning-text {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 /* --- Chat: memory-consulted indicator (S03) -------------------------------- */

@@ -38,8 +38,19 @@ use serde::{Deserialize, Serialize};
 pub enum InputAction {
     /// Move the mouse cursor to an absolute screen coordinate.
     MouseMove { x: i32, y: i32 },
-    /// Synthesize a mouse button click at the current cursor position.
-    MouseClick { button: MouseButton },
+    /// Synthesize a mouse button click. When `x`/`y` are present the cursor is
+    /// moved to that absolute screen coordinate *then* clicked (the model's
+    /// natural "click at (x,y)" — one action, grounded on a `screen_query`
+    /// coordinate); when absent the click fires at the current cursor position.
+    /// Both must be present together; one without the other is a malformed
+    /// action the tool rejects.
+    MouseClick {
+        button: MouseButton,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+    },
     /// Type a run of Unicode text as keystrokes.
     TypeText { text: String },
     /// Press (and release) a single named key — e.g. `return`, `tab`, `escape`,
@@ -60,6 +71,58 @@ impl InputAction {
             InputAction::KeyPress { .. } => ActionKind::KeyPress,
         }
     }
+
+    /// The kebab-case action name for logs — the same string as the serde
+    /// `action` tag (`mouse-move` / `mouse-click` / `type-text` / `key-press`).
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            InputAction::MouseMove { .. } => "mouse-move",
+            InputAction::MouseClick { .. } => "mouse-click",
+            InputAction::TypeText { .. } => "type-text",
+            InputAction::KeyPress { .. } => "key-press",
+        }
+    }
+
+    /// A bare click at the current cursor position — the coordless
+    /// [`InputAction::MouseClick`]. Keeps construction terse at call sites that
+    /// don't aim (tests, the coordless fallback path).
+    pub fn click(button: MouseButton) -> Self {
+        InputAction::MouseClick { button, x: None, y: None }
+    }
+
+    /// A click that moves to `(x, y)` first — the coordinate-bearing
+    /// [`InputAction::MouseClick`], the shape the model emits when it aims a
+    /// click at a `screen_query` coordinate.
+    pub fn click_at(button: MouseButton, x: i32, y: i32) -> Self {
+        InputAction::MouseClick { button, x: Some(x), y: Some(y) }
+    }
+
+    /// The target coordinate a `mouse-move` or coordinate-bearing `mouse-click`
+    /// aims at, if any. `None` for a bare click / type / key-press. The gate
+    /// reads this to decide whether an action needs a prior `screen_query` to be
+    /// grounded (the coordinate must have come from the screen, never a guess).
+    pub fn aim_target(&self) -> Option<(i32, i32)> {
+        match self {
+            InputAction::MouseMove { x, y } => Some((*x, *y)),
+            InputAction::MouseClick { x: Some(x), y: Some(y), .. } => Some((*x, *y)),
+            _ => None,
+        }
+    }
+
+    /// A coordinate-bearing click must carry BOTH x and y or neither — one
+    /// without the other is a malformed action the tool rejects before it
+    /// reaches the backend (so a half-specified aim never silently clicks at the
+    /// cursor). Returns the offending field name for the error detail.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let InputAction::MouseClick { x, y, .. } = self {
+            match (x, y) {
+                (Some(_), None) => return Err("mouse-click has x but no y"),
+                (None, Some(_)) => return Err("mouse-click has y but no x"),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The kind of a HID [`InputAction`], stripped of its payload — the unit the
@@ -74,6 +137,11 @@ pub enum ActionKind {
     MouseClick,
     TypeText,
     KeyPress,
+    /// Bring a running app to the front — the `focus_app` tool's action kind
+    /// (M005). It has no [`InputAction`] payload variant (activation is not an
+    /// enigo event), but it is HID-class: gated through the same `ApprovalGate`
+    /// and grantable ("Always allow this kind") via the session whitelist.
+    FocusApp,
 }
 
 /// Which mouse button an action targets. Kebab-case in JSON to match the rest
@@ -241,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn trait_is_object_safe_and_performs_through_dyn() {
         let backend: Arc<dyn InputControl> = Arc::new(MockInput::ok());
-        backend.perform(InputAction::MouseClick { button: MouseButton::Left }).await.unwrap();
+        backend.perform(InputAction::click(MouseButton::Left)).await.unwrap();
         assert!(backend.permission().granted);
         assert!(backend.request_permission());
     }
@@ -335,7 +403,8 @@ mod tests {
     fn action_json_round_trips_with_tag() {
         let actions = [
             InputAction::MouseMove { x: 10, y: 20 },
-            InputAction::MouseClick { button: MouseButton::Right },
+            InputAction::click(MouseButton::Right),
+            InputAction::click_at(MouseButton::Left, 30, 40),
             InputAction::TypeText { text: "hello".into() },
             InputAction::KeyPress { key: "return".into() },
         ];
@@ -352,10 +421,28 @@ mod tests {
         assert_eq!(v["x"], 3);
         assert_eq!(v["y"], 4);
 
-        let v =
-            serde_json::to_value(InputAction::MouseClick { button: MouseButton::Middle }).unwrap();
+        // A bare click omits x/y entirely (skip_serializing_if) — the coordless
+        // wire shape older callers and the model both still emit.
+        let v = serde_json::to_value(InputAction::click(MouseButton::Middle)).unwrap();
         assert_eq!(v["action"], "mouse-click");
         assert_eq!(v["button"], "middle");
+        assert!(v.get("x").is_none(), "bare click must not carry x");
+        assert!(v.get("y").is_none(), "bare click must not carry y");
+
+        // A coordinate-bearing click carries both — the aim-then-click the model
+        // emits after screen_query; parsing a stray x/y no longer drops it.
+        let aimed: InputAction =
+            serde_json::from_str(r#"{"action":"mouse-click","button":"left","x":640,"y":220}"#)
+                .unwrap();
+        assert_eq!(aimed, InputAction::click_at(MouseButton::Left, 640, 220));
+        assert_eq!(aimed.aim_target(), Some((640, 220)));
+        assert!(InputAction::click(MouseButton::Left).aim_target().is_none());
+
+        // Half-specified aim is malformed — validate() rejects it before it can
+        // silently degrade to a click-at-cursor.
+        let half: InputAction =
+            serde_json::from_str(r#"{"action":"mouse-click","button":"left","x":640}"#).unwrap();
+        assert!(half.validate().is_err(), "x-without-y must be rejected");
     }
 
     #[test]
@@ -365,11 +452,7 @@ mod tests {
         // serialize the same kebab string as its action's `action` tag.
         let cases = [
             (InputAction::MouseMove { x: 1, y: 2 }, ActionKind::MouseMove, "mouse-move"),
-            (
-                InputAction::MouseClick { button: MouseButton::Left },
-                ActionKind::MouseClick,
-                "mouse-click",
-            ),
+            (InputAction::click(MouseButton::Left), ActionKind::MouseClick, "mouse-click"),
             (InputAction::TypeText { text: "a".into() }, ActionKind::TypeText, "type-text"),
             (InputAction::KeyPress { key: "return".into() }, ActionKind::KeyPress, "key-press"),
         ];
@@ -385,5 +468,19 @@ mod tests {
             InputAction::TypeText { text: "hello".into() }.kind(),
             InputAction::TypeText { text: "world".into() }.kind(),
         );
+    }
+
+    #[test]
+    fn focus_app_kind_serializes_kebab_case() {
+        // The `focus_app` tool has no InputAction payload, but its ActionKind is
+        // the unit the ApprovalGate gates and the whitelist grants by; it rides
+        // the same camelCase/kebab contract as the input kinds (`focus-app`).
+        assert_eq!(serde_json::to_value(ActionKind::FocusApp).unwrap(), "focus-app");
+        let back: ActionKind = serde_json::from_str("\"focus-app\"").unwrap();
+        assert_eq!(back, ActionKind::FocusApp);
+        // Grantable through the whitelist like any other kind.
+        let mut wl = std::collections::HashSet::new();
+        wl.insert(ActionKind::FocusApp);
+        assert!(wl.contains(&ActionKind::FocusApp));
     }
 }

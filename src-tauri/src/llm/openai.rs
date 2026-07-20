@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
-use super::{ChatRequest, LlmClient, LlmError, LlmHealth, StreamOutcome, TokenSink};
+use super::{
+    ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink,
+};
 
 /// The single definition site for the LM Studio endpoint. S05 makes this
 /// user-configurable; until then every layer reads it from here.
@@ -139,16 +141,17 @@ impl OpenAiClient {
     }
 }
 
-#[async_trait]
-impl LlmClient for OpenAiClient {
-    fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    async fn stream_chat(
+impl OpenAiClient {
+    /// The single SSE-streaming core behind both [`LlmClient::stream_chat`] and
+    /// [`LlmClient::stream_chat_reasoning`]. `on_reasoning` is `Some` only on the
+    /// reasoning path (the `chat` command); when `None`, reasoning deltas are
+    /// still parsed off the wire (so they never leak into the answer text) but
+    /// dropped rather than forwarded. Reasoning never enters [`StreamOutcome`].
+    async fn stream_chat_core(
         &self,
         request: &ChatRequest,
         on_token: TokenSink<'_>,
+        on_reasoning: Option<ReasoningSink<'_>>,
     ) -> Result<StreamOutcome, LlmError> {
         let url = format!("{}/v1/chat/completions", self.endpoint);
         let mut body = serde_json::json!({ "messages": request.messages, "stream": true });
@@ -227,6 +230,15 @@ impl LlmClient for OpenAiClient {
                     on_token(&token);
                     Ok(false)
                 }
+                Ok(SseLine::Reasoning(chunk)) => {
+                    // A distinct stream: forwarded to the Thinking… surface when a
+                    // sink is wired, never appended to `text` (the answer stays
+                    // reasoning-free) and never counted as an answer token.
+                    if let Some(sink) = on_reasoning {
+                        sink(&chunk);
+                    }
+                    Ok(false)
+                }
                 Ok(SseLine::ToolCalls(deltas)) => {
                     for delta in deltas {
                         tool_acc.entry(delta.index).or_default().absorb(delta);
@@ -300,6 +312,30 @@ impl LlmClient for OpenAiClient {
         }
         Ok(StreamOutcome { text, token_count, tool_calls })
     }
+}
+
+#[async_trait]
+impl LlmClient for OpenAiClient {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn stream_chat(
+        &self,
+        request: &ChatRequest,
+        on_token: TokenSink<'_>,
+    ) -> Result<StreamOutcome, LlmError> {
+        self.stream_chat_core(request, on_token, None).await
+    }
+
+    async fn stream_chat_reasoning(
+        &self,
+        request: &ChatRequest,
+        on_token: TokenSink<'_>,
+        on_reasoning: ReasoningSink<'_>,
+    ) -> Result<StreamOutcome, LlmError> {
+        self.stream_chat_core(request, on_token, Some(on_reasoning)).await
+    }
 
     async fn health(&self) -> LlmHealth {
         let url = format!("{}/v1/models", self.endpoint);
@@ -320,6 +356,10 @@ impl LlmClient for OpenAiClient {
 enum SseLine {
     /// A content delta to append and forward.
     Token(String),
+    /// A reasoning delta (`delta.reasoning_content` / `delta.reasoning`) — a
+    /// thinking-model's chain-of-thought, forwarded to the Thinking… surface
+    /// but never appended to the answer text.
+    Reasoning(String),
     /// Streamed `delta.tool_calls` fragments to accumulate by index.
     ToolCalls(Vec<ToolCallDelta>),
     /// The `data: [DONE]` terminator.
@@ -399,6 +439,18 @@ fn parse_sse_line(line: &str) -> Result<SseLine, String> {
     if let Some(content) = delta["content"].as_str() {
         if !content.is_empty() {
             return Ok(SseLine::Token(content.to_string()));
+        }
+    }
+    // Thinking models stream their chain-of-thought in a separate field while
+    // `content` is null/empty (which is why the answer pane otherwise fills with
+    // blank newlines). LM Studio / DeepSeek use `reasoning_content`; some
+    // OpenAI-compatible servers use `reasoning`. Either one, non-empty, is a
+    // reasoning delta — kept OUT of the answer text.
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(reasoning) = delta[key].as_str() {
+            if !reasoning.is_empty() {
+                return Ok(SseLine::Reasoning(reasoning.to_string()));
+            }
         }
     }
     // Tool-call rounds stream content as null with tool_calls fragments.
@@ -713,6 +765,82 @@ mod tests {
     #[test]
     fn parse_recognizes_done_marker() {
         assert!(matches!(parse_sse_line("data: [DONE]"), Ok(SseLine::Done)));
+    }
+
+    #[test]
+    fn parse_recognizes_reasoning_content_and_reasoning_fields() {
+        // Both field spellings map to Reasoning; content-carrying deltas still win.
+        let rc = r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#;
+        assert!(matches!(parse_sse_line(rc), Ok(SseLine::Reasoning(s)) if s == "hmm"));
+        let r = r#"data: {"choices":[{"delta":{"reasoning":"pondering"}}]}"#;
+        assert!(matches!(parse_sse_line(r), Ok(SseLine::Reasoning(s)) if s == "pondering"));
+        // An empty reasoning field is a Skip, not an empty Reasoning delta.
+        let empty = r#"data: {"choices":[{"delta":{"reasoning_content":""}}]}"#;
+        assert!(matches!(parse_sse_line(empty), Ok(SseLine::Skip)));
+        // Content present alongside reasoning: content is the answer, wins.
+        let both =
+            r#"data: {"choices":[{"delta":{"content":"answer","reasoning_content":"think"}}]}"#;
+        assert!(matches!(parse_sse_line(both), Ok(SseLine::Token(s)) if s == "answer"));
+    }
+
+    /// Build a reasoning-carrying SSE event (the LM Studio / DeepSeek shape:
+    /// null content, a `reasoning_content` fragment).
+    fn sse_reasoning(fragment: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": null, "reasoning_content": fragment}}]})
+        )
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_forward_to_sink_and_stay_out_of_answer_text() {
+        // A thinking model: two reasoning fragments, then the real answer. The
+        // reasoning must reach on_reasoning verbatim and NEVER enter text or the
+        // token count — the fix for the blank-newlines-in-the-answer symptom.
+        let parts = vec![
+            sse_reasoning("Let me "),
+            sse_reasoning("consider.\n"),
+            sse_token("Final answer"),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let endpoint = spawn_raw_server(chunked_200(&parts, true)).await;
+        let client = OpenAiClient::new(&endpoint);
+        let tokens = Mutex::new(String::new());
+        let reasoning = Mutex::new(String::new());
+        let outcome = client
+            .stream_chat_reasoning(
+                &req(vec![ChatMessage::user("hi")]),
+                &|t| tokens.lock().unwrap().push_str(t),
+                &|r| reasoning.lock().unwrap().push_str(r),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "Final answer", "reasoning must not leak into the answer");
+        assert_eq!(outcome.token_count, 1, "reasoning deltas are not answer tokens");
+        assert_eq!(*tokens.lock().unwrap(), "Final answer");
+        assert_eq!(
+            *reasoning.lock().unwrap(),
+            "Let me consider.\n",
+            "every reasoning fragment must reach the Thinking… sink in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_reasoning_sink_still_drops_reasoning_from_text() {
+        // The plain stream_chat path (ingest/nudge): a model that emits reasoning
+        // must still keep it out of the answer, even with no sink wired.
+        let parts = vec![
+            sse_reasoning("thinking hard"),
+            sse_token("done"),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let endpoint = spawn_raw_server(chunked_200(&parts, true)).await;
+        let (result, seen) = run_chat(&endpoint).await;
+        let outcome = result.unwrap();
+        assert_eq!(outcome.text, "done");
+        assert_eq!(outcome.token_count, 1);
+        assert_eq!(seen, vec!["done"], "reasoning is never delivered as a content token");
     }
 
     #[test]

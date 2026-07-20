@@ -15,6 +15,12 @@ pub mod fallback;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+/// Persisted overlay presentation config (M006 S04): the mode + per-edge
+/// extents + modal size owned in Rust, applied by the overlay webview. Kept a
+/// pure side-effect module beside the state machine — it never touches
+/// [`OverlayState`] or [`dispatch`] (D040/MEM148).
+pub mod presentation;
+
 #[cfg(not(target_os = "macos"))]
 use fallback as platform;
 #[cfg(target_os = "macos")]

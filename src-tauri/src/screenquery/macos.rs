@@ -31,7 +31,14 @@ impl MacosScreenQuery {
 
 impl From<TextElement> for ScreenElement {
     fn from(el: TextElement) -> Self {
-        ScreenElement { text: el.text, x: el.x, y: el.y, width: el.width, height: el.height }
+        ScreenElement {
+            text: el.text,
+            x: el.x,
+            y: el.y,
+            width: el.width,
+            height: el.height,
+            app: el.app,
+        }
     }
 }
 
@@ -57,9 +64,13 @@ mod tests {
 
     #[test]
     fn text_element_maps_to_screen_element_verbatim() {
-        let te = TextElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4 };
+        let te =
+            TextElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) };
         let se: ScreenElement = te.into();
-        assert_eq!(se, ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4 });
+        assert_eq!(
+            se,
+            ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) }
+        );
     }
 
     /// Live run of the full backend against the real screen (MEM038 precedent)

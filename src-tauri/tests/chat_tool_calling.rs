@@ -35,12 +35,29 @@ use third_eye_lib::input::commands::{HidArmState, InputState};
 use third_eye_lib::input::fallback::FallbackInput;
 use third_eye_lib::llm::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use third_eye_lib::llm::toolloop::{
-    run_tool_loop, CompositeExecutor, InputTool, MemorySearchTool, ScreenQueryTool, ToolEvent,
+    run_tool_loop, CompositeExecutor, InputTool, MemorySearchTool, ScreenQueryTool, ScreenSeen,
+    ToolEvent,
     INPUT_ACTION_TOOL, MEMORY_SEARCH_TOOL, SCREEN_QUERY_TOOL,
 };
 use third_eye_lib::screenquery::commands::ScreenQueryState;
 use third_eye_lib::llm::ChatMessage;
 use third_eye_lib::memory::{Embedder, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode};
+
+// --- Live-probe doubles (M005 targeting): drive the REAL model through the
+// production composite while capturing HID actions instead of firing them and
+// serving a fixed screen, so the probe observes the model's tool *sequence*
+// (focus_app → screen_query → mouse-move) with zero real-world side effects. ---
+use async_trait::async_trait;
+use third_eye_lib::appfocus::{AppFocus, AppFocusError, FocusedApp};
+use third_eye_lib::input::{
+    ActionKind, InputAction, InputControl, InputError, InputPermission,
+};
+use third_eye_lib::llm::toolloop::{
+    ApprovalGate, ApprovalPrompt, ApprovalVerdict, FocusAppTool, FocusedApp as FocusedAppGate,
+    HID_SYSTEM_PROMPT, NO_SCREEN_QUERY_KIND,
+};
+use third_eye_lib::input::commands::{HidRunMode, SessionWhitelist};
+use third_eye_lib::screenquery::{ScreenElement, ScreenQuery, ScreenQueryError};
 
 /// A scratch db path under the OS temp dir, cleaned up on drop so failed
 /// runs do not accumulate files.
@@ -661,7 +678,11 @@ async fn live_screen_query_then_aim() {
     // The exact production composite over the real platform backends behind the
     // same managed-state seams production mounts.
     let executor = CompositeExecutor::new(vec![
-        Box::new(ScreenQueryTool::new(ScreenQueryState::with_platform_backend().backend())),
+        Box::new(ScreenQueryTool::new(
+            ScreenQueryState::with_platform_backend().backend(),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedAppGate::new()),
+        )),
         Box::new(InputTool::new(
             InputState::with_platform_backend().backend(),
             Arc::new(HidArmState::new(true)),
@@ -702,13 +723,241 @@ async fn live_screen_query_then_aim() {
             result.name, result.ok, result.failure
         );
         if !result.ok {
-            assert_eq!(
-                result.failure.as_deref(),
-                Some("permission-denied"),
-                "{} must fail typed permission-denied when ungranted, got {:?}",
+            // Acceptable typed refusals: permission-denied when ungranted, and —
+            // on a granted machine — the targeting gate refusing the hardcoded
+            // (200,200) as off-target / not-yet-grounded, since the scripted
+            // server cannot read the live query result to aim at a real element.
+            // The point of this probe is that the path resolves cleanly, not that
+            // the fixed coordinate happens to land on something.
+            assert!(
+                matches!(
+                    result.failure.as_deref(),
+                    Some("permission-denied" | "off-target" | "no-screen-query")
+                ),
+                "{} must fail with a typed permission/targeting kind, got {:?}",
                 result.name,
                 result.failure,
             );
         }
     }
+}
+
+/// Records every HID action instead of synthesizing it, and reports permission
+/// as granted so the [`ApprovalGate`]/`MacosInput` preflight is never the thing
+/// that stops a move — the probe wants to see the model's *sequence*, not a
+/// permission gate. No CGEvent is ever posted.
+struct RecordingInput {
+    actions: Mutex<Vec<InputAction>>,
+}
+
+impl RecordingInput {
+    fn new() -> Self {
+        Self { actions: Mutex::new(Vec::new()) }
+    }
+}
+
+#[async_trait]
+impl InputControl for RecordingInput {
+    fn permission(&self) -> InputPermission {
+        InputPermission { granted: true, supported: true }
+    }
+    fn request_permission(&self) -> bool {
+        true
+    }
+    async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        self.actions.lock().unwrap().push(action);
+        Ok(())
+    }
+}
+
+/// A focus backend that always succeeds — no real app is activated. Records the
+/// requested name so the probe can confirm the model asked to front the app it
+/// was told to (e.g. "Google Chrome").
+struct RecordingFocus {
+    focused: Mutex<Vec<String>>,
+}
+
+impl RecordingFocus {
+    fn new() -> Self {
+        Self { focused: Mutex::new(Vec::new()) }
+    }
+}
+
+#[async_trait]
+impl AppFocus for RecordingFocus {
+    async fn focus(&self, app_name: &str) -> Result<FocusedApp, AppFocusError> {
+        self.focused.lock().unwrap().push(app_name.to_string());
+        Ok(FocusedApp { app: app_name.to_string() })
+    }
+    async fn running_apps(&self) -> Vec<String> {
+        vec!["Google Chrome".into(), "Finder".into()]
+    }
+}
+
+/// A screen that always returns one clearly-labelled, unambiguous target with
+/// real (non-menubar) coordinates, so a model that follows the discipline lands
+/// a sensible move — and the probe can assert the move used THESE coordinates,
+/// not a guess.
+struct FixedScreen;
+
+#[async_trait]
+impl ScreenQuery for FixedScreen {
+    async fn query(&self) -> Result<Vec<ScreenElement>, ScreenQueryError> {
+        Ok(vec![ScreenElement {
+            text: "Search Google or type a URL".into(),
+            x: 640,
+            y: 220,
+            width: 400,
+            height: 40,
+            app: Some("Google Chrome".into()),
+        }])
+    }
+}
+
+/// Auto-run has no prompt path, but ApprovalGate still needs an approver; this
+/// one panics if ever called, proving the auto-run path never prompts.
+struct NeverPrompt;
+
+#[async_trait]
+impl ApprovalPrompt for NeverPrompt {
+    async fn request(&self, kind: ActionKind, summary: String) -> ApprovalVerdict {
+        panic!("auto-run must never prompt (kind={kind:?}, summary={summary:?})");
+    }
+}
+
+/// M005 targeting probe — the decisive small-model test. Drives the REAL 9B
+/// model (LM Studio default lane, or `THIRD_EYE_TOOL_MODEL`) through the exact
+/// production composite: `HID_SYSTEM_PROMPT` grounding, the `ScreenSeen`-gated
+/// `ApprovalGate` over a recording input + scripted focus, and a fixed screen —
+/// so it observes the model's tool *sequence* with zero real HID/capture.
+///
+/// It proves the two things the user's failed live test could not distinguish:
+///  1. the small model, given the system prompt, drives `focus_app` →
+///     `screen_query` → an aimed action (a `mouse-move` or a coordinate-bearing
+///     `mouse-click`) — not a blind top-of-screen guess; and
+///  2. even if it guesses, the structural gate refuses the blind aim with the
+///     typed `no-screen-query` kind — so every action that reached the backend
+///     with a coordinate aimed INSIDE the on-screen element's box (640,220 +
+///     400x40), a coordinate it could only have read from screen_query.
+///
+/// `#[ignore]`: needs LM Studio serving the tool-capable chat model at the
+/// project-default endpoint. Run explicitly:
+/// ```sh
+/// cargo test --manifest-path src-tauri/Cargo.toml --test chat_tool_calling \
+///   -- --ignored --nocapture live_small_model_follows_targeting_discipline
+/// ```
+#[tokio::test]
+#[ignore = "requires LM Studio serving a tool-capable chat model; drives the real model"]
+async fn live_small_model_follows_targeting_discipline() {
+    let input = Arc::new(RecordingInput::new());
+    let focus = Arc::new(RecordingFocus::new());
+
+    let screen_seen = Arc::new(ScreenSeen::new());
+    let focused_app = Arc::new(FocusedAppGate::new());
+    let gate = ApprovalGate::new(
+        InputTool::new(input.clone(), Arc::new(HidArmState::new(true))),
+        FocusAppTool::new(focus.clone()),
+        HidRunMode::AutoRun,
+        Arc::new(std::sync::Mutex::new(SessionWhitelist::new())),
+        Arc::new(NeverPrompt),
+        screen_seen.clone(),
+        focused_app.clone(),
+    );
+    let executor = CompositeExecutor::new(vec![
+        Box::new(gate),
+        Box::new(ScreenQueryTool::new(Arc::new(FixedScreen), screen_seen, focused_app)),
+    ]);
+
+    let model = std::env::var("THIRD_EYE_TOOL_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut client = OpenAiClient::default_endpoint();
+    if let Some(model) = model {
+        client = client.with_model(model);
+    }
+
+    let capture = Capture::new();
+    // Exactly how production grounds the run (commands.rs): HID_SYSTEM_PROMPT
+    // leads, then the user's task.
+    let outcome = run_tool_loop(
+        &client,
+        &executor,
+        vec![
+            ChatMessage::system(HID_SYSTEM_PROMPT),
+            ChatMessage::user(
+                "Click the Google Chrome address bar so I can type a new URL.",
+            ),
+        ],
+        1,
+        &|t| capture.tokens.lock().unwrap().push_str(t),
+        &|e| capture.events.lock().unwrap().push(e.clone()),
+    )
+    .await
+    .expect("live targeting conversation must resolve");
+
+    let events = capture.events.lock().unwrap().clone();
+    eprintln!("\n=== live targeting probe ===\nanswer: {}", outcome.text);
+    for e in &events {
+        eprintln!("event: {e:?}");
+    }
+
+    // The ordered names of every tool CALL the model actually emitted.
+    let call_names: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            ToolEvent::Call(c) => Some(c.call.name.clone()),
+            _ => None,
+        })
+        .collect();
+    eprintln!("call sequence: {call_names:?}");
+
+    // Whether a blind aim (move or coordinate-bearing click) was refused by the
+    // structural gate.
+    let blind_refusals = events
+        .iter()
+        .filter(|e| {
+            matches!(e, ToolEvent::Result(r) if r.failure.as_deref() == Some(NO_SCREEN_QUERY_KIND))
+        })
+        .count();
+    eprintln!("blind aim refusals (no-screen-query): {blind_refusals}");
+
+    let recorded = input.actions.lock().unwrap().clone();
+    let focused = focus.focused.lock().unwrap().clone();
+    eprintln!("focus_app calls: {focused:?}");
+    eprintln!("recorded HID actions: {recorded:?}");
+
+    // The substance of the fix, asserted structurally rather than on model whim:
+    // EVERY action that reached the backend with a coordinate aimed INSIDE the
+    // on-screen element's box (640,220 sized 400x40) — a coordinate the model
+    // could only have read from screen_query (its top-left, its centre 840,240,
+    // or any point within). The gate makes this an invariant: a guess outside
+    // the box is refused before it can be recorded. So if the model aimed at all,
+    // it aimed at the real target. This now covers the coordinate-bearing click —
+    // the shape the small model actually emits (target on the click, not a move).
+    const BOX: (i32, i32, i32, i32) = (640, 220, 400, 40); // x, y, w, h
+    for action in &recorded {
+        if let Some((x, y)) = action.aim_target() {
+            let in_box = x >= BOX.0 && x <= BOX.0 + BOX.2 && y >= BOX.1 && y <= BOX.1 + BOX.3;
+            assert!(
+                in_box,
+                "an aimed action reached the backend at ({x},{y}) — outside the only \
+                 on-screen element {BOX:?}, so the model did not read it from \
+                 screen_query and the structural gate leaked: {action:?}",
+            );
+        }
+    }
+
+    // The model is expected to call screen_query at least once before any move —
+    // the whole point of the discipline. (If the small model refused to use
+    // tools at all, this fails loudly rather than passing vacuously.)
+    assert!(
+        call_names.iter().any(|n| n == SCREEN_QUERY_TOOL),
+        "the model never called {SCREEN_QUERY_TOOL}; sequence was {call_names:?}",
+    );
+    // And the loop must have terminated with real content (no hang/abort).
+    assert!(
+        !events.is_empty(),
+        "the model emitted no tool events at all — it ignored the tools entirely",
+    );
 }

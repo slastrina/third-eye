@@ -166,6 +166,22 @@ impl InputState {
         self.backend.permission()
     }
 
+    /// Trigger the OS Accessibility prompt through the backend and return the
+    /// resulting permission value — the first-run onboarding entry point.
+    /// Requesting the grant here does NOT arm HID: it only pre-grants the OS
+    /// permission so a later Settings arm is a one-click flip, not a grant
+    /// round-trip. The arm state is untouched (still `Off`, D038/R019). On an
+    /// unsupported platform the backend returns `false` and the value stays
+    /// `supported: false`, so the UI can present it truthfully.
+    pub fn request_permission(&self) -> InputPermission {
+        // Only ask where a prompt can appear; off macOS the fallback returns
+        // false without side effects.
+        if self.backend.permission().supported {
+            self.backend.request_permission();
+        }
+        self.backend.permission()
+    }
+
     /// Record (or clear) the most recent arm/disarm failure — the applier calls
     /// this on every mutation so a refused arm or persist failure stays
     /// queryable on the status (R007). Mirrors `PrivacyState::record_error`.
@@ -554,10 +570,12 @@ mod tests {
     use std::sync::Mutex;
 
     /// Minimal scriptable backend: records the last action so delegation
-    /// through the managed state can be asserted without touching real HID.
+    /// through the managed state can be asserted without touching real HID, plus
+    /// whether the OS prompt was requested (the onboarding flow's contract).
     struct ScriptedInput {
         permission: InputPermission,
         last: Mutex<Option<InputAction>>,
+        prompt_requested: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -567,6 +585,7 @@ mod tests {
         }
 
         fn request_permission(&self) -> bool {
+            self.prompt_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             self.permission.granted
         }
 
@@ -577,7 +596,11 @@ mod tests {
     }
 
     fn state_with(permission: InputPermission) -> (InputState, Arc<ScriptedInput>) {
-        let backend = Arc::new(ScriptedInput { permission, last: Mutex::new(None) });
+        let backend = Arc::new(ScriptedInput {
+            permission,
+            last: Mutex::new(None),
+            prompt_requested: std::sync::atomic::AtomicBool::new(false),
+        });
         (InputState::new(backend.clone()), backend)
     }
 
@@ -593,12 +616,12 @@ mod tests {
         // The Arc the executor will hold must dispatch to the state's backend.
         state
             .backend()
-            .perform(InputAction::MouseClick { button: MouseButton::Left })
+            .perform(InputAction::click(MouseButton::Left))
             .await
             .unwrap();
         assert_eq!(
             *backend.last.lock().unwrap(),
-            Some(InputAction::MouseClick { button: MouseButton::Left }),
+            Some(InputAction::click(MouseButton::Left)),
             "backend() must return a handle to the state's own backend"
         );
     }
@@ -612,6 +635,27 @@ mod tests {
         assert!(arm.armed());
         arm.set_armed(false);
         assert!(!arm.armed());
+    }
+
+    #[test]
+    fn request_permission_prompts_and_never_arms_hid() {
+        // First-run onboarding: requesting the grant prompts the backend and
+        // reports the live permission, but must NOT arm HID — arming stays the
+        // explicit Settings choice (D038/R019). The machine stays disarmed even
+        // when the grant is present.
+        use std::sync::atomic::Ordering;
+        let (state, backend) = state_with(InputPermission { granted: true, supported: true });
+        assert!(!state.armed(), "precondition: disarmed by default");
+        let result = state.request_permission();
+        assert!(
+            backend.prompt_requested.load(Ordering::SeqCst),
+            "a supported backend must be prompted during onboarding"
+        );
+        assert_eq!(result, InputPermission { granted: true, supported: true });
+        assert!(
+            !state.armed(),
+            "requesting the Accessibility grant must never arm HID (D038)"
+        );
     }
 
     #[test]

@@ -32,15 +32,23 @@ use super::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
 use super::toolloop::{
     run_tool_loop_with_stop, ApprovalGate, ApprovalPrompt, ApprovalVerdict, CompositeExecutor,
-    InputTool, MemorySearchTool, ScreenQueryTool, ToolEvent, ToolExecutor, TOOL_CALL_EVENT,
-    TOOL_RESULT_EVENT,
+    FocusAppTool, FocusedApp, InputTool, MemorySearchTool, ScreenQueryTool, ScreenSeen, ToolEvent,
+    ToolExecutor, HID_SYSTEM_PROMPT, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
 };
-use super::{ChatMessage, LlmClient, LlmError, LlmHealth};
+use super::{ChatMessage, LlmClient, LlmError, LlmHealth, Role};
 
 /// Event names — the string half of the IPC contract with `src/chat.ts`.
 pub const TOKEN_EVENT: &str = "llm://token";
 pub const DONE_EVENT: &str = "llm://done";
 pub const ERROR_EVENT: &str = "llm://error";
+/// Reasoning-delta stream (thinking models): a model's chain-of-thought
+/// (`delta.reasoning_content` / `delta.reasoning`) arrives as its own event
+/// stream so the overlay can render a dimmed "Thinking…" region distinct from
+/// the answer — and so reasoning never lands in the answer body (which used to
+/// fill with blank newlines while the heavy model thought). Transient by
+/// construction: never persisted, cleared per turn UI-side. The string half of
+/// the contract with `src/chat.ts` (pinned by a Rust test and its TS twin).
+pub const REASONING_EVENT: &str = "llm://reasoning";
 /// Routing-state broadcast (S07): mutation responses only reach the calling
 /// window, so every successful `set_model` / `set_lane_model` also emits the
 /// updated [`ModelInfo`] app-wide — the overlay stays truthful when the
@@ -222,6 +230,16 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
 pub struct TokenEvent {
     pub request_id: u64,
     pub token: String,
+}
+
+/// One reasoning delta (thinking models). Same shape as [`TokenEvent`] but on
+/// the [`REASONING_EVENT`] channel — the UI appends these to a transient
+/// Thinking… region, never to the answer text.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEvent {
+    pub request_id: u64,
+    pub delta: String,
 }
 
 /// Terminal success event: full accumulated text plus the latency figures
@@ -532,6 +550,17 @@ pub async fn chat(
             }
         };
 
+        // Reasoning deltas (thinking models) ride their own event so the overlay
+        // shows a dimmed Thinking… region — kept out of the answer text, which is
+        // what used to fill with blank newlines. Emission failure is logged, never
+        // fatal, same policy as tokens.
+        let on_reasoning = |delta: &str| {
+            let payload = ReasoningEvent { request_id: id, delta: delta.into() };
+            if let Err(e) = task_app.emit(REASONING_EVENT, payload) {
+                log::warn!("llm: request {id} reasoning emit failed: {e}");
+            }
+        };
+
         // Tool phases surface as llm://tool-call / llm://tool-result — the
         // UI's memory-consulted indicator (T04). Emission failure is logged,
         // never fatal, same policy as tokens.
@@ -555,6 +584,7 @@ pub async fn chat(
         let memory = task_app.state::<crate::memory::MemoryState>();
         let input_state = task_app.state::<crate::input::commands::InputState>();
         let screen_state = task_app.state::<crate::screenquery::commands::ScreenQueryState>();
+        let appfocus_state = task_app.state::<crate::appfocus::commands::AppFocusState>();
         let mut executors: Vec<Box<dyn ToolExecutor>> = Vec::new();
         match memory.store() {
             Some(store) => {
@@ -578,7 +608,10 @@ pub async fn chat(
         // Run mode (S04/T05): the gate snapshots the persisted three-way run mode
         // the user picked in Settings (Off/Ask/Auto-run), applied AX-gated into
         // the shared InputState — Off stays inert (D038), Ask prompts inline per
-        // not-yet-whitelisted kind, Auto-run performs without prompting.
+        // not-yet-whitelisted kind, Auto-run performs without prompting. The gate
+        // wraps BOTH HID-class surfaces (M005): input_action and focus_app, so a
+        // best-effort app activation is gated on the exact same Off/Ask/Auto-run
+        // path (ActionKind::FocusApp) — Off refuses before activating.
         let approval = task_app.state::<Arc<ApprovalState>>();
         let mode = input_state.mode();
         let approver = Arc::new(OverlayApprovalPrompt::new(
@@ -586,14 +619,38 @@ pub async fn chat(
             approval.inner().clone(),
             id,
         ));
+        // Per-run targeting gates (M005): both shared between the ScreenQueryTool
+        // and the ApprovalGate. `screen_seen` refuses a mouse-move until the model
+        // has grounded coordinates via screen_query; `focused_app` filters
+        // screen_query results to the app the model focused so it can only click
+        // inside that app, never the desktop. Fresh per request — neither carries
+        // across conversations.
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
         executors.push(Box::new(ApprovalGate::new(
             InputTool::new(input_state.backend(), input_state.arm_state()),
+            FocusAppTool::new(appfocus_state.backend()),
             mode,
             approval.whitelist(),
             approver,
+            screen_seen.clone(),
+            focused_app.clone(),
         )));
-        executors.push(Box::new(ScreenQueryTool::new(screen_state.backend())));
+        executors.push(Box::new(ScreenQueryTool::new(
+            screen_state.backend(),
+            screen_seen,
+            focused_app,
+        )));
         let executor = CompositeExecutor::new(executors);
+        // Ground the model in the focus→query→click discipline (M005 targeting
+        // fix). Only when the caller didn't already send a system turn — the
+        // summon-from-nudge path prepends its own screen-context system message
+        // and must not be clobbered. Prepended so it leads the conversation.
+        let mut messages = messages;
+        if !messages.iter().any(|m| m.role == Role::System) {
+            messages.insert(0, ChatMessage::system(HID_SYSTEM_PROMPT));
+            log::debug!("llm: request {id} grounded with HID orchestration system prompt");
+        }
         // The loop observes the cooperative Stop flag between rounds/actions and
         // terminates with a typed stopped outcome (S04 T04).
         let should_stop = move || stop.load(Ordering::SeqCst);
@@ -603,6 +660,7 @@ pub async fn chat(
             messages,
             id,
             &on_token,
+            &on_reasoning,
             &on_event,
             &should_stop,
         )
@@ -1073,6 +1131,17 @@ mod tests {
         assert_eq!(v["approvalId"], 3);
         assert_eq!(v["kind"], "mouse-click");
         assert_eq!(v["summary"], "Click the left mouse button");
+
+        // The FocusApp kind (M005) flows through the same payload — the overlay
+        // reads `focus-app` and its human summary for a focus_app approval.
+        let v = serde_json::to_value(ApprovalRequestPayload {
+            approval_id: 4,
+            kind: ActionKind::FocusApp,
+            summary: "Bring \"Google Chrome\" to the front".into(),
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "focus-app");
+        assert_eq!(v["summary"], "Bring \"Google Chrome\" to the front");
     }
 
     #[test]
@@ -1135,6 +1204,18 @@ mod tests {
         let v = serde_json::to_value(TokenEvent { request_id: 7, token: "hi".into() }).unwrap();
         assert_eq!(v["requestId"], 7);
         assert_eq!(v["token"], "hi");
+    }
+
+    #[test]
+    fn reasoning_event_name_and_payload_are_the_ipc_contract() {
+        // src/chat.ts pins the same event string and reads `delta` — the const
+        // and payload shape are the contract lock for the Thinking… stream.
+        assert_eq!(REASONING_EVENT, "llm://reasoning");
+        let v =
+            serde_json::to_value(ReasoningEvent { request_id: 7, delta: "let me think".into() })
+                .unwrap();
+        assert_eq!(v["requestId"], 7);
+        assert_eq!(v["delta"], "let me think");
     }
 
     #[test]

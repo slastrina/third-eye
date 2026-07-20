@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use super::guard::{GuardState, GuardedClient};
 use super::openai::OpenAiClient;
-use super::{ChatRequest, LlmClient, LlmError, LlmHealth, StreamOutcome, TokenSink};
+use super::{ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink};
 
 /// Lane for quick, low-latency prompts (small model). The default lane.
 pub const THIN_LANE: &str = "thin";
@@ -282,6 +282,23 @@ impl LlmClient for ModelRouter {
             client.endpoint()
         );
         client.stream_chat(request, on_token).await
+    }
+
+    async fn stream_chat_reasoning(
+        &self,
+        request: &ChatRequest,
+        on_token: TokenSink<'_>,
+        on_reasoning: ReasoningSink<'_>,
+    ) -> Result<StreamOutcome, LlmError> {
+        // Forward the reasoning sink to the active lane's client verbatim: the
+        // router picks the lane, the lane's client (OpenAiClient, possibly
+        // guard-wrapped) does the SSE parse.
+        let (lane, model, client) = self.active_lane();
+        log::debug!(
+            "llm: routing (reasoning) via lane={lane} model={model} endpoint={}",
+            client.endpoint()
+        );
+        client.stream_chat_reasoning(request, on_token, on_reasoning).await
     }
 
     async fn health(&self) -> LlmHealth {

@@ -21,17 +21,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::appfocus::{AppFocus, AppFocusError};
 use crate::input::commands::{
     resolve_approval, ApprovalDecision, HidArmState, HidRunMode, SessionWhitelist,
 };
 use crate::input::{ActionKind, InputAction, InputControl, InputError, MouseButton};
 use crate::memory::commands::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 use crate::memory::{search, Embedder, MemoryStore, SearchMode};
-use crate::screenquery::ScreenQuery;
+use crate::screenquery::{ScreenElement, ScreenQuery};
 
 use super::{
-    ChatMessage, ChatRequest, LlmClient, LlmError, StreamOutcome, TokenSink, ToolCall,
-    ToolDefinition,
+    ChatMessage, ChatRequest, LlmClient, LlmError, ReasoningSink, StreamOutcome, TokenSink,
+    ToolCall, ToolDefinition,
 };
 
 /// Event names — the tool-phase half of the IPC contract with `src/chat.ts`.
@@ -63,6 +64,214 @@ pub const INPUT_ACTION_TOOL: &str = "input_action";
 /// [`INPUT_ACTION_TOOL`] click at. Coordinates are transient — produced per
 /// query, never persisted (R011/R023).
 pub const SCREEN_QUERY_TOOL: &str = "screen_query";
+
+/// The app-focus tool S05 ships (M005): brings a running app to the front by
+/// best-effort name match, so the model can operate the app it means (e.g.
+/// Chrome) rather than whatever happened to be frontmost. HID-class: gated
+/// through the same [`ApprovalGate`] as [`INPUT_ACTION_TOOL`]
+/// ([`ActionKind::FocusApp`]).
+pub const FOCUS_APP_TOOL: &str = "focus_app";
+
+/// The HID-orchestration system prompt prepended to every chat request that the
+/// caller did not already ground with a `system` turn (M005 targeting fix). Small
+/// local models do not infer the focus→query→click discipline from a flat tool
+/// list, so it is spelled out. It is guidance; the structural [`ScreenSeen`] gate
+/// enforces the coordinate rule even when the model ignores the prose.
+pub const HID_SYSTEM_PROMPT: &str = "You can control this computer for the user with tools: \
+focus_app (bring an app to the front), screen_query (read the text on screen with each item's \
+exact pixel coordinates), and input_action (move/click the mouse, type text, press a key).\n\n\
+To operate any app, follow this order every time:\n\
+1. Call focus_app with the app name (e.g. \"Google Chrome\") to bring it to the front.\n\
+2. Call screen_query to see what is on screen and get the real pixel coordinates of the element \
+you want. Each element gives x,y for its top-left corner plus width and height; aim at its centre \
+(x + width/2, y + height/2).\n\
+3. To click a target, call input_action with action \"mouse-click\" and pass the x,y you computed \
+from that screen_query result — the click moves to that point and clicks it in one step.\n\
+4. Use action \"type-text\" or \"key-press\" to enter text after clicking.\n\n\
+Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click \
+or move to a coordinate you did not read from screen_query will be refused. After you focus_app the \
+screen changes, so call screen_query again before you click.\n\n\
+Always focus_app FIRST, before screen_query. Once you have focused an app, screen_query returns only \
+that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a \
+coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it \
+hides the user's windows instead of doing what they asked.";
+
+/// The typed failure kind the [`ApprovalGate`] returns when the model tries to
+/// aim the mouse at coordinates it never obtained from [`SCREEN_QUERY_TOOL`].
+/// A small model that guesses a coordinate lands on the wrong target (the
+/// menubar / tray icon is the signature of a top-of-screen guess); refusing the
+/// blind click structurally forces the `focus_app → screen_query → mouse` order
+/// instead of leaving it to model discipline (M005 targeting fix).
+pub const NO_SCREEN_QUERY_KIND: &str = "no-screen-query";
+
+/// The typed failure a coordinate-bearing click/move gets when its (x, y) does
+/// not land inside any element the last [`SCREEN_QUERY_TOOL`] returned — the
+/// model aimed at bare desktop / between windows. Distinct from
+/// [`NO_SCREEN_QUERY_KIND`] (never looked): here the model *did* look but is
+/// clicking a coordinate that is not one of the real elements. Refusing it is
+/// what actually stops the "click wallpaper → reveal desktop → windows hide"
+/// failure (M005), rather than merely telling the model not to.
+pub const OFF_TARGET_KIND: &str = "off-target";
+
+/// A per-run flag recording whether the model has *seen the screen* — i.e.
+/// called [`SCREEN_QUERY_TOOL`] and gotten real pixel coordinates — since the
+/// last thing that changed what is on screen. It is the structural half of the
+/// targeting fix: any mouse action that names an absolute coordinate (a
+/// `mouse-move`, or a coordinate-bearing `mouse-click`) is refused until it is
+/// set, so the model cannot aim at a coordinate it guessed.
+///
+/// Lifecycle, one instance per `chat()` request (shared by `Arc`):
+/// - starts `false` (the model has not looked yet);
+/// - a successful `screen_query` sets it `true` (coordinates are now grounded);
+/// - a `focus_app` clears it back to `false` — activation changes what is
+///   frontmost, so any prior coordinates are stale and the model must re-query.
+///
+/// A bare `mouse-click` (no x/y), `type-text`, and `key-press` carry no
+/// coordinate, so they are never gated on this flag; only actions that name an
+/// absolute pixel — `mouse-move` and a coordinate-bearing `mouse-click` — are.
+/// One on-screen element's bounding box in absolute screen pixels, captured
+/// from a `screen_query` result. The gate keeps the boxes the model was last
+/// shown so it can verify a click's coordinate lands *inside a real element*,
+/// not on bare desktop between windows (the M005 miss). `x,y` is the top-left
+/// corner; the box spans `[x, x+width) × [y, y+height)` (right/bottom exclusive,
+/// matching `attribute_app`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeenBox {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl SeenBox {
+    /// Is `(px, py)` inside this box? Right/bottom edges are exclusive.
+    fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x
+            && px < self.x + self.width
+            && py >= self.y
+            && py < self.y + self.height
+    }
+}
+
+/// A per-run record of whether the model has *seen the screen* — i.e. called
+/// [`SCREEN_QUERY_TOOL`] and gotten real pixel coordinates — since the last
+/// thing that changed what is on screen, *and the exact boxes it was shown*.
+/// It is the structural half of the targeting fix: a mouse action naming an
+/// absolute coordinate is refused unless (1) the model has looked since the
+/// last focus change AND (2) the coordinate lands inside one of the boxes the
+/// last `screen_query` returned. Telling the model "only click real elements"
+/// is not enough for a 9B model — this enforces it: a click on bare desktop
+/// (which on Sonoma+ reveals the desktop and hides the user's windows) is
+/// refused before it reaches the backend.
+///
+/// The seen-flag and the boxes are one field so they can never drift: seeing
+/// the screen *is* holding a (possibly empty) box set; invalidating clears both.
+///
+/// Lifecycle, one instance per `chat()` request (shared by `Arc`):
+/// - starts empty (`None` — the model has not looked yet; any aimed action is
+///   refused with `no-screen-query`);
+/// - a successful `screen_query` stores the filtered element boxes;
+/// - a `focus_app` clears them — activation changes what is frontmost, so any
+///   prior coordinates are stale and the model must re-query.
+#[derive(Debug, Default)]
+pub struct ScreenSeen(std::sync::Mutex<Option<Vec<SeenBox>>>);
+
+impl ScreenSeen {
+    /// A fresh gate for one chat request — the model has not looked at the
+    /// screen yet.
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The model just got real on-screen coordinates from `screen_query`: record
+    /// the boxes it was shown (already filtered to the focused app) so a later
+    /// click can be checked against them.
+    pub fn mark_seen(&self, boxes: Vec<SeenBox>) {
+        *self.0.lock().unwrap() = Some(boxes);
+    }
+
+    /// The frontmost app changed (a `focus_app` activation): prior coordinates
+    /// are stale, so the model must query the screen again before aiming.
+    pub fn invalidate(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    /// Has the model seen the current screen (called `screen_query` since the
+    /// last focus change)?
+    pub fn seen(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
+    /// Does `(x, y)` land inside one of the boxes the last `screen_query`
+    /// returned? `false` when the model has not looked yet (no boxes) or when the
+    /// coordinate is off every element — the desktop-click case. An empty box set
+    /// (the model queried but the focused app had no recognized elements) also
+    /// returns `false`: there is nothing legitimate to click.
+    pub fn on_target(&self, x: i32, y: i32) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|boxes| boxes.iter().any(|b| b.contains(x, y)))
+    }
+}
+
+/// The app the model last brought to the front with `focus_app`, shared per
+/// chat request (`Arc`) between the [`ApprovalGate`] that sets it and the
+/// [`ScreenQueryTool`] that reads it. It is the second half of the targeting
+/// fix: once an app is focused, `screen_query` returns ONLY that app's
+/// elements, so the model structurally cannot aim a click at the desktop or
+/// another app — the exact failure mode where a click on exposed wallpaper
+/// triggered macOS "reveal desktop" and hid the user's windows (M005).
+///
+/// Lifecycle, one instance per `chat()` request:
+/// - starts `None` (no app focused — `screen_query` returns everything, the
+///   pre-focus survey the model uses to decide what to focus);
+/// - a successful `focus_app` stores the app's resolved localized name;
+/// - a later `focus_app` overwrites it with the new target.
+///
+/// Matching is case-insensitive and exact on the localized app name, which is
+/// what both `focus_app` returns (`FocusedApp.app`) and `attribute_app` writes
+/// onto each element (`ScreenElement.app`).
+#[derive(Debug, Default)]
+pub struct FocusedApp(std::sync::Mutex<Option<String>>);
+
+impl FocusedApp {
+    /// A fresh holder for one chat request — nothing focused yet.
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// Record the app `focus_app` just brought to the front (its resolved
+    /// localized name), so subsequent `screen_query` results are filtered to it.
+    pub fn set(&self, app: impl Into<String>) {
+        *self.0.lock().unwrap() = Some(app.into());
+    }
+
+    /// The currently-focused app name, or `None` before any `focus_app`.
+    pub fn current(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Keep only the elements owned by the focused app (case-insensitive exact
+    /// match on the localized name). Before any focus (`None`) every element is
+    /// returned — the pre-focus survey. An element with no `app` attribution is
+    /// dropped once an app is focused: unattributed regions are the desktop /
+    /// menu-bar chrome the model must not click.
+    pub fn filter(&self, elements: Vec<ScreenElement>) -> Vec<ScreenElement> {
+        match self.current() {
+            None => elements,
+            Some(focused) => elements
+                .into_iter()
+                .filter(|el| {
+                    el.app
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(&focused))
+                })
+                .collect(),
+        }
+    }
+}
 
 /// A model-requested tool call, about to execute. Carries the round so the
 /// UI (and logs) can reconstruct multi-round traces.
@@ -264,10 +473,14 @@ impl InputTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: INPUT_ACTION_TOOL.into(),
-            description: "Drive this computer's mouse and keyboard: move or click the mouse, \
-                          type text, or press a single key. Coordinates are absolute screen \
-                          pixels. Use this to operate the foreground application on the user's \
-                          behalf."
+            description: "Drive this computer's mouse and keyboard: click the mouse (optionally \
+                          moving to a target first), move the mouse, type text, or press a single \
+                          key. Coordinates are absolute screen pixels and MUST come from a \
+                          screen_query result — never guess an x/y. To click something: call \
+                          focus_app to bring the app to the front, then screen_query to read its \
+                          on-screen elements and their exact coordinates, then mouse-click with the \
+                          x,y of the target (the click moves there and clicks in one step). A click \
+                          or move to a guessed coordinate is refused."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -279,16 +492,20 @@ impl InputTool {
                     },
                     "x": {
                         "type": "integer",
-                        "description": "mouse-move: absolute screen X coordinate in pixels."
+                        "description": "mouse-move / mouse-click: absolute screen X coordinate in \
+                                        pixels, from a screen_query element. For mouse-click, pass \
+                                        x and y together to move to the target then click it."
                     },
                     "y": {
                         "type": "integer",
-                        "description": "mouse-move: absolute screen Y coordinate in pixels."
+                        "description": "mouse-move / mouse-click: absolute screen Y coordinate in \
+                                        pixels, from a screen_query element. For mouse-click, pass \
+                                        x and y together to move to the target then click it."
                     },
                     "button": {
                         "type": "string",
                         "enum": ["left", "right", "middle"],
-                        "description": "mouse-click: which mouse button to click."
+                        "description": "mouse-click: which mouse button to click (default left)."
                     },
                     "text": {
                         "type": "string",
@@ -374,11 +591,22 @@ impl ToolExecutor for InputTool {
 /// only in this outcome's `content` and never reach the memory store (R011).
 pub struct ScreenQueryTool {
     backend: Arc<dyn ScreenQuery>,
+    /// Set on a successful query so the [`ApprovalGate`] knows the model has
+    /// grounded coordinates and may aim the mouse (the targeting fix).
+    screen_seen: Arc<ScreenSeen>,
+    /// The app the model last focused. Once set, results are filtered to it so
+    /// the model can only see (and thus click) elements inside the focused app,
+    /// never the desktop or another app (the targeting fix, second half).
+    focused_app: Arc<FocusedApp>,
 }
 
 impl ScreenQueryTool {
-    pub fn new(backend: Arc<dyn ScreenQuery>) -> Self {
-        Self { backend }
+    pub fn new(
+        backend: Arc<dyn ScreenQuery>,
+        screen_seen: Arc<ScreenSeen>,
+        focused_app: Arc<FocusedApp>,
+    ) -> Self {
+        Self { backend, screen_seen, focused_app }
     }
 
     /// The model-facing definition. No arguments: a screen query is a snapshot
@@ -419,6 +647,52 @@ impl ToolExecutor for ScreenQueryTool {
         // screen. The whole capture/recognize pipeline lives behind the backend.
         match self.backend.query().await {
             Ok(elements) => {
+                // Filter to the focused app (if one was focused): the model then
+                // only ever sees — and can only aim a click at — elements inside
+                // that app, never the desktop wallpaper (which on Sonoma+ hides
+                // all windows) or another app's chrome (M005 targeting fix).
+                let focused = self.focused_app.current();
+                let total = elements.len();
+                if let Some(app) = &focused {
+                    // Diagnostic (M005): the distinct app-attribution strings in
+                    // the pre-filter set. If the focused name is absent here, the
+                    // filter's name-authority (SC applicationName) disagrees with
+                    // focus_app's (NSRunningApplication localizedName).
+                    let mut attributed: Vec<&str> = elements
+                        .iter()
+                        .map(|el| el.app.as_deref().unwrap_or("<none>"))
+                        .collect();
+                    attributed.sort_unstable();
+                    attributed.dedup();
+                    log::debug!(
+                        "screen_query: focused={app:?} distinct attributed apps={attributed:?}"
+                    );
+                }
+                let elements = self.focused_app.filter(elements);
+                if let Some(app) = &focused {
+                    log::debug!(
+                        "screen_query: filtered {} → {} element(s) for focused app {app:?}",
+                        total,
+                        elements.len()
+                    );
+                }
+                // The model now holds real on-screen coordinates — unblock the
+                // mouse-positioning gate AND record the exact boxes it was shown,
+                // so a subsequent coordinate-bearing click is checked against them
+                // (a click off every box is a desktop click and is refused). The
+                // boxes are the *filtered* set, so only elements inside the focused
+                // app are clickable (M005 targeting enforcement).
+                self.screen_seen.mark_seen(
+                    elements
+                        .iter()
+                        .map(|el| SeenBox {
+                            x: el.x,
+                            y: el.y,
+                            width: el.width,
+                            height: el.height,
+                        })
+                        .collect(),
+                );
                 let content = serde_json::to_string(&elements).unwrap_or_else(|e| {
                     format!(r#"{{"error":"result serialization failed: {e}"}}"#)
                 });
@@ -433,6 +707,107 @@ impl ToolExecutor for ScreenQueryTool {
             // Typed ScreenQueryError → same kind tag the UI matches on; the model
             // sees the detail and can recover (e.g. ask the user to grant Screen
             // Recording) rather than aim a click at coordinates it never got.
+            Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
+        }
+    }
+}
+
+/// The app-focus tool over the [`AppFocus`] backend (M005). Advertises one
+/// `focus_app` tool with a single required `app` string; each call best-effort
+/// matches a running app by name and brings it to the front, returning the
+/// localized name it actually activated. Every failure — a typed
+/// [`crate::appfocus::AppFocusError`] (not-found / activation-failed /
+/// unsupported) — rides back as a typed [`ToolOutcome`], never a silent no-op
+/// (R007). A `not-found` payload lists the running-app candidates so the model
+/// can retry against a real name rather than guess again.
+///
+/// This tool is HID-class: the [`ApprovalGate`] wraps it so every activation is
+/// gated through the per-action approval resolver ([`ActionKind::FocusApp`])
+/// before it reaches the backend — the tool itself performs no gating.
+pub struct FocusAppTool {
+    backend: Arc<dyn AppFocus>,
+}
+
+impl FocusAppTool {
+    pub fn new(backend: Arc<dyn AppFocus>) -> Self {
+        Self { backend }
+    }
+
+    /// The model-facing definition. `app` is the required target name — a
+    /// best-effort match, so a fuzzy value ("chrome") resolves to the running
+    /// app ("Google Chrome") and the result reports which was fronted.
+    pub fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: FOCUS_APP_TOOL.into(),
+            description: "Bring a running application to the front by name (e.g. \"Chrome\", \
+                          \"Safari\", \"Finder\"). Call this before operating an app with \
+                          input_action so your clicks and keystrokes land in the app you mean, \
+                          not whatever was frontmost. The match is best-effort; the result names \
+                          the app actually activated."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "description": "The application name to bring to the front, e.g. \"Google Chrome\"."
+                    }
+                },
+                "required": ["app"]
+            }),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FocusAppArgs {
+    app: String,
+}
+
+#[async_trait]
+impl ToolExecutor for FocusAppTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name != FOCUS_APP_TOOL {
+            return ToolOutcome::failure(
+                "unknown-tool",
+                format!("unknown tool: {} (available: {FOCUS_APP_TOOL})", call.name),
+            );
+        }
+        let args: FocusAppArgs = match serde_json::from_str(&call.arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return ToolOutcome::failure(
+                    "invalid-arguments",
+                    format!("invalid {FOCUS_APP_TOOL} arguments: {e}"),
+                )
+            }
+        };
+        match self.backend.focus(&args.app).await {
+            Ok(focused) => ToolOutcome {
+                content: serde_json::json!({ "ok": true, "focused": focused.app }).to_string(),
+                ok: true,
+                result_count: None,
+                mode: None,
+                failure: None,
+            },
+            // A not-found carries the running-app candidates back to the model so
+            // it can retry against a real name; other typed errors ride their
+            // kind back unchanged (R007).
+            Err(AppFocusError::NotFound { requested, candidates }) => ToolOutcome {
+                content: serde_json::json!({
+                    "error": format!("no running app matched {requested:?}"),
+                    "candidates": candidates,
+                })
+                .to_string(),
+                ok: false,
+                result_count: None,
+                mode: None,
+                failure: Some("not-found".to_string()),
+            },
             Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
         }
     }
@@ -528,23 +903,40 @@ pub trait ApprovalPrompt: Send + Sync {
 /// never touches the backend; "Always allow this kind" mutates the session
 /// whitelist so the same kind performs unprompted for the rest of the session.
 ///
-/// The gate wraps ONLY the input tool, so memory_search / screen_query — sibling
-/// executors in the [`CompositeExecutor`] — are never gated.
+/// The gate wraps the input tool AND the app-focus tool (both HID-class), so
+/// memory_search / screen_query — sibling executors in the [`CompositeExecutor`]
+/// — are never gated. `focus_app` is gated with [`ActionKind::FocusApp`] on the
+/// exact same Off/Ask/AutoRun path as `input_action`; the two HID surfaces share
+/// one gate so the mode snapshot, session whitelist, and approver are identical
+/// for both.
 pub struct ApprovalGate {
     inner: InputTool,
+    focus: FocusAppTool,
     mode: HidRunMode,
     whitelist: Arc<std::sync::Mutex<SessionWhitelist>>,
     approver: Arc<dyn ApprovalPrompt>,
+    /// The per-run "has the model looked at the screen" flag (the targeting
+    /// fix): a `mouse-move` is refused until `screen_query` has grounded
+    /// coordinates, and a successful `focus_app` invalidates it (the screen
+    /// changed). Shared with the [`ScreenQueryTool`] that sets it.
+    screen_seen: Arc<ScreenSeen>,
+    /// The app the model has focused, recorded here on a successful `focus_app`
+    /// and read by the [`ScreenQueryTool`] to filter results to that app (the
+    /// targeting fix, second half). Shared per chat request.
+    focused_app: Arc<FocusedApp>,
 }
 
 impl ApprovalGate {
     pub fn new(
         inner: InputTool,
+        focus: FocusAppTool,
         mode: HidRunMode,
         whitelist: Arc<std::sync::Mutex<SessionWhitelist>>,
         approver: Arc<dyn ApprovalPrompt>,
+        screen_seen: Arc<ScreenSeen>,
+        focused_app: Arc<FocusedApp>,
     ) -> Self {
-        Self { inner, mode, whitelist, approver }
+        Self { inner, focus, mode, whitelist, approver, screen_seen, focused_app }
     }
 
     /// A human sentence describing the pending action — what the overlay shows so
@@ -553,11 +945,77 @@ impl ApprovalGate {
     fn summary(action: &InputAction) -> String {
         match action {
             InputAction::MouseMove { x, y } => format!("Move the mouse to ({x}, {y})"),
-            InputAction::MouseClick { button } => {
+            InputAction::MouseClick { button, x: Some(x), y: Some(y) } => {
+                format!("Click the {} mouse button at ({x}, {y})", button_name(*button))
+            }
+            InputAction::MouseClick { button, .. } => {
                 format!("Click the {} mouse button", button_name(*button))
             }
             InputAction::TypeText { text } => format!("Type {}", quote_preview(text)),
             InputAction::KeyPress { key } => format!("Press the {key} key"),
+        }
+    }
+
+    /// The shared per-action gate for one HID-class call, factored out so
+    /// `input_action` and `focus_app` follow the byte-identical Off/Ask/AutoRun
+    /// path: Off refuses `disabled` (already handled by the caller), the resolver
+    /// gates by `kind`, a `Prompt` asks the injected approver, and Perform /
+    /// Allow-once / Allow-kind delegate to `run` — the closure that dispatches to
+    /// the owning inner tool. A denied (or timed-out) prompt returns the typed
+    /// `approval-denied` result and never runs. `tool` names the surface for logs.
+    async fn gate_and_run<F, Fut>(
+        &self,
+        tool: &str,
+        kind: ActionKind,
+        summary: String,
+        run: F,
+    ) -> ToolOutcome
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ToolOutcome>,
+    {
+        // Resolve under the lock, then drop it before any `.await` (the whitelist
+        // guard must never be held across the approval round-trip).
+        let decision = {
+            let whitelist = self.whitelist.lock().unwrap();
+            resolve_approval(self.mode, kind, &whitelist)
+        };
+        match decision {
+            // Only Off resolves to Refuse and that is handled by the caller; defensive.
+            ApprovalDecision::Refuse => {
+                let err = InputError::disabled();
+                ToolOutcome::failure(err.kind(), err.to_string())
+            }
+            ApprovalDecision::Perform => {
+                log::info!(
+                    "llm: {tool} approved without prompt kind={kind:?} mode={:?} (auto-run or whitelisted)",
+                    self.mode
+                );
+                run().await
+            }
+            ApprovalDecision::Prompt => {
+                let verdict = self.approver.request(kind, summary).await;
+                match verdict {
+                    ApprovalVerdict::Deny => {
+                        log::warn!("llm: {tool} denied by user kind={kind:?}");
+                        ToolOutcome::failure(
+                            APPROVAL_DENIED_KIND,
+                            format!("the user denied this HID action ({kind:?})"),
+                        )
+                    }
+                    ApprovalVerdict::AllowOnce => {
+                        log::info!("llm: {tool} allowed once kind={kind:?}");
+                        run().await
+                    }
+                    ApprovalVerdict::AllowKind => {
+                        self.whitelist.lock().unwrap().allow(kind);
+                        log::info!(
+                            "llm: {tool} allowed + kind whitelisted for session kind={kind:?}"
+                        );
+                        run().await
+                    }
+                }
+            }
         }
     }
 }
@@ -565,15 +1023,71 @@ impl ApprovalGate {
 #[async_trait]
 impl ToolExecutor for ApprovalGate {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        // Delegates to the inner tool, so the S03 structural gate still holds: a
-        // disarmed InputTool advertises nothing and the composite never offers
-        // input_action to the model at all (D038).
-        self.inner.definitions()
+        // Off is structurally inert (D038): advertise NEITHER HID surface, so the
+        // composite never offers input_action or focus_app to the model at all —
+        // the run-mode gate withholds them regardless of the inner arm state.
+        if self.mode == HidRunMode::Off {
+            return Vec::new();
+        }
+        // Armed mode: the inner tool's own S03 structural gate still applies (a
+        // disarmed InputTool advertises nothing), plus the HID-class focus_app.
+        let mut defs = self.inner.definitions();
+        defs.extend(self.focus.definitions());
+        defs
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
-        // Not our tool: hand straight to the inner tool. The composite routes by
-        // name so this is defensive — nothing here gates a non-input call.
+        // Route by name. focus_app is HID-class and gated with ActionKind::FocusApp;
+        // input_action keeps its byte-identical path. Anything else is not ours —
+        // hand straight to the inner tool (defensive; the composite routes by name).
+        if call.name == FOCUS_APP_TOOL {
+            // Off is structurally inert (D038): refuse with the `disabled` error
+            // BEFORE parsing or activating — the whitelist can never un-inert a
+            // disarmed machine.
+            if self.mode == HidRunMode::Off {
+                let err = InputError::disabled();
+                log::warn!("llm: focus_app refused — HID off (kind={})", err.kind());
+                return ToolOutcome::failure(err.kind(), err.to_string());
+            }
+            // Parse the target app so the prompt names it. A malformed call is a
+            // typed invalid-arguments failure — never a prompt, never an activate.
+            let app = match serde_json::from_str::<FocusAppArgs>(&call.arguments) {
+                Ok(args) => args.app,
+                Err(e) => {
+                    return ToolOutcome::failure(
+                        "invalid-arguments",
+                        format!("invalid {FOCUS_APP_TOOL} arguments: {e}"),
+                    )
+                }
+            };
+            let summary = format!("Bring {} to the front", quote_preview(&app));
+            let outcome = self
+                .gate_and_run(FOCUS_APP_TOOL, ActionKind::FocusApp, summary, || {
+                    self.focus.execute(call)
+                })
+                .await;
+            // A successful activation changes what is frontmost, so any pixel
+            // coordinates the model already holds are now stale — force a fresh
+            // screen_query before it may aim the mouse again (the targeting fix).
+            if outcome.ok {
+                self.screen_seen.invalidate();
+                // Record the RESOLVED app name (best-effort match may differ from
+                // the requested string, e.g. "chrome" → "Google Chrome") so the
+                // ScreenQueryTool filters to exactly what attribute_app labels
+                // elements with. Fall back to the requested name if the content
+                // is somehow unparseable — never leave the filter unset after a
+                // successful focus.
+                let resolved = serde_json::from_str::<serde_json::Value>(&outcome.content)
+                    .ok()
+                    .and_then(|v| v.get("focused").and_then(|f| f.as_str()).map(str::to_owned))
+                    .unwrap_or(app);
+                self.focused_app.set(resolved.clone());
+                log::info!(
+                    "llm: focus_app succeeded ({resolved:?}) — coordinates invalidated; screen_query now filtered to this app"
+                );
+            }
+            return outcome;
+        }
         if call.name != INPUT_ACTION_TOOL {
             return self.inner.execute(call).await;
         }
@@ -597,50 +1111,72 @@ impl ToolExecutor for ApprovalGate {
                 )
             }
         };
-        let kind = action.kind();
-        // Resolve under the lock, then drop it before any `.await` (the whitelist
-        // guard must never be held across the approval round-trip).
-        let decision = {
-            let whitelist = self.whitelist.lock().unwrap();
-            resolve_approval(self.mode, kind, &whitelist)
-        };
-        match decision {
-            // Only Off resolves to Refuse and that is handled above; defensive.
-            ApprovalDecision::Refuse => {
-                let err = InputError::disabled();
-                ToolOutcome::failure(err.kind(), err.to_string())
-            }
-            ApprovalDecision::Perform => {
-                log::info!(
-                    "llm: input_action approved without prompt kind={kind:?} mode={:?} (auto-run or whitelisted)",
-                    self.mode
+        // A coordinate-bearing click must carry both x and y (or neither). A
+        // half-specified aim would silently degrade to a click-at-cursor — the
+        // exact failure mode we are closing — so reject it as invalid-arguments
+        // before it can reach the backend.
+        if let Err(detail) = action.validate() {
+            return ToolOutcome::failure(
+                "invalid-arguments",
+                format!("invalid {INPUT_ACTION_TOOL} arguments: {detail}"),
+            );
+        }
+        // Structural targeting guard (M005): any action that names an absolute
+        // pixel — a `mouse-move` OR a coordinate-bearing `mouse-click` (the shape
+        // small models actually emit: they put the target on the click, not a
+        // separate move) — must come from a real screen_query, not a guess.
+        // Refuse it, with a typed actionable error the model can recover from,
+        // until the model has looked at the screen since the last focus change.
+        // This is what stops a small model from clicking the tray icon on a
+        // guessed coordinate. A bare click / type / key carries no coordinate and
+        // is never gated here.
+        if let Some((ax, ay)) = action.aim_target() {
+            // Two-stage structural targeting guard (M005). Stage 1: the model
+            // must have looked at the screen since the last focus change — a blind
+            // aim is refused with no-screen-query. Stage 2: even after looking, the
+            // coordinate must land inside one of the elements screen_query actually
+            // returned. A coordinate off every box is a click on bare desktop
+            // between windows — the exact miss that reveals the desktop and hides
+            // the user's windows. Telling the model "only click real elements" was
+            // never enough for a 9B model; this refuses the off-target aim before
+            // it reaches the backend and hands back the actionable reason so the
+            // model re-queries and picks a real element.
+            if !self.screen_seen.seen() {
+                log::warn!(
+                    "llm: input_action {} refused — no screen_query yet (kind={NO_SCREEN_QUERY_KIND})",
+                    action.kind_str()
                 );
-                self.inner.execute(call).await
+                return ToolOutcome::failure(
+                    NO_SCREEN_QUERY_KIND,
+                    "call screen_query first to get real on-screen pixel coordinates before \
+                     aiming the mouse — do not guess coordinates. Pass the x,y from screen_query \
+                     to a mouse-click. If you need a specific app, call focus_app to bring it to \
+                     the front, then screen_query, then click.",
+                );
             }
-            ApprovalDecision::Prompt => {
-                let verdict = self.approver.request(kind, Self::summary(&action)).await;
-                match verdict {
-                    ApprovalVerdict::Deny => {
-                        log::warn!("llm: input_action denied by user kind={kind:?}");
-                        ToolOutcome::failure(
-                            APPROVAL_DENIED_KIND,
-                            format!("the user denied this HID action ({kind:?})"),
-                        )
-                    }
-                    ApprovalVerdict::AllowOnce => {
-                        log::info!("llm: input_action allowed once kind={kind:?}");
-                        self.inner.execute(call).await
-                    }
-                    ApprovalVerdict::AllowKind => {
-                        self.whitelist.lock().unwrap().allow(kind);
-                        log::info!(
-                            "llm: input_action allowed + kind whitelisted for session kind={kind:?}"
-                        );
-                        self.inner.execute(call).await
-                    }
-                }
+            if !self.screen_seen.on_target(ax, ay) {
+                log::warn!(
+                    "llm: input_action {} refused — ({ax}, {ay}) is not inside any \
+                     screen_query element (kind={OFF_TARGET_KIND})",
+                    action.kind_str()
+                );
+                return ToolOutcome::failure(
+                    OFF_TARGET_KIND,
+                    format!(
+                        "({ax}, {ay}) is not inside any element screen_query returned — that spot \
+                         is empty desktop, and clicking it hides the user's windows instead of \
+                         doing what they asked. Pick one of the elements from the most recent \
+                         screen_query and aim at its centre (x + width/2, y + height/2). If the \
+                         target is not among them, call screen_query again (or focus_app then \
+                         screen_query) — never invent a coordinate."
+                    ),
+                );
             }
         }
+        let kind = action.kind();
+        let summary = Self::summary(&action);
+        self.gate_and_run(INPUT_ACTION_TOOL, kind, summary, || self.inner.execute(call))
+            .await
     }
 }
 
@@ -709,9 +1245,18 @@ pub async fn run_tool_loop(
     on_token: TokenSink<'_>,
     on_event: ToolEventSink<'_>,
 ) -> Result<StreamOutcome, LlmError> {
-    run_tool_loop_with_stop(client, executor, messages, request_id, on_token, on_event, &|| false)
-        .await
-        .map(|loop_outcome| loop_outcome.outcome)
+    run_tool_loop_with_stop(
+        client,
+        executor,
+        messages,
+        request_id,
+        on_token,
+        &|_| {},
+        on_event,
+        &|| false,
+    )
+    .await
+    .map(|loop_outcome| loop_outcome.outcome)
 }
 
 /// Drive one chat request through its tool rounds, observing a Stop signal
@@ -736,6 +1281,7 @@ pub async fn run_tool_loop_with_stop(
     mut messages: Vec<ChatMessage>,
     request_id: u64,
     on_token: TokenSink<'_>,
+    on_reasoning: ReasoningSink<'_>,
     on_event: ToolEventSink<'_>,
     should_stop: StopSignal<'_>,
 ) -> Result<LoopOutcome, LlmError> {
@@ -755,7 +1301,7 @@ pub async fn run_tool_loop_with_stop(
         let tools = if round < MAX_TOOL_ROUNDS { executor.definitions() } else { Vec::new() };
         let final_round = tools.is_empty();
         let request = ChatRequest { messages: std::mem::take(&mut messages), tools };
-        let outcome = client.stream_chat(&request, on_token).await?;
+        let outcome = client.stream_chat_reasoning(&request, on_token, on_reasoning).await?;
         messages = request.messages;
         streamed_text = outcome.text.clone();
         streamed_tokens = outcome.token_count;
@@ -1162,6 +1708,7 @@ mod tests {
             vec![ChatMessage::user("do a long task")],
             7,
             &|t| capture.tokens.lock().unwrap().push_str(t),
+            &|_| {},
             &|e| capture.events.lock().unwrap().push(e.clone()),
             &should_stop,
         )
@@ -1194,6 +1741,7 @@ mod tests {
             vec![ChatMessage::user("what was I working on?")],
             7,
             &|t| capture.tokens.lock().unwrap().push_str(t),
+            &|_| {},
             &|e| capture.events.lock().unwrap().push(e.clone()),
             &|| false,
         )
@@ -1430,7 +1978,7 @@ mod tests {
         // The action really reached the backend.
         assert_eq!(
             *backend.last.lock().unwrap(),
-            Some(InputAction::MouseClick { button: MouseButton::Right }),
+            Some(InputAction::click(MouseButton::Right)),
         );
         // The model sees a structured confirmation echoing what was synthesized.
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
@@ -1526,7 +2074,7 @@ mod tests {
                 Arc::new(RecordingInput::new()),
                 Arc::new(HidArmState::disarmed()),
             )),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()))),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
         ]);
         let names: Vec<String> =
             composite.definitions().into_iter().map(|d| d.name).collect();
@@ -1629,12 +2177,32 @@ mod tests {
                     y: 200,
                     width: 60,
                     height: 24,
+                    app: None,
                 }]),
             }
         }
 
         fn failing(err: ScreenQueryError) -> Self {
             Self { result: Err(err) }
+        }
+
+        /// A fixture whose elements carry the given `(text, app)` attributions —
+        /// for the focused-app filtering tests. Coordinates are irrelevant here,
+        /// so they are stubbed uniformly.
+        fn with_apps(items: &[(&str, Option<&str>)]) -> Self {
+            Self {
+                result: Ok(items
+                    .iter()
+                    .map(|(text, app)| ScreenElement {
+                        text: (*text).into(),
+                        x: 1,
+                        y: 2,
+                        width: 3,
+                        height: 4,
+                        app: app.map(str::to_owned),
+                    })
+                    .collect()),
+            }
         }
     }
 
@@ -1662,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn screen_query_ok_returns_element_json_with_coordinates() {
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()));
+        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()));
         let outcome = tool.execute(&screen_call("c1")).await;
         assert!(outcome.ok);
         assert_eq!(outcome.failure, None);
@@ -1677,22 +2245,102 @@ mod tests {
         assert_eq!(v[0]["height"], 24);
     }
 
+    #[test]
+    fn focused_app_filter_is_identity_before_any_focus() {
+        // Before any focus_app the model needs the full screen survey to decide
+        // what to focus, so filter() with None returns everything untouched.
+        let focused = FocusedApp::new();
+        let els = vec![
+            ScreenElement { text: "a".into(), x: 0, y: 0, width: 1, height: 1, app: Some("Chrome".into()) },
+            ScreenElement { text: "b".into(), x: 0, y: 0, width: 1, height: 1, app: None },
+        ];
+        assert_eq!(focused.filter(els.clone()), els);
+    }
+
+    #[test]
+    fn focused_app_filter_keeps_only_the_focused_app_and_drops_unattributed() {
+        // Once an app is focused, only its elements survive — case-insensitively
+        // on the localized name — and unattributed (app=None) desktop/menu-bar
+        // chrome is dropped so the model can never aim a click at the wallpaper.
+        let focused = FocusedApp::new();
+        focused.set("Google Chrome");
+        let kept = focused.filter(vec![
+            ScreenElement { text: "addr".into(), x: 0, y: 0, width: 1, height: 1, app: Some("google chrome".into()) },
+            ScreenElement { text: "other".into(), x: 0, y: 0, width: 1, height: 1, app: Some("Finder".into()) },
+            ScreenElement { text: "desktop".into(), x: 0, y: 0, width: 1, height: 1, app: None },
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "addr");
+    }
+
+    #[tokio::test]
+    async fn screen_query_filters_results_to_the_focused_app() {
+        // End-to-end through the tool: with a focused app set, the JSON handed to
+        // the model contains ONLY that app's elements — the structural guarantee
+        // that the model can't click the desktop (M005). The screen_seen flag is
+        // still marked so a subsequent aimed click is not blocked.
+        let seen = Arc::new(ScreenSeen::new());
+        let focused = Arc::new(FocusedApp::new());
+        focused.set("Google Chrome");
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::with_apps(&[
+                ("address bar", Some("Google Chrome")),
+                ("dock item", Some("Dock")),
+                ("wallpaper text", None),
+            ])),
+            seen.clone(),
+            focused,
+        );
+        let outcome = tool.execute(&screen_call("c1")).await;
+        assert!(outcome.ok);
+        assert!(seen.seen(), "a successful query must still ground coordinates");
+        assert_eq!(outcome.result_count, Some(1), "only the Chrome element survives");
+        let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["text"], "address bar");
+        assert_eq!(v[0]["app"], "Google Chrome");
+    }
+
+    #[tokio::test]
+    async fn screen_query_returns_all_apps_before_any_focus() {
+        // With no focus set, the pre-focus survey returns every element so the
+        // model can choose which app to focus.
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::with_apps(&[
+                ("a", Some("Google Chrome")),
+                ("b", Some("Finder")),
+                ("c", None),
+            ])),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
+        let outcome = tool.execute(&screen_call("c1")).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.result_count, Some(3));
+    }
+
     #[tokio::test]
     async fn screen_query_typed_failure_rides_the_kind_back() {
         // A backend permission failure surfaces as an ok:false outcome carrying
         // the screen-query kind — the UI's walkthrough keys on it (R007).
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::failing(
-            ScreenQueryError::PermissionDenied { detail: "TCC denied".into() },
-        )));
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::failing(ScreenQueryError::PermissionDenied {
+                detail: "TCC denied".into(),
+            })),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
         let outcome = tool.execute(&screen_call("c1")).await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("permission-denied"));
         assert!(outcome.content.contains("error"));
 
         // The unsupported class (fallback platform) rides its own kind too.
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::failing(
-            ScreenQueryError::unsupported_here(),
-        )));
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::failing(ScreenQueryError::unsupported_here())),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
         let outcome = tool.execute(&screen_call("c2")).await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("unsupported"));
@@ -1700,7 +2348,7 @@ mod tests {
 
     #[tokio::test]
     async fn screen_query_wrong_name_is_unknown_tool() {
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()));
+        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()));
         let outcome = tool
             .execute(&ToolCall {
                 id: "c1".into(),
@@ -1719,7 +2367,7 @@ mod tests {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
             Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm())),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()))),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
         ]);
         let names: Vec<String> =
             composite.definitions().into_iter().map(|d| d.name).collect();
@@ -1771,8 +2419,39 @@ mod tests {
         }
     }
 
+    /// Records the last focused app name so gating of focus_app through the
+    /// ApprovalGate can be asserted without touching a real workspace. Any name
+    /// is treated as a match (returns it verbatim).
+    struct RecordingFocus {
+        last: Mutex<Option<String>>,
+    }
+
+    impl RecordingFocus {
+        fn new() -> Self {
+            Self { last: Mutex::new(None) }
+        }
+    }
+
+    #[async_trait]
+    impl AppFocus for RecordingFocus {
+        async fn focus(&self, app_name: &str) -> Result<crate::appfocus::FocusedApp, AppFocusError> {
+            *self.last.lock().unwrap() = Some(app_name.to_string());
+            Ok(crate::appfocus::FocusedApp { app: app_name.to_string() })
+        }
+
+        async fn running_apps(&self) -> Vec<String> {
+            vec!["Google Chrome".into(), "Finder".into()]
+        }
+    }
+
+    fn focus_call(id: &str, args: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: FOCUS_APP_TOOL.into(), arguments: args.into() }
+    }
+
     /// A gate over a recording backend, its inner tool armed (so a Perform truly
     /// reaches HID), plus the shared session whitelist for post-hoc assertions.
+    /// The app-focus surface is wired to a scripted no-op backend so the input
+    /// path assertions are unaffected.
     fn gate_over(
         mode: HidRunMode,
         backend: Arc<RecordingInput>,
@@ -1780,7 +2459,25 @@ mod tests {
     ) -> (ApprovalGate, Arc<std::sync::Mutex<SessionWhitelist>>) {
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
         let inner = InputTool::new(backend, armed_arm());
-        (ApprovalGate::new(inner, mode, whitelist.clone(), approver), whitelist)
+        let focus = FocusAppTool::new(Arc::new(RecordingFocus::new()));
+        // Mark the screen already seen — with a screen-spanning box so any aimed
+        // coordinate these approval-path tests use lands on-target — so they
+        // exercise the Off/Ask/AutoRun gate directly; the targeting guards
+        // (no-screen-query, off-target) have their own dedicated tests.
+        let screen_seen = Arc::new(ScreenSeen::new());
+        screen_seen.mark_seen(vec![SeenBox { x: 0, y: 0, width: 100_000, height: 100_000 }]);
+        (
+            ApprovalGate::new(
+                inner,
+                focus,
+                mode,
+                whitelist.clone(),
+                approver,
+                screen_seen,
+                Arc::new(FocusedApp::new()),
+            ),
+            whitelist,
+        )
     }
 
     #[tokio::test]
@@ -1913,16 +2610,24 @@ mod tests {
         let backend = Arc::new(RecordingInput::new());
         let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::AllowOnce]));
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        // One shared targeting gate: the screen_query below sets it so the
+        // subsequent mouse-move is allowed to aim — the real focus→query→click
+        // wiring, not a bypass.
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
             InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::Ask,
             whitelist,
             approver.clone(),
+            screen_seen.clone(),
+            focused_app.clone(),
         );
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
             Box::new(gate),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()))),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
         ]);
 
         // memory_search: succeeds, never gated.
@@ -1930,18 +2635,21 @@ mod tests {
         assert!(mem.ok);
         assert_eq!(approver.prompt_count(), 0, "memory_search must never be gated");
 
-        // screen_query: succeeds, never gated.
+        // screen_query: succeeds, never gated — and it grounds the coordinates
+        // the mouse-move below needs.
         let scr = composite.execute(&screen_call("c2")).await;
         assert!(scr.ok);
         assert_eq!(approver.prompt_count(), 0, "screen_query must never be gated");
 
-        // input_action: gated through the approver, then performed.
+        // input_action: gated through the approver, then performed. The aim must
+        // land inside a real screen_query element — ScriptedScreen::ok() returns
+        // one box [100,160)×[200,224), so (120, 210) is on-target.
         let hid = composite
-            .execute(&input_call("c3", r#"{"action":"mouse-move","x":1,"y":2}"#))
+            .execute(&input_call("c3", r#"{"action":"mouse-move","x":120,"y":210}"#))
             .await;
         assert!(hid.ok);
         assert_eq!(approver.prompt_count(), 1, "input_action must be gated");
-        assert_eq!(*backend.last.lock().unwrap(), Some(InputAction::MouseMove { x: 1, y: 2 }));
+        assert_eq!(*backend.last.lock().unwrap(), Some(InputAction::MouseMove { x: 120, y: 210 }));
     }
 
     #[tokio::test]
@@ -1952,11 +2660,16 @@ mod tests {
         let backend = Arc::new(RecordingInput::new());
         let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::AllowOnce]));
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        // mouse-click carries no coordinate, so it is not gated on the targeting
+        // flag; a fresh (unseen) gate still performs the click.
         let gate = ApprovalGate::new(
             InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::Ask,
             whitelist,
             approver.clone(),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
         );
         let composite = CompositeExecutor::new(vec![Box::new(gate)]);
         let client = ScriptedClient::new(vec![
@@ -1969,10 +2682,518 @@ mod tests {
         assert_eq!(approver.prompt_count(), 1);
         assert_eq!(
             *backend.last.lock().unwrap(),
-            Some(InputAction::MouseClick { button: MouseButton::Left }),
+            Some(InputAction::click(MouseButton::Left)),
         );
         // The tool-result event rode back ok:true after the approval.
         let ToolEvent::Result(result) = &capture.events()[1] else { panic!("expected Result") };
         assert!(result.ok);
+    }
+
+    // --- Screen-query targeting guard (M005) -----------------------------
+
+    #[tokio::test]
+    async fn mouse_move_is_refused_until_screen_query_grounds_coordinates() {
+        // The structural targeting fix: a mouse-move on a guessed coordinate is
+        // refused (typed no-screen-query), never reaching the backend, until a
+        // successful screen_query has grounded coordinates. AutoRun so approval
+        // never masks the guard.
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver.clone(),
+            screen_seen.clone(),
+            focused_app.clone(),
+        );
+        let composite = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+        ]);
+
+        // Blind mouse-move: refused, backend untouched, approver never consulted.
+        let blind = composite
+            .execute(&input_call("c1", r#"{"action":"mouse-move","x":9,"y":9}"#))
+            .await;
+        assert!(!blind.ok);
+        assert_eq!(blind.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
+        assert_eq!(*backend.last.lock().unwrap(), None, "a guessed move must never reach HID");
+        assert_eq!(approver.prompt_count(), 0);
+
+        // screen_query grounds the coordinates.
+        assert!(composite.execute(&screen_call("c2")).await.ok);
+
+        // Now the same mouse-move lands.
+        let aimed = composite
+            .execute(&input_call("c3", r#"{"action":"mouse-move","x":100,"y":200}"#))
+            .await;
+        assert!(aimed.ok, "mouse-move must perform once the screen has been queried");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            Some(InputAction::MouseMove { x: 100, y: 200 }),
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_bearing_click_is_refused_until_screen_query_grounds_coordinates() {
+        // The real small-model failure mode (M005): the model puts the target on
+        // the CLICK — {"action":"mouse-click","x":..,"y":..} — never a separate
+        // mouse-move. Before this fix serde dropped x/y and the click fired at the
+        // cursor (landing on the tray). Now a coordinate-bearing click is gated on
+        // screen_query exactly like a move, and once grounded it moves-then-clicks.
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver.clone(),
+            screen_seen.clone(),
+            focused_app.clone(),
+        );
+        let composite = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+        ]);
+
+        // Blind aimed click: refused, backend untouched — the coordinate is no
+        // longer silently dropped into a click-at-cursor.
+        let blind = composite
+            .execute(&input_call("c1", r#"{"action":"mouse-click","x":840,"y":240,"button":"left"}"#))
+            .await;
+        assert!(!blind.ok);
+        assert_eq!(blind.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
+        assert_eq!(*backend.last.lock().unwrap(), None, "a guessed click must never reach HID");
+        assert_eq!(approver.prompt_count(), 0);
+
+        // screen_query grounds coordinates; the same aimed click now lands, and it
+        // carries the coordinate through to the backend (move-then-click).
+        assert!(composite.execute(&screen_call("c2")).await.ok);
+        let aimed = composite
+            .execute(&input_call("c3", r#"{"action":"mouse-click","x":100,"y":200,"button":"left"}"#))
+            .await;
+        assert!(aimed.ok, "an aimed click must perform once the screen has been queried");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            Some(InputAction::click_at(MouseButton::Left, 100, 200)),
+            "the coordinate must reach the backend, not be dropped",
+        );
+    }
+
+    #[tokio::test]
+    async fn click_off_every_screen_query_box_is_refused_as_off_target() {
+        // The actual M005 miss: the model DID call screen_query, but then clicked a
+        // coordinate that is not inside any returned element — bare desktop between
+        // windows, which reveals the desktop and hides the user's windows. The gate
+        // must refuse it (typed off-target), backend untouched, even though the
+        // screen was seen. ScriptedScreen::ok() returns one box [100,160)×[200,224).
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver.clone(),
+            screen_seen.clone(),
+            focused_app.clone(),
+        );
+        let composite = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+        ]);
+
+        // Ground the screen, then aim at (5, 5) — well outside the only element.
+        assert!(composite.execute(&screen_call("c1")).await.ok);
+        let off = composite
+            .execute(&input_call("c2", r#"{"action":"mouse-click","x":5,"y":5,"button":"left"}"#))
+            .await;
+        assert!(!off.ok, "a click on bare desktop must be refused");
+        assert_eq!(off.failure.as_deref(), Some(OFF_TARGET_KIND));
+        assert_eq!(*backend.last.lock().unwrap(), None, "an off-target click must never reach HID");
+        assert_eq!(approver.prompt_count(), 0, "refused before the approval prompt");
+
+        // A click INSIDE the element's box performs (regression guard: enforcement
+        // is not blanket-refusing every aimed click).
+        let on = composite
+            .execute(&input_call("c3", r#"{"action":"mouse-click","x":130,"y":210,"button":"left"}"#))
+            .await;
+        assert!(on.ok, "a click inside a real element must perform");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            Some(InputAction::click_at(MouseButton::Left, 130, 210)),
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_change_clears_seen_boxes_so_a_stale_coordinate_is_refused() {
+        // A successful focus_app invalidates the seen boxes (the screen changed):
+        // a coordinate that was on-target before the focus must now be refused
+        // (no-screen-query, since nothing is grounded) until the model re-queries.
+        let screen_seen = Arc::new(ScreenSeen::new());
+        screen_seen.mark_seen(vec![SeenBox { x: 100, y: 200, width: 60, height: 24 }]);
+        assert!(screen_seen.on_target(120, 210));
+        screen_seen.invalidate();
+        assert!(!screen_seen.seen(), "focus change clears the seen flag");
+        assert!(!screen_seen.on_target(120, 210), "and clears the boxes with it");
+    }
+
+    #[tokio::test]
+    async fn half_specified_click_coordinate_is_rejected_as_invalid() {
+        // x-without-y (or the reverse) would silently degrade to a click-at-cursor
+        // — the exact failure we are closing — so it is rejected as invalid before
+        // the screen_query gate even runs, and never touches the backend.
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        screen_seen.mark_seen(vec![SeenBox { x: 0, y: 0, width: 100_000, height: 100_000 }]); // even with the screen grounded, half-aim is invalid.
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver,
+            screen_seen,
+            Arc::new(FocusedApp::new()),
+        );
+        let outcome = gate
+            .execute(&input_call("c1", r#"{"action":"mouse-click","x":840,"button":"left"}"#))
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some("invalid-arguments"));
+        assert_eq!(*backend.last.lock().unwrap(), None, "a half-aimed click must never reach HID");
+    }
+
+    #[tokio::test]
+    async fn bare_click_type_and_key_are_never_gated_on_screen_query() {
+        // A bare mouse-click (no x/y), type, and key carry no coordinate, so they
+        // perform on a fresh (never-queried) gate. Only coordinate-bearing actions
+        // are gated (see coordinate_bearing_click_is_refused_until_screen_query).
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver,
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
+        for (args, expect) in [
+            (r#"{"action":"mouse-click","button":"left"}"#, InputAction::click(MouseButton::Left)),
+            (r#"{"action":"type-text","text":"hi"}"#, InputAction::TypeText { text: "hi".into() }),
+            (
+                r#"{"action":"key-press","key":"return"}"#,
+                InputAction::KeyPress { key: "return".into() },
+            ),
+        ] {
+            let outcome = gate.execute(&input_call("c", args)).await;
+            assert!(outcome.ok, "{args} must not be gated on screen_query");
+            assert_eq!(*backend.last.lock().unwrap(), Some(expect));
+        }
+    }
+
+    #[tokio::test]
+    async fn focus_app_invalidates_prior_screen_query() {
+        // A successful focus_app changes the frontmost app, so coordinates the
+        // model already holds are stale: the next mouse-move must be refused until
+        // a fresh screen_query. This enforces focus → query → click ordering.
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver,
+            screen_seen.clone(),
+            focused_app.clone(),
+        );
+        // The fixture element is attributed to Google Chrome so it survives the
+        // post-focus filter; its box is [1,4)×[2,6), so (2, 3) is on-target.
+        let composite = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::with_apps(&[("addr", Some("Google Chrome"))])),
+                screen_seen,
+                focused_app,
+            )),
+        ]);
+
+        // Query grounds coordinates; a move onto the element now lands.
+        assert!(composite.execute(&screen_call("c1")).await.ok);
+        assert!(composite
+            .execute(&input_call("c2", r#"{"action":"mouse-move","x":2,"y":3}"#))
+            .await
+            .ok);
+
+        // focus_app succeeds → coordinates invalidated.
+        assert!(composite.execute(&focus_call("c3", r#"{"app":"Google Chrome"}"#)).await.ok);
+
+        // The next move is refused until a fresh query.
+        let stale = composite
+            .execute(&input_call("c4", r#"{"action":"mouse-move","x":2,"y":3}"#))
+            .await;
+        assert!(!stale.ok, "a move after focus_app must be refused until re-query");
+        assert_eq!(stale.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
+
+        // Re-query re-grounds (still scoped to the focused Chrome element); the
+        // move onto it lands again.
+        assert!(composite.execute(&screen_call("c5")).await.ok);
+        assert!(composite
+            .execute(&input_call("c6", r#"{"action":"mouse-move","x":2,"y":3}"#))
+            .await
+            .ok);
+    }
+
+    #[tokio::test]
+    async fn focus_app_scopes_the_next_screen_query_to_that_app() {
+        // The end-to-end targeting guarantee (M005): after a successful focus_app,
+        // screen_query returns ONLY the focused app's elements — the desktop and
+        // other apps are gone, so the model structurally cannot aim at wallpaper.
+        let backend = Arc::new(RecordingInput::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let screen_seen = Arc::new(ScreenSeen::new());
+        let focused_app = Arc::new(FocusedApp::new());
+        // RecordingFocus echoes the requested name back as the resolved app.
+        let gate = ApprovalGate::new(
+            InputTool::new(backend.clone(), armed_arm()),
+            FocusAppTool::new(Arc::new(RecordingFocus::new())),
+            HidRunMode::AutoRun,
+            whitelist,
+            approver,
+            screen_seen.clone(),
+            focused_app.clone(),
+        );
+        let screen = Arc::new(ScriptedScreen::with_apps(&[
+            ("address bar", Some("Google Chrome")),
+            ("desktop icon", None),
+            ("menu item", Some("Finder")),
+        ]));
+        let composite = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(ScreenQueryTool::new(screen, screen_seen, focused_app)),
+        ]);
+
+        // Before focus: the pre-focus survey returns all three elements.
+        let survey = composite.execute(&screen_call("c1")).await;
+        assert_eq!(survey.result_count, Some(3), "pre-focus survey returns everything");
+
+        // Focus Chrome, then re-query: only Chrome's element survives.
+        assert!(composite.execute(&focus_call("c2", r#"{"app":"Google Chrome"}"#)).await.ok);
+        let scoped = composite.execute(&screen_call("c3")).await;
+        assert_eq!(scoped.result_count, Some(1), "post-focus query is scoped to Chrome");
+        let v: serde_json::Value = serde_json::from_str(&scoped.content).unwrap();
+        assert_eq!(v[0]["text"], "address bar");
+        assert_eq!(v[0]["app"], "Google Chrome");
+    }
+
+    #[test]
+    fn hid_system_prompt_names_the_tool_sequence() {
+        // The prose the model reads must spell out the focus→query→click order and
+        // the no-guessing rule; drift here silently degrades small-model targeting.
+        assert!(HID_SYSTEM_PROMPT.contains(FOCUS_APP_TOOL));
+        assert!(HID_SYSTEM_PROMPT.contains(SCREEN_QUERY_TOOL));
+        assert!(HID_SYSTEM_PROMPT.contains(INPUT_ACTION_TOOL));
+        // It teaches the model's natural one-action aim: click with the x,y.
+        assert!(HID_SYSTEM_PROMPT.contains("mouse-click"));
+        assert!(HID_SYSTEM_PROMPT.to_lowercase().contains("never guess"));
+    }
+
+    // --- FocusAppTool (M005) ---------------------------------------------
+
+    #[test]
+    fn focus_app_definition_is_the_openai_function_envelope() {
+        let def = FocusAppTool::definition();
+        assert_eq!(def.name, FOCUS_APP_TOOL);
+        let v = serde_json::to_value(&def).unwrap();
+        assert_eq!(v["type"], "function");
+        assert_eq!(v["function"]["name"], "focus_app");
+        assert_eq!(v["function"]["parameters"]["required"][0], "app");
+    }
+
+    #[tokio::test]
+    async fn focus_app_ok_reports_the_activated_name() {
+        let backend = Arc::new(RecordingFocus::new());
+        let tool = FocusAppTool::new(backend.clone());
+        let outcome = tool.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.failure, None);
+        assert_eq!(*backend.last.lock().unwrap(), Some("Google Chrome".to_string()));
+        let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["focused"], "Google Chrome");
+    }
+
+    #[tokio::test]
+    async fn focus_app_not_found_lists_candidates_for_retry() {
+        // A not-found rides its kind back and carries the running-app candidates
+        // so the model can retry against a real name (R007).
+        struct MissBackend;
+        #[async_trait]
+        impl AppFocus for MissBackend {
+            async fn focus(
+                &self,
+                app_name: &str,
+            ) -> Result<crate::appfocus::FocusedApp, AppFocusError> {
+                Err(AppFocusError::NotFound {
+                    requested: app_name.to_string(),
+                    candidates: vec!["Zed".into(), "Finder".into()],
+                })
+            }
+            async fn running_apps(&self) -> Vec<String> {
+                vec!["Zed".into(), "Finder".into()]
+            }
+        }
+        let tool = FocusAppTool::new(Arc::new(MissBackend));
+        let outcome = tool.execute(&focus_call("c1", r#"{"app":"Firefox"}"#)).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some("not-found"));
+        let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(v["candidates"][0], "Zed");
+        assert_eq!(v["candidates"][1], "Finder");
+    }
+
+    #[tokio::test]
+    async fn focus_app_malformed_arguments_are_typed_invalid_arguments() {
+        let tool = FocusAppTool::new(Arc::new(RecordingFocus::new()));
+        let outcome = tool.execute(&focus_call("c1", "{not json")).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some("invalid-arguments"));
+    }
+
+    #[tokio::test]
+    async fn focus_app_wrong_name_is_unknown_tool() {
+        let tool = FocusAppTool::new(Arc::new(RecordingFocus::new()));
+        let outcome = tool
+            .execute(&ToolCall { id: "c1".into(), name: "memory_search".into(), arguments: "{}".into() })
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some("unknown-tool"));
+    }
+
+    // --- FocusApp gating through the ApprovalGate (M005) ------------------
+
+    /// A gate whose app-focus surface is a recording backend, so a gated
+    /// activation can be asserted to have (not) reached it.
+    fn focus_gate_over(
+        mode: HidRunMode,
+        focus: Arc<RecordingFocus>,
+        approver: Arc<ScriptedApprover>,
+    ) -> (ApprovalGate, Arc<std::sync::Mutex<SessionWhitelist>>) {
+        let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
+        let inner = InputTool::new(Arc::new(RecordingInput::new()), armed_arm());
+        (
+            ApprovalGate::new(
+                inner,
+                FocusAppTool::new(focus),
+                mode,
+                whitelist.clone(),
+                approver,
+                Arc::new(ScreenSeen::new()),
+                Arc::new(FocusedApp::new()),
+            ),
+            whitelist,
+        )
+    }
+
+    #[test]
+    fn gate_off_withholds_focus_app_from_the_definitions() {
+        // Structural gate (D038): HID Off advertises neither input_action nor
+        // focus_app; an armed mode advertises both.
+        let (off, _wl) = focus_gate_over(
+            HidRunMode::Off,
+            Arc::new(RecordingFocus::new()),
+            Arc::new(ScriptedApprover::new(vec![])),
+        );
+        assert!(off.definitions().is_empty(), "Off must advertise no HID tools");
+
+        let (ask, _wl) = focus_gate_over(
+            HidRunMode::Ask,
+            Arc::new(RecordingFocus::new()),
+            Arc::new(ScriptedApprover::new(vec![])),
+        );
+        let names: Vec<String> = ask.definitions().into_iter().map(|d| d.name).collect();
+        assert!(names.contains(&INPUT_ACTION_TOOL.to_string()));
+        assert!(names.contains(&FOCUS_APP_TOOL.to_string()), "an armed mode advertises focus_app");
+    }
+
+    #[tokio::test]
+    async fn gate_off_refuses_focus_app_with_disabled_before_activating() {
+        // Off is structurally inert: the gate refuses focus_app BEFORE parsing or
+        // activating — never prompts, never reaches the backend (D038).
+        let focus = Arc::new(RecordingFocus::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let (gate, _wl) = focus_gate_over(HidRunMode::Off, focus.clone(), approver.clone());
+        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some("disabled"));
+        assert!(focus.last.lock().unwrap().is_none(), "Off must not activate anything");
+        assert_eq!(approver.prompt_count(), 0, "Off must never prompt");
+    }
+
+    #[tokio::test]
+    async fn gate_ask_deny_never_activates_the_app() {
+        // Ask + new kind prompts; a Deny returns approval-denied and never fronts.
+        let focus = Arc::new(RecordingFocus::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::Deny]));
+        let (gate, _wl) = focus_gate_over(HidRunMode::Ask, focus.clone(), approver.clone());
+        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failure.as_deref(), Some(APPROVAL_DENIED_KIND));
+        assert!(focus.last.lock().unwrap().is_none(), "Deny must not activate the app");
+        assert_eq!(approver.prompt_count(), 1);
+        // The overlay saw a human summary naming the target app.
+        assert!(approver.last_summary().unwrap().contains("Google Chrome"));
+    }
+
+    #[tokio::test]
+    async fn gate_ask_allow_kind_whitelists_focus_app_for_the_session() {
+        // "Always allow this kind" performs AND whitelists FocusApp, so a second
+        // focus_app performs without prompting (the queue has one verdict; a
+        // second prompt would panic on the exhausted script).
+        let focus = Arc::new(RecordingFocus::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::AllowKind]));
+        let (gate, wl) = focus_gate_over(HidRunMode::Ask, focus.clone(), approver.clone());
+
+        let first = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        assert!(first.ok);
+        assert_eq!(approver.prompt_count(), 1);
+        assert!(wl.lock().unwrap().contains(ActionKind::FocusApp), "allow-kind must whitelist FocusApp");
+
+        let second = gate.execute(&focus_call("c2", r#"{"app":"Finder"}"#)).await;
+        assert!(second.ok, "a whitelisted FocusApp must perform without prompting");
+        assert_eq!(approver.prompt_count(), 1, "the whitelisted kind must not prompt again");
+        assert_eq!(*focus.last.lock().unwrap(), Some("Finder".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gate_auto_run_activates_focus_app_without_prompting() {
+        let focus = Arc::new(RecordingFocus::new());
+        let approver = Arc::new(ScriptedApprover::new(vec![]));
+        let (gate, _wl) = focus_gate_over(HidRunMode::AutoRun, focus.clone(), approver.clone());
+        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        assert!(outcome.ok);
+        assert_eq!(approver.prompt_count(), 0, "Auto-run must never prompt");
+        assert_eq!(*focus.last.lock().unwrap(), Some("Google Chrome".to_string()));
     }
 }

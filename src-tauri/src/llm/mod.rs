@@ -338,6 +338,16 @@ pub struct LlmHealth {
 /// behind a `Mutex` or channel.
 pub type TokenSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
+/// Per-reasoning-delta callback for models that stream a separate
+/// chain-of-thought (`delta.reasoning_content` / `delta.reasoning`) alongside
+/// the answer. Same `Fn(&str)` shape as [`TokenSink`], but a *distinct* stream:
+/// reasoning is surfaced to the UI as a transient "Thinking…" region and never
+/// folded into the answer text or the persisted [`StreamOutcome`] (mirroring
+/// how screen_query coordinates stay transient — R011/R023). Only chat wires a
+/// real sink; ingestion/nudge/classification pass none and inherit the
+/// default no-op in [`LlmClient::stream_chat_reasoning`].
+pub type ReasoningSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
 /// The chat seam. Object-safe (`Arc<dyn LlmClient>`) so S03's router and
 /// M003's privacy guard can wrap any implementation without knowing its
 /// transport.
@@ -356,6 +366,26 @@ pub trait LlmClient: Send + Sync {
         request: &ChatRequest,
         on_token: TokenSink<'_>,
     ) -> Result<StreamOutcome, LlmError>;
+
+    /// Like [`Self::stream_chat`], but also forwards a model's separate
+    /// reasoning stream (`delta.reasoning_content` / `delta.reasoning`) to
+    /// `on_reasoning` as it arrives — the "Thinking…" surface. The default
+    /// ignores reasoning and delegates to [`Self::stream_chat`], so every
+    /// client that does not parse a reasoning channel (mocks, and any caller
+    /// that does not want it) is unchanged. Only [`crate::llm::openai::OpenAiClient`]
+    /// overrides the parse; the wrapping [`crate::llm::router::ModelRouter`] and
+    /// [`crate::llm::guard::GuardedClient`] override only to forward the sink to
+    /// their inner client. Reasoning never enters [`StreamOutcome`] — it is a
+    /// transient UI stream, not part of the answer.
+    async fn stream_chat_reasoning(
+        &self,
+        request: &ChatRequest,
+        on_token: TokenSink<'_>,
+        on_reasoning: ReasoningSink<'_>,
+    ) -> Result<StreamOutcome, LlmError> {
+        let _ = on_reasoning;
+        self.stream_chat(request, on_token).await
+    }
 
     /// Cheap liveness probe (never errors — offline is a value, not a fault).
     async fn health(&self) -> LlmHealth;

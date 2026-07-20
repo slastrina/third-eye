@@ -66,6 +66,7 @@ mod tests {
                 y: 6,
                 width: 7,
                 height: 8,
+                app: None,
             }])
         }
     }

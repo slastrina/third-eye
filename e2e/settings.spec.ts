@@ -48,6 +48,26 @@ test("privacy toggle and status readouts render their unavailable states", async
   await expect(page.locator(".settings-status-value").last()).toHaveText("unavailable");
 });
 
+test("overlay presentation section renders its controls and unavailable state", async ({ page }) => {
+  await page.goto("/?view=settings");
+  // The Overlay section (M006/S04) exposes the mode select with no window
+  // geometry ACLs — it only invokes the custom command and listens for the
+  // authoritative overlay://presentation broadcast.
+  await expect(page.getByRole("heading", { name: "Overlay" })).toBeVisible();
+  const modeSelect = page.getByLabel("Overlay presentation mode");
+  await expect(modeSelect).toHaveCount(1);
+  // Every mode is offered; the default option is modal (floating).
+  await expect(modeSelect.locator("option")).toHaveCount(5);
+  // overlay_presentation rejects outside Tauri → the select is disabled with a
+  // named note, and no drawer extent input renders (modal has no extent).
+  await expect(modeSelect).toBeDisabled();
+  await expect(modeSelect).toHaveValue("modal");
+  await expect(
+    page.locator(".settings-unavailable", { hasText: "Overlay presentation is unavailable" }),
+  ).toBeVisible();
+  await expect(page.locator("[data-overlay-extent]")).toHaveCount(0);
+});
+
 test("in-page close and Escape are absorbed outside Tauri", async ({ page }) => {
   await page.goto("/?view=settings");
   await page.getByRole("button", { name: "Close settings" }).click();

@@ -101,6 +101,57 @@ describe("chatReducer streaming", () => {
   });
 });
 
+describe("chatReducer reasoning (Thinking… stream)", () => {
+  it("accumulates reasoning deltas into the message's reasoning field, not text", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 1, delta: "Let me " } });
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 1, delta: "think.\n" } });
+    s = chatReducer(s, { type: "token", payload: { requestId: 1, token: "Answer" } });
+    expect(lastMessage(s)).toMatchObject({
+      role: "assistant",
+      text: "Answer",
+      reasoning: "Let me think.\n",
+      status: "streaming",
+    });
+  });
+
+  it("ignores stale reasoning tagged with a superseded request id", () => {
+    let s = started("hi", 2);
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 1, delta: "zombie thought" } });
+    expect(lastMessage(s).reasoning).toBeUndefined();
+  });
+
+  it("buffers reasoning that beats the request id resolving, then replays it", () => {
+    let s = chatReducer(initialChatState, { type: "submit", question: "hi" });
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 7, delta: "early" } });
+    expect(lastMessage(s).reasoning).toBeUndefined();
+    s = chatReducer(s, { type: "request-started", requestId: 7 });
+    expect(lastMessage(s).reasoning).toBe("early");
+  });
+
+  it("reasoning survives the terminal done event (stays readable after the answer settles)", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 1, delta: "pondering" } });
+    s = chatReducer(s, {
+      type: "done",
+      payload: { requestId: 1, text: "final", tokenCount: 1, firstTokenMs: 5, totalMs: 9 },
+    });
+    expect(lastMessage(s)).toMatchObject({ text: "final", reasoning: "pondering", status: "done" });
+  });
+
+  it("reasoning is never resent as wire history (transient, answer-only history)", () => {
+    let s = started("hi", 1);
+    s = chatReducer(s, { type: "reasoning", payload: { requestId: 1, delta: "secret thought" } });
+    s = chatReducer(s, {
+      type: "done",
+      payload: { requestId: 1, text: "the answer", tokenCount: 1, firstTokenMs: 5, totalMs: 9 },
+    });
+    const history = composeMessages(s.messages, "next");
+    expect(history.some((m) => m.content.includes("secret thought"))).toBe(false);
+    expect(history.some((m) => m.content === "the answer")).toBe(true);
+  });
+});
+
 describe("chatReducer pre-resolve buffering", () => {
   it("buffers events that arrive before the request id resolves, then replays matches", () => {
     let s = chatReducer(initialChatState, { type: "submit", question: "hi" });
@@ -600,8 +651,14 @@ describe("HID approval IPC contract (S04/M005)", () => {
     // ActionKind mirrors InputAction's `action` tag.
     const verdicts: ApprovalVerdict[] = ["allow-once", "allow-kind", "deny"];
     expect(verdicts).toEqual(["allow-once", "allow-kind", "deny"]);
-    const kinds: ActionKind[] = ["mouse-move", "mouse-click", "type-text", "key-press"];
-    expect(kinds).toHaveLength(4);
+    const kinds: ActionKind[] = [
+      "mouse-move",
+      "mouse-click",
+      "type-text",
+      "key-press",
+      "focus-app",
+    ];
+    expect(kinds).toHaveLength(5);
   });
 });
 

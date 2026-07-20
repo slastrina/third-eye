@@ -48,6 +48,17 @@ import {
   setCloudOptin,
   type CloudProvider,
 } from "./cloud-state";
+import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geometry";
+import {
+  drawerEdgeOf,
+  drawerExtentFor,
+  onOverlayPresentation,
+  overlayPresentation,
+  setOverlayExtent,
+  setOverlayPresentation,
+  type PresentationMode,
+  type PresentationStatus,
+} from "./overlay-presentation-state";
 import {
   MEMORY_EMPTY_HINT,
   MEMORY_PAGE_SIZE,
@@ -109,6 +120,24 @@ import {
 /** Sentinel select value for "no pin" — a real model id is never empty. */
 const DEFAULT_OPTION = "";
 
+/** Overlay presentation choices for the mode select: a free modal window or a
+ *  drawer docked flush against one of the four display edges. Mirrors the Rust
+ *  PresentationMode serde tags (a drawer edge reuses the `Edge` union). */
+const PRESENTATION_MODE_OPTIONS: { value: PresentationMode; label: string }[] = [
+  { value: "modal", label: "Modal (floating)" },
+  { value: "top", label: "Drawer — top edge" },
+  { value: "bottom", label: "Drawer — bottom edge" },
+  { value: "left", label: "Drawer — left edge" },
+  { value: "right", label: "Drawer — right edge" },
+];
+
+/** The overlay minimum for a drawer edge's variable axis: width for the
+ *  left/right edges, height for top/bottom. Used as the extent input's `min`
+ *  (the backend also floors any sub-min value safe, so this is only guidance). */
+function extentMinFor(edge: Edge): number {
+  return edge === "left" || edge === "right" ? OVERLAY_MIN_WIDTH : OVERLAY_MIN_HEIGHT;
+}
+
 /** Human title for a refused HID arm / persist failure (R007 — every failure
  *  is typed and visible, never a silent no-op). `permission-denied` drives the
  *  walkthrough rather than this banner, so it is rendered separately. */
@@ -146,6 +175,14 @@ function Settings() {
   // (mount query and privacy://state broadcast land the same shape); all
   // display logic lives in pure privacy-state.ts helpers.
   const [guard, setGuard] = useState<GuardTelemetry | null>(null);
+  // Overlay presentation is a single authoritative backend snapshot too (mount
+  // query, mode/extent command response, and the overlay://presentation
+  // broadcast all land the same PresentationStatus shape). This webview holds
+  // core:default only — no window-geometry ACLs — so it never applies geometry;
+  // it invokes the mutators and lets the overlay webview do the apply. Every
+  // handler dispatches the status the command returns / the broadcast pushes,
+  // never optimistically mutating (MEM082/MEM027), so the two windows can't drift.
+  const [presentation, setPresentation] = useState<PresentationStatus | null>(null);
 
   const refreshModels = () => {
     dispatch({ type: "models-loading" });
@@ -210,6 +247,13 @@ function Settings() {
       (status) => dispatchCloud({ type: "heavy", status }),
       (err) => console.debug("settings: cloud_heavy_provider unavailable:", err),
     );
+    // Health-as-value beside the overlay geometry (R007): a PresentationStatus
+    // at any time, never an error. Rejects only outside a Tauri runtime, where
+    // the presentation stays null and the section shows its unavailable note.
+    overlayPresentation().then(
+      (status) => setPresentation(status),
+      (err) => console.debug("settings: overlay_presentation unavailable:", err),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -240,6 +284,10 @@ function Settings() {
       // Cloud opt-in truth flows one way too: a toggle from any window
       // broadcasts the resulting status as cloud://optin.
       onCloudOptin((status) => dispatchCloud({ type: "optin", status })),
+      // Overlay presentation truth flows one way, backend → UI: a mode/extent
+      // change from this window OR a live resize on the overlay webview
+      // broadcasts the resulting PresentationStatus as overlay://presentation.
+      onOverlayPresentation((status) => setPresentation(status)),
     ];
     // MEM115: a capability/ACL denial rejects listen() inside the real app —
     // without this catch the rejection is unhandled and every live surface
@@ -363,6 +411,29 @@ function Settings() {
     );
   };
 
+  const selectPresentationMode = (mode: PresentationMode) => {
+    setOverlayPresentation(mode).then(
+      // Never rejects backend-side; a persist failure rides persistError and the
+      // authoritative status (which the overlay webview applies) comes straight
+      // back — this window never touches window geometry (the ACL split).
+      (status) => setPresentation(status),
+      (err) => console.debug("settings: set_overlay_presentation unavailable:", err),
+    );
+  };
+
+  const submitExtent = (mode: PresentationMode, raw: string) => {
+    const value = Number(raw);
+    // Ignore an unparseable field; a valid-but-sub-min value is floored safe by
+    // the backend, so it is passed through rather than clamped here.
+    if (!Number.isFinite(value)) return;
+    // Both axes carry the same value: the backend selects the active drawer
+    // edge's relevant axis (width for left/right, height for top/bottom).
+    setOverlayExtent(mode, value, value).then(
+      (status) => setPresentation(status),
+      (err) => console.debug("settings: set_overlay_extent unavailable:", err),
+    );
+  };
+
   // Memory list + status fetch. refreshToken is the pure refetch signal
   // (bumped by the reducer on mutations, staleness, and empty-page clamps);
   // offset changes on page turns. A non-MemoryError rejection means no
@@ -433,6 +504,11 @@ function Settings() {
   };
 
   const lanes = state.modelInfo?.lanes ?? null;
+  // The active drawer edge (null in modal mode) drives whether the extent input
+  // shows and which axis minimum it uses. Its stored extent seeds the input.
+  const presentationEdge: Edge | null = presentation ? drawerEdgeOf(presentation) : null;
+  const presentationExtent =
+    presentation && presentationEdge ? drawerExtentFor(presentation, presentationEdge) : 0;
 
   return (
     <div className="settings-root">
@@ -732,6 +808,83 @@ function Settings() {
             watcher.status?.state === "watching" && (
               <p className="settings-hint">Watching — no text extracted yet.</p>
             )
+          )}
+        </section>
+
+        <section className="settings-section" aria-labelledby="settings-overlay-heading">
+          <h2 id="settings-overlay-heading" className="settings-section-title">
+            Overlay
+          </h2>
+          <label className="settings-row">
+            <span className="settings-row-label">Presentation</span>
+            <select
+              className="settings-select"
+              aria-label="Overlay presentation mode"
+              data-overlay-mode={presentation?.mode ?? "modal"}
+              // Inert until the snapshot loads (outside the app the invoke
+              // rejects and presentation stays null).
+              disabled={presentation === null}
+              value={presentation?.mode ?? "modal"}
+              onChange={(event) =>
+                selectPresentationMode(event.target.value as PresentationMode)
+              }
+            >
+              {PRESENTATION_MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="settings-hint">
+            Modal floats free; a drawer docks flush to a screen edge. The overlay
+            adopts the change immediately and restores the same shape after quit
+            and relaunch.
+          </p>
+          {presentation === null && (
+            <p className="settings-unavailable">
+              Overlay presentation is unavailable outside the app.
+            </p>
+          )}
+          {presentation && presentationEdge && (
+            <>
+              <label className="settings-row">
+                <span className="settings-row-label">Drawer size (px)</span>
+                <input
+                  type="number"
+                  className="settings-select"
+                  aria-label="Drawer extent"
+                  data-overlay-extent
+                  min={extentMinFor(presentationEdge)}
+                  step={10}
+                  // Remounts (re-seeding defaultValue) whenever the authoritative
+                  // extent changes — the input never carries drifting local state;
+                  // the broadcast/response is the source of truth (MEM082/MEM027).
+                  key={`${presentationEdge}-${presentationExtent}`}
+                  defaultValue={presentationExtent}
+                  onBlur={(event) => submitExtent(presentation.mode, event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+              </label>
+              <p className="settings-hint">
+                Width for a left/right drawer, height for top/bottom. Values below
+                the overlay minimum are floored to a sane on-screen size.
+              </p>
+            </>
+          )}
+          {presentation && !presentationEdge && (
+            <p className="settings-hint">
+              Modal size follows the overlay window — drag its corner grip to
+              resize.
+            </p>
+          )}
+          {presentation?.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Overlay presentation couldn't be saved</strong>
+              <span>{presentation.persistError}</span>
+            </div>
           )}
         </section>
 

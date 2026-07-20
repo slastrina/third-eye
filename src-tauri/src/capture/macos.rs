@@ -110,6 +110,42 @@ fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
     encode::encode_rgba_frame(RawRgbaFrame { width, height, rgba })
 }
 
+/// One on-screen window's owning-app name and its bounding rect, converted into
+/// the SAME absolute top-left screen-PIXEL space the OCR boxes land in — so the
+/// screen_query path can attribute each recognized text element to the app whose
+/// window covers it (M005). `layer` is the window's `SCWindow::window_layer` so a
+/// caller can pick the TOPMOST window (lowest layer number is frontmost) when
+/// rects overlap. Own-process windows are excluded exactly like the capture
+/// filter's PID exclusion (R008), so the overlay never attributes text to itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowAppRect {
+    pub app: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub layer: i32,
+}
+
+/// The captured image's geometry, carried alongside the pixels so the
+/// screen_query path can map captured-pixel boxes BACK to logical screen points
+/// — the coordinate space the input backend (`enigo`, `Coordinate::Abs`) clicks
+/// in. The capture is taken at native pixel density and then capped to
+/// `max_dimension` on the longest edge, so the captured pixel space is neither
+/// logical points nor native pixels; without this conversion a click at a
+/// screen_query coordinate lands in the wrong physical spot (M005 targeting).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureGeometry {
+    /// Captured image width in pixels (the OCR normalization basis on x).
+    pub pixel_w: u32,
+    /// Captured image height in pixels (the OCR normalization basis on y).
+    pub pixel_h: u32,
+    /// Primary display width in logical points (the input backend's x space).
+    pub point_w: f64,
+    /// Primary display height in logical points (the input backend's y space).
+    pub point_h: f64,
+}
+
 /// The reusable capture stage: one `CGImage` of the primary display, capped
 /// to `max_dimension` on its longest edge (GPU scaling), with every window
 /// owned by this process excluded by PID (R008).
@@ -122,6 +158,40 @@ fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
 /// in-memory bitmap: dropping it releases the pixels; nothing here encodes
 /// or writes them.
 pub fn capture_display_image_blocking(max_dimension: u32) -> Result<CGImage, CaptureError> {
+    capture_display_image_with_windows_blocking(max_dimension).map(|(image, _windows)| image)
+}
+
+/// The windows-bearing capture that ALSO returns the [`CaptureGeometry`] the
+/// screen_query path needs to convert captured-pixel boxes back to logical
+/// screen points. [`capture_display_image_with_windows_blocking`] is the
+/// backward-compatible view that drops the geometry.
+pub fn capture_display_image_with_geometry_blocking(
+    max_dimension: u32,
+) -> Result<(CGImage, Vec<WindowAppRect>, CaptureGeometry), CaptureError> {
+    capture_inner(max_dimension)
+}
+
+/// The capture stage plus the on-screen window→app rects in the captured image's
+/// own pixel space (M005 app-labelling). Same capture as
+/// [`capture_display_image_blocking`]; additionally returns every on-screen,
+/// non-own-process window as a [`WindowAppRect`] converted with the *exact same*
+/// point→pixel scale (`point_pixel_scale`) and `fit_within` cap the capture
+/// itself uses, translated so the display's top-left is the pixel origin — the
+/// coordinate space the OCR boxes are scaled into. The screen_query path calls
+/// this so it can label each recognized element with its owning app; the PNG
+/// frame path and the watcher use the image-only sibling and never pay for the
+/// window walk.
+pub fn capture_display_image_with_windows_blocking(
+    max_dimension: u32,
+) -> Result<(CGImage, Vec<WindowAppRect>), CaptureError> {
+    capture_inner(max_dimension).map(|(image, windows, _geom)| (image, windows))
+}
+
+/// The full capture: the `CGImage`, the window→app rects, and the
+/// [`CaptureGeometry`] mapping captured pixels ↔ logical points.
+fn capture_inner(
+    max_dimension: u32,
+) -> Result<(CGImage, Vec<WindowAppRect>, CaptureGeometry), CaptureError> {
     // Preflight is read-only and cheap; never prompts.
     if !has_permission() {
         return Err(CaptureError::PermissionDenied {
@@ -177,8 +247,85 @@ pub fn capture_display_image_blocking(max_dimension: u32) -> Result<CGImage, Cap
         .with_height(target_h)
         .with_shows_cursor(true);
 
-    SCScreenshotManager::capture_image(&filter, &config)
-        .map_err(|e| CaptureError::CaptureFailed { detail: format!("screenshot failed: {e}") })
+    // Collect the app rects BEFORE the capture so the same shareable-content
+    // snapshot backs both. Frames are in global points with the display's own
+    // frame as the origin offset; scale by target/point so they land in the
+    // captured pixel space, which is what the OCR boxes are normalized to
+    // (extract_elements_blocking uses the image's own width()/height(), equal to
+    // target_w/target_h). fit_within may cap the longest edge, so derive the
+    // per-axis pixel scale from target vs. the display's point size — the exact
+    // factor the capture applied — rather than assuming `scale`.
+    let display_frame = display.frame();
+    let (dpw, dph) = (display.width() as f64, display.height() as f64);
+    let sx = if dpw > 0.0 { target_w as f64 / dpw } else { 0.0 };
+    let sy = if dph > 0.0 { target_h as f64 / dph } else { 0.0 };
+    let window_rects = window_app_rects(&windows, own_pid, display_frame.origin.x, display_frame.origin.y, sx, sy);
+
+    let image = SCScreenshotManager::capture_image(&filter, &config)
+        .map_err(|e| CaptureError::CaptureFailed { detail: format!("screenshot failed: {e}") })?;
+    // The geometry the screen_query path uses to convert captured-pixel boxes
+    // back to logical screen points: the captured image dims (pixel basis) and
+    // the display's logical point dims (input-backend basis). The point→pixel
+    // scale is target/point; the inverse maps a box back to points.
+    let geometry = CaptureGeometry {
+        pixel_w: target_w,
+        pixel_h: target_h,
+        point_w: dpw,
+        point_h: dph,
+    };
+    Ok((image, window_rects, geometry))
+}
+
+/// Pure geometry: convert each on-screen, non-own-process window's frame (global
+/// points) into a [`WindowAppRect`] in the captured pixel space. `origin_x/_y`
+/// are the display's own frame origin (global points) subtracted so the rect is
+/// relative to the display's top-left; `sx/sy` are the per-axis point→pixel
+/// scales. Kept as a free function over the collected `(app, frame, layer,
+/// on_screen, pid)` tuples so the scaling and filtering are testable without a
+/// live capture. Sorted topmost-first (ascending layer) so the first covering
+/// window wins attribution.
+fn window_app_rects(
+    windows: &[SCWindow],
+    own_pid: i32,
+    origin_x: f64,
+    origin_y: f64,
+    sx: f64,
+    sy: f64,
+) -> Vec<WindowAppRect> {
+    let mut rects: Vec<WindowAppRect> = windows
+        .iter()
+        .filter(|w| w.is_on_screen())
+        .filter_map(|w| {
+            let app = w.owning_application()?;
+            // Skip our own windows (R008 parity with the capture filter).
+            if app.process_id() == own_pid {
+                return None;
+            }
+            // WindowServer/menu-bar owners and some system windows report an
+            // empty application_name(). A blank-named rect would attribute
+            // elements to app=Some("") — indistinguishable from a real target
+            // yet unfocusable and unusable. Drop it so those regions read as
+            // unattributed (app=None), the honest "no clickable app here" the
+            // targeting filter and the model both key on (M005).
+            let name = app.application_name();
+            if name.trim().is_empty() {
+                return None;
+            }
+            let frame = w.frame();
+            Some(WindowAppRect {
+                app: name,
+                x: ((frame.origin.x - origin_x) * sx).round() as i32,
+                y: ((frame.origin.y - origin_y) * sy).round() as i32,
+                w: (frame.size.width * sx).round() as i32,
+                h: (frame.size.height * sy).round() as i32,
+                layer: w.window_layer(),
+            })
+        })
+        .collect();
+    // Topmost first: macOS layers ascend away from the user, so the lowest layer
+    // is frontmost and wins when rects overlap.
+    rects.sort_by_key(|r| r.layer);
+    rects
 }
 
 // Keeps the trait bound explicit: the T03 commands hold Arc<dyn ScreenCapture>.

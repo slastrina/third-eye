@@ -12,6 +12,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export const TOKEN_EVENT = "llm://token";
 export const DONE_EVENT = "llm://done";
 export const ERROR_EVENT = "llm://error";
+/** Reasoning-delta stream (thinking models): a model's chain-of-thought arrives
+ *  on its own event so the overlay renders a dimmed "Thinking…" region distinct
+ *  from the answer — and reasoning never lands in the answer body (which used to
+ *  fill with blank newlines while the heavy model thought). Keep in sync with
+ *  REASONING_EVENT in src-tauri/src/llm/commands.rs (pinned by a Rust test and
+ *  its TS twin). Transient: cleared per turn, never persisted. */
+export const REASONING_EVENT = "llm://reasoning";
 /** Tool-phase events (S03): emitted by the backend dispatch loop when the
  *  model requests a tool and when its execution settles. These drive the
  *  memory-consulted indicator — the UI-facing observability surface. Keep in
@@ -46,6 +53,14 @@ export interface ChatMessage {
 export interface TokenPayload {
   requestId: number;
   token: string;
+}
+
+/** llm://reasoning payload — the serde camelCase serialization of Rust's
+ *  ReasoningEvent. `delta` is one chain-of-thought fragment to append to the
+ *  transient Thinking… region. */
+export interface ReasoningPayload {
+  requestId: number;
+  delta: string;
 }
 
 export interface DonePayload {
@@ -159,6 +174,10 @@ export function onModelInfoBroadcast(cb: (info: ModelInfo) => void): Promise<Unl
 
 export function onLlmToken(cb: (payload: TokenPayload) => void): Promise<UnlistenFn> {
   return listen<TokenPayload>(TOKEN_EVENT, (e) => cb(e.payload));
+}
+
+export function onLlmReasoning(cb: (payload: ReasoningPayload) => void): Promise<UnlistenFn> {
+  return listen<ReasoningPayload>(REASONING_EVENT, (e) => cb(e.payload));
 }
 
 export function onLlmDone(cb: (payload: DonePayload) => void): Promise<UnlistenFn> {
@@ -434,8 +453,15 @@ export function onHidStateChanged(cb: (status: HidArmedStatus) => void): Promise
 export const HID_APPROVAL_EVENT = "hid://approval-request";
 
 /** The kind of a HID action, stripped of payload — the granularity the session
- *  whitelist grants by. The kebab-case serde tags of Rust's ActionKind. */
-export type ActionKind = "mouse-move" | "mouse-click" | "type-text" | "key-press";
+ *  whitelist grants by. The kebab-case serde tags of Rust's ActionKind.
+ *  "focus-app" is the HID-class `focus_app` tool (bring an app to the front),
+ *  gated through the same approval path as the input actions (M005). */
+export type ActionKind =
+  | "mouse-move"
+  | "mouse-click"
+  | "type-text"
+  | "key-press"
+  | "focus-app";
 
 /** The `hid://approval-request` payload — the serde camelCase serialization of
  *  Rust's ApprovalRequestPayload. Pixel-free: a correlation id, the action kind,
@@ -510,6 +536,53 @@ export function onRunState(cb: (payload: RunStatePayload) => void): Promise<Unli
 }
 
 // ---------------------------------------------------------------------------
+// First-run onboarding IPC (M006) — contract defined in
+// src-tauri/src/onboarding/mod.rs. The overlay shows a one-time explainer on
+// first launch, then requests Screen Recording + Accessibility with context and
+// marks onboarding done. Requesting Accessibility does NOT arm HID (D038/R019).
+// ---------------------------------------------------------------------------
+
+/** The first-run onboarding snapshot — the serde camelCase serialization of
+ *  Rust's FirstRunStatus. `pending` is the signal to show the explainer;
+ *  `capture`/`input` are the live permission states so the panel can reflect
+ *  what is already granted; `persistError` carries a failed "mark done" save. */
+export interface FirstRunStatus {
+  pending: boolean;
+  capture: CapturePermission;
+  input: InputPermission;
+  persistError: string | null;
+}
+
+/** Read the first-run onboarding snapshot (health-as-value; never rejects
+ *  backend-side). Outside a Tauri runtime the invoke rejects and the caller
+ *  absorbs it — the overlay simply skips onboarding. */
+export function firstRunStatus(): Promise<FirstRunStatus> {
+  return invoke<FirstRunStatus>("first_run_status");
+}
+
+/** Request the Screen Recording OS prompt during onboarding; resolves to the
+ *  resulting permission. Spends the one-shot macOS TCC prompt — after a prior
+ *  denial it comes back ungranted and the Settings deep-link is the recourse. */
+export function requestCapturePermission(): Promise<CapturePermission> {
+  return invoke<CapturePermission>("request_capture_permission");
+}
+
+/** Request the Accessibility OS prompt during onboarding; resolves to the
+ *  resulting permission. Requesting the grant does NOT arm HID — arming stays the
+ *  explicit Settings choice (D038/R019); this only pre-grants the OS permission. */
+export function requestInputPermission(): Promise<InputPermission> {
+  return invoke<InputPermission>("request_input_permission");
+}
+
+/** Mark first-run onboarding complete so the explainer never shows again —
+ *  called whether the user finished the permission steps or skipped them. Never
+ *  rejects backend-side; a persist failure rides `persistError` on the returned
+ *  status, same contract as the other health-as-value mutations. */
+export function completeFirstRun(): Promise<FirstRunStatus> {
+  return invoke<FirstRunStatus>("complete_first_run");
+}
+
+// ---------------------------------------------------------------------------
 // Chat state machine (pure)
 // ---------------------------------------------------------------------------
 
@@ -530,6 +603,11 @@ export interface UiMessage {
   attached?: boolean;
   /** Assistant only: memory_search tool phase (renders the indicator). */
   memory?: MemoryPhase;
+  /** Assistant only: accumulated chain-of-thought from a thinking model,
+   *  rendered as a dimmed "Thinking…" region above the answer. Transient —
+   *  streamed via llm://reasoning, never sent back as history or persisted.
+   *  Undefined when the model streamed no reasoning. */
+  reasoning?: string;
 }
 
 /** A typed backend error, or an IPC-level failure where the chat invoke
@@ -603,6 +681,7 @@ export const initialChatState: ChatState = {
 
 export type LlmEvent =
   | { type: "token"; payload: TokenPayload }
+  | { type: "reasoning"; payload: ReasoningPayload }
   | { type: "done"; payload: DonePayload }
   | { type: "error"; payload: ErrorPayload }
   | { type: "tool-call"; payload: ToolCallPayload }
@@ -786,6 +865,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         messages: withLastAssistant(state.messages, (m) => ({
           ...m,
           text: m.text + action.payload.token,
+        })),
+      };
+    }
+    case "reasoning": {
+      // Same stale-filtering and pre-resolve buffering as tokens: a reasoning
+      // delta from an aborted predecessor must not touch the active answer. It
+      // appends to the transient `reasoning` region, never to `text`.
+      if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
+      if (action.payload.requestId !== state.requestId) return state; // stale
+      return {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({
+          ...m,
+          reasoning: (m.reasoning ?? "") + action.payload.delta,
         })),
       };
     }
