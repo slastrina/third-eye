@@ -339,6 +339,177 @@ export function onNudgeState(cb: (status: NudgeStatus) => void): Promise<Unliste
 }
 
 // ---------------------------------------------------------------------------
+// HID arming IPC (S03/M005) — contract defined in src-tauri/src/input/commands.rs
+// ---------------------------------------------------------------------------
+
+/** HID arm-state broadcast: mutation responses only reach the calling window,
+ *  so every arm/disarm also emits the resulting HidArmedStatus app-wide — the
+ *  overlay/tray affordance stays truthful when the settings window (or a future
+ *  tray path) flips the arming toggle. Keep in sync with HID_STATE_EVENT in
+ *  src-tauri/src/input/commands.rs (pinned by a Rust test). */
+export const HID_STATE_EVENT = "hid://state";
+
+/** Accessibility permission snapshot — health-as-value, never an error. The
+ *  serde camelCase serialization of Rust's InputPermission. `supported: false`
+ *  means this platform has no HID backend, so the arming affordance is inert. */
+export interface InputPermission {
+  granted: boolean;
+  supported: boolean;
+}
+
+/** Kind-tagged HID failure taxonomy — the serde serialization of Rust's
+ *  InputError (R007: every failure is typed, never a bare string). `disabled`
+ *  is the structural-inertness refusal (D038); `permission-denied` is the kind
+ *  the arming walkthrough keys on. */
+export type InputError =
+  | { kind: "disabled"; detail: string }
+  | { kind: "permission-denied"; detail: string }
+  | { kind: "unsupported"; platform: string; detail: string }
+  | { kind: "input-failed"; detail: string };
+
+/** The HID run mode (S04) — the kebab-case serde tags of Rust's HidRunMode.
+ *  `off` is structurally inert (D038); `ask` prompts inline before each not-yet-
+ *  whitelisted action kind; `auto-run` performs every action without prompting
+ *  (the "dangerously allows all input" mode). `off` is the safe default a
+ *  missing/garbage persisted value falls back to. */
+export type HidRunMode = "off" | "ask" | "auto-run";
+
+/** Queryable HID arming state `{ armed, mode, permission, error }` —
+ *  health-as-value beside `privacy_status` (R007), the serde camelCase
+ *  serialization of Rust's HidArmedStatus. `mode` is the three-way run mode the
+ *  Settings selector reads; `armed` is `mode !== "off"`, kept for the S03
+ *  boolean surface. `error` carries the most recent refused select (permission-
+ *  denied) or persist failure (input-failed), typed so the walkthrough matches
+ *  on `kind`. Null `error` means the last mutation succeeded. */
+export interface HidArmedStatus {
+  armed: boolean;
+  mode: HidRunMode;
+  permission: InputPermission;
+  error: InputError | null;
+}
+
+/** Current HID arming state (health-as-value, like `llm_health`). Safe to poll
+ *  while the walkthrough waits for the user to grant Accessibility. */
+export function hidArmedStatus(): Promise<HidArmedStatus> {
+  return invoke<HidArmedStatus>("hid_armed_status");
+}
+
+/** Arm or disarm HID. Never rejects backend-side — a refused arm (permission-
+ *  denied) or persist failure rides `error` on the returned authoritative
+ *  status, same contract as `set_privacy_mode`/`set_nudges_enabled`. */
+export function setHidArmed(arm: boolean): Promise<HidArmedStatus> {
+  return invoke<HidArmedStatus>("set_hid_armed", { arm });
+}
+
+/** Select the HID run mode (S04) — the three-way successor to `setHidArmed`.
+ *  Never rejects backend-side: a refused select (permission-denied → walkthrough)
+ *  or persist failure rides `error` on the returned authoritative status, same
+ *  contract as `setHidArmed`/`set_privacy_mode`. */
+export function setHidRunMode(mode: HidRunMode): Promise<HidArmedStatus> {
+  return invoke<HidArmedStatus>("set_hid_run_mode", { mode });
+}
+
+/** Deep-link to System Settings → Privacy & Security → Accessibility — the
+ *  arming walkthrough's "Open System Settings" action. Rejects with a typed
+ *  InputError (`unsupported` off macOS). */
+export function openInputSettings(): Promise<void> {
+  return invoke("open_input_settings");
+}
+
+/** Subscribe to the app-wide HID arm-state broadcast (`hid://state`). */
+export function onHidStateChanged(cb: (status: HidArmedStatus) => void): Promise<UnlistenFn> {
+  return listen<HidArmedStatus>(HID_STATE_EVENT, (e) => cb(e.payload));
+}
+
+// ---------------------------------------------------------------------------
+// HID per-action approval IPC (S04/M005) — contract defined in
+// src-tauri/src/llm/commands.rs (event + payload) and the pure resolver in
+// src-tauri/src/input/commands.rs
+// ---------------------------------------------------------------------------
+
+/** HID approval-request broadcast: the backend approval gate emits this when an
+ *  Ask-mode action whose kind is not yet whitelisted needs the user's decision,
+ *  and awaits a `respond_hid_approval` reply. Keep in sync with HID_APPROVAL_EVENT
+ *  in src-tauri/src/llm/commands.rs (pinned by a Rust test and its TS twin). */
+export const HID_APPROVAL_EVENT = "hid://approval-request";
+
+/** The kind of a HID action, stripped of payload — the granularity the session
+ *  whitelist grants by. The kebab-case serde tags of Rust's ActionKind. */
+export type ActionKind = "mouse-move" | "mouse-click" | "type-text" | "key-press";
+
+/** The `hid://approval-request` payload — the serde camelCase serialization of
+ *  Rust's ApprovalRequestPayload. Pixel-free: a correlation id, the action kind,
+ *  and a human summary the overlay shows; never a screenshot or coordinate. */
+export interface HidApprovalRequest {
+  approvalId: number;
+  kind: ActionKind;
+  summary: string;
+}
+
+/** The user's answer to an approval prompt — the kebab-case wire strings Rust's
+ *  ApprovalVerdict deserializes. "allow-once" performs this one action;
+ *  "allow-kind" also whitelists the kind for the session; "deny" refuses. */
+export type ApprovalVerdict = "allow-once" | "allow-kind" | "deny";
+
+/** Subscribe to the HID approval-request broadcast (`hid://approval-request`). */
+export function onHidApprovalRequest(
+  cb: (request: HidApprovalRequest) => void,
+): Promise<UnlistenFn> {
+  return listen<HidApprovalRequest>(HID_APPROVAL_EVENT, (e) => cb(e.payload));
+}
+
+/** Deliver the user's verdict for a pending HID approval. Resolves to whether a
+ *  live waiter received it (`false` if the gate already timed out) — safe to
+ *  fire-and-forget; the backend never rejects. */
+export function respondHidApproval(
+  approvalId: number,
+  verdict: ApprovalVerdict,
+): Promise<boolean> {
+  return invoke<boolean>("respond_hid_approval", { approvalId, verdict });
+}
+
+// ---------------------------------------------------------------------------
+// Chat run-state + Stop control IPC (S04 T04) — contract defined in
+// src-tauri/src/llm/commands.rs
+// ---------------------------------------------------------------------------
+
+/** Chat run-state broadcast: the backend emits the resulting RunPhase app-wide
+ *  on every transition (running on chat start, stopped when Stop cuts a run
+ *  short, idle on a natural finish/error), so the overlay's Stop control appears
+ *  exactly while a run is active. Keep in sync with RUN_STATE_EVENT in
+ *  src-tauri/src/llm/commands.rs (pinned by a Rust test and its TS twin). */
+export const RUN_STATE_EVENT = "llm://run-state";
+
+/** The coarse chat run-state — the kebab-case serde tags of Rust's RunPhase.
+ *  "running" shows the Stop control; "idle"/"stopped" hide it. */
+export type RunPhase = "idle" | "running" | "stopped";
+
+/** The `llm://run-state` / `run_state` payload — the serde camelCase
+ *  serialization of Rust's RunStatePayload. */
+export interface RunStatePayload {
+  phase: RunPhase;
+}
+
+/** Current chat run-state (health-as-value, like `llm_health`). The overlay
+ *  queries this at mount to render the Stop control truthfully before any
+ *  broadcast arrives. */
+export function runState(): Promise<RunStatePayload> {
+  return invoke<RunStatePayload>("run_state");
+}
+
+/** Stop the in-flight chat run: resolves to the resulting run-state. Never
+ *  rejects backend-side — a Stop with nothing in flight returns `idle`, so it
+ *  is safe to fire without racing the run's own completion. */
+export function stopChat(): Promise<RunStatePayload> {
+  return invoke<RunStatePayload>("stop_chat");
+}
+
+/** Subscribe to the app-wide chat run-state broadcast (`llm://run-state`). */
+export function onRunState(cb: (payload: RunStatePayload) => void): Promise<UnlistenFn> {
+  return listen<RunStatePayload>(RUN_STATE_EVENT, (e) => cb(e.payload));
+}
+
+// ---------------------------------------------------------------------------
 // Chat state machine (pure)
 // ---------------------------------------------------------------------------
 
@@ -406,6 +577,10 @@ export interface ChatState {
    *  "summoned"): grounds the next submit via a prepended system message,
    *  then clears — consume-once, like the screen attachment. */
   nudgePreload: NudgePayload | null;
+  /** Coarse chat run-state (S04 T04) behind the overlay Stop control: "running"
+   *  from submit until the backend's terminal run-state broadcast, then
+   *  "idle"/"stopped". Fed by submit and the `llm://run-state` broadcast. */
+  runPhase: RunPhase;
 }
 
 export const initialChatState: ChatState = {
@@ -423,6 +598,7 @@ export const initialChatState: ChatState = {
   privacy: null,
   nudge: null,
   nudgePreload: null,
+  runPhase: "idle",
 };
 
 export type LlmEvent =
@@ -446,6 +622,7 @@ export type ChatAction =
   | { type: "privacy"; status: PrivacyStatus }
   | { type: "nudge-shown"; payload: NudgePayload }
   | { type: "nudge-dismissed"; reason: NudgeDismissReason }
+  | { type: "run-state"; phase: RunPhase }
   | LlmEvent;
 
 function withLastAssistant(
@@ -568,6 +745,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         // composed history before dispatching) — consumed here so it can
         // never ride a later, unrelated question.
         nudgePreload: null,
+        // A submit starts a run: show the Stop control immediately, before the
+        // backend's `running` broadcast lands (which confirms the same state).
+        runPhase: "running",
       };
     }
     case "request-started": {
@@ -594,6 +774,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         buffered: [],
         messages: settleStreamingTail(state.messages),
         banner: { error: { kind: "ipc", detail: action.detail }, online: false },
+        // The chat invoke itself rejected — no backend run started, so no
+        // run-state broadcast will arrive to clear the Stop control; do it here.
+        runPhase: "idle",
       };
     case "token": {
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
@@ -708,7 +891,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         nudgePreload: action.reason === "summoned" ? state.nudge : state.nudgePreload,
       };
     }
+    case "run-state":
+      // The backend's broadcast is authoritative: "running" when a run is live,
+      // "idle"/"stopped" once it ends. Drives the Stop control's visibility.
+      return { ...state, runPhase: action.phase };
   }
+}
+
+/** Whether the overlay Stop control should render (S04 T04): only while a run is
+ *  active. A stopped or idle run hides it. Pure so the visibility is unit-tested
+ *  without a DOM. */
+export function showStopButton(state: ChatState): boolean {
+  return state.runPhase === "running";
 }
 
 // ---------------------------------------------------------------------------

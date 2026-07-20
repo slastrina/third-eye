@@ -279,6 +279,116 @@ pub fn save_cloud_optin(app: &AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Store key holding the HID arming toggle (M005 S03, D038). Absent means off
+/// — the default; there is no env fallback. Arming is the single gate that lets
+/// the model be offered the input tool and lets any input action touch the
+/// InputControl backend, so garbage in the store must fail safe to off (never
+/// silently arm a capability that can click and type anywhere, R019).
+pub const HID_ENABLED_KEY: &str = "hidEnabled";
+
+/// Read the persisted HID arming toggle. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller
+/// keeps the default (off, disarmed).
+pub fn load_hid_enabled(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(HID_ENABLED_KEY)?;
+    Some(stored_hid_enabled(&value))
+}
+
+/// Interpret one stored HID-arming value. Only a JSON boolean is trusted;
+/// anything else is logged and treated as off (disarmed) rather than silently
+/// arming a capability that can click and type anywhere on garbage data — off
+/// is the only safe fallback for the HID gate (D038, R019).
+fn stored_hid_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!("config: {HID_ENABLED_KEY} holds non-boolean value {other}; treating as off");
+            false
+        }
+    }
+}
+
+/// Persist the HID arming toggle. The error names the failed persist path; the
+/// caller (the HID applier) rolls the in-memory toggle back so an unpersisted
+/// arming state can never silently revert on restart (hotkey precedent).
+pub fn save_hid_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(HID_ENABLED_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {HID_ENABLED_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {HID_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Store key holding the HID run mode (M005 S04, D038) — the three-way
+/// successor to [`HID_ENABLED_KEY`]. Absent means `off` — the default and the
+/// structurally-inert state; there is no env fallback. The value is the
+/// kebab-case wire name of [`crate::input::commands::HidRunMode`]
+/// (`off`/`ask`/`auto-run`), so garbage in the store must fail safe to `off`
+/// (never silently arm a capability that can click and type anywhere, R019).
+pub const HID_RUN_MODE_KEY: &str = "hidRunMode";
+
+/// Read the persisted HID run mode. `None` means nothing usable is persisted
+/// (no store, no key — both logged where relevant): the caller keeps the default
+/// (`off`, disarmed).
+pub fn load_hid_run_mode(app: &AppHandle) -> Option<crate::input::commands::HidRunMode> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(HID_RUN_MODE_KEY)?;
+    Some(stored_hid_run_mode(&value))
+}
+
+/// Interpret one stored HID run-mode value. Only a recognized kebab-case mode
+/// tag (`off`/`ask`/`auto-run`) is trusted; anything else — an unknown string,
+/// a non-string, or null — is logged and treated as `off` (disarmed) rather than
+/// silently arming a capability that can click and type anywhere on garbage
+/// data. `off` is the only safe fallback for the HID gate (D038, R019).
+fn stored_hid_run_mode(value: &serde_json::Value) -> crate::input::commands::HidRunMode {
+    match serde_json::from_value::<crate::input::commands::HidRunMode>(value.clone()) {
+        Ok(mode) => mode,
+        Err(_) => {
+            log::warn!("config: {HID_RUN_MODE_KEY} holds unrecognized value {value}; treating as off");
+            crate::input::commands::HidRunMode::Off
+        }
+    }
+}
+
+/// Persist the HID run mode. The error names the failed persist path; the caller
+/// (the HID applier) rolls the in-memory mode back so an unpersisted choice can
+/// never silently revert on restart (hotkey precedent).
+pub fn save_hid_run_mode(
+    app: &AppHandle,
+    mode: crate::input::commands::HidRunMode,
+) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    let wire = serde_json::json!(mode);
+    store.set(HID_RUN_MODE_KEY, wire.clone());
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {HID_RUN_MODE_KEY}={wire} to {path}: {e}"))?;
+    log::info!("config: persisted {HID_RUN_MODE_KEY}={wire} to {path}");
+    Ok(())
+}
+
 /// Store key holding the heavy-lane cloud provider selection (M004 S04).
 /// Absent/null means no cloud provider is selected — the default. The value is
 /// the provider's kebab-case wire name ("openai" / "anthropic"), kept
@@ -508,6 +618,60 @@ mod tests {
         assert!(!stored_cloud_optin(&serde_json::json!(1)));
         assert!(!stored_cloud_optin(&serde_json::Value::Null));
         assert!(!stored_cloud_optin(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_hid_armed_booleans_round_trip() {
+        assert!(stored_hid_enabled(&serde_json::json!(true)));
+        assert!(!stored_hid_enabled(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_non_boolean_hid_armed_is_treated_as_off() {
+        // D038/R019: garbage in the store must never silently arm a capability
+        // that can click and type anywhere — off (disarmed) is the only safe
+        // fallback for the HID gate.
+        assert!(!stored_hid_enabled(&serde_json::json!("true")));
+        assert!(!stored_hid_enabled(&serde_json::json!(1)));
+        assert!(!stored_hid_enabled(&serde_json::Value::Null));
+        assert!(!stored_hid_enabled(&serde_json::json!({"enabled": true})));
+    }
+
+    #[test]
+    fn stored_hid_run_mode_round_trips_each_mode() {
+        // The persist round-trip proven at the interpreter level (the same level
+        // every other config test proves at): the wire tag save_hid_run_mode
+        // writes reads back to the same mode. Covers all three of Off/Ask/AutoRun.
+        use crate::input::commands::HidRunMode;
+        for mode in [HidRunMode::Off, HidRunMode::Ask, HidRunMode::AutoRun] {
+            let stored = serde_json::json!(mode);
+            assert_eq!(stored_hid_run_mode(&stored), mode, "wire form: {stored}");
+        }
+        // The exact kebab-case strings the store holds and src/chat.ts keys on.
+        assert_eq!(stored_hid_run_mode(&serde_json::json!("off")), HidRunMode::Off);
+        assert_eq!(stored_hid_run_mode(&serde_json::json!("ask")), HidRunMode::Ask);
+        assert_eq!(stored_hid_run_mode(&serde_json::json!("auto-run")), HidRunMode::AutoRun);
+    }
+
+    #[test]
+    fn stored_garbage_hid_run_mode_is_treated_as_off() {
+        // D038/R019: garbage in the store must never silently arm a capability
+        // that can click and type anywhere — off (disarmed) is the only safe
+        // fallback for the HID gate. Unknown tags, wrong case, non-strings, and
+        // null all collapse to Off.
+        use crate::input::commands::HidRunMode;
+        for bad in [
+            serde_json::json!("on"),
+            serde_json::json!("Ask"),
+            serde_json::json!("auto_run"),
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+            serde_json::json!({"mode": "ask"}),
+            serde_json::json!(["ask"]),
+        ] {
+            assert_eq!(stored_hid_run_mode(&bad), HidRunMode::Off, "bad value: {bad}");
+        }
     }
 
     #[test]

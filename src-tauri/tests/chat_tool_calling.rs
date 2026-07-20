@@ -31,10 +31,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use third_eye_lib::input::commands::{HidArmState, InputState};
+use third_eye_lib::input::fallback::FallbackInput;
 use third_eye_lib::llm::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use third_eye_lib::llm::toolloop::{
-    run_tool_loop, MemorySearchTool, ToolEvent, MEMORY_SEARCH_TOOL,
+    run_tool_loop, CompositeExecutor, InputTool, MemorySearchTool, ScreenQueryTool, ToolEvent,
+    INPUT_ACTION_TOOL, MEMORY_SEARCH_TOOL, SCREEN_QUERY_TOOL,
 };
+use third_eye_lib::screenquery::commands::ScreenQueryState;
 use third_eye_lib::llm::ChatMessage;
 use third_eye_lib::memory::{Embedder, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode};
 
@@ -361,6 +365,165 @@ async fn tools_unsupported_rejection_is_typed_through_the_loop() {
     assert!(capture.tokens.lock().unwrap().is_empty());
 }
 
+/// M005 S01/T05 CI proof: the CompositeExecutor advertises `memory_search`
+/// and `input_action` together and routes an `input_action` call — streamed
+/// by the scripted model exactly as LM Studio would — through the production
+/// `run_tool_loop` to the HID backend. FallbackInput is used so this is
+/// deterministic on every CI platform: the typed `unsupported` error rides
+/// back to the model as an `ok:false` result, proving the whole compose →
+/// dispatch → InputControl → typed-failure path without needing a granted Mac.
+#[tokio::test(flavor = "multi_thread")]
+async fn composite_routes_input_action_through_the_loop() {
+    // Round 0: the model calls input_action (a left mouse-click). id/name on
+    // the first delta, arguments fragmented across two — the LM Studio shape.
+    let round0 = scripted::sse_200(&[
+        scripted::sse_tool_delta(0, Some("call_hid_1"), Some(INPUT_ACTION_TOOL), None),
+        scripted::sse_tool_delta(0, None, None, Some(r#"{"action":"mouse-"#)),
+        scripted::sse_tool_delta(0, None, None, Some(r#"click","button":"left"}"#)),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    // Round 1: having read the (typed-unsupported) tool result, the model
+    // streams a text answer instead of retrying.
+    let round1 = scripted::sse_200(&[
+        scripted::sse_token("I could not drive the mouse on this machine."),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let (endpoint, captured) = scripted::spawn(vec![round0, round1]).await;
+
+    let scratch = ScratchDb::new("toolloop-composite");
+    let store = seeded_store(&scratch);
+    let embedder = Arc::new(OpenAiEmbedder::new(refused_endpoint().await));
+    // The exact production mount shape: memory_search + input_action, dispatched
+    // by name. FallbackInput compiles and returns typed unsupported everywhere.
+    let executor = CompositeExecutor::new(vec![
+        Box::new(MemorySearchTool::new(store, embedder)),
+        Box::new(InputTool::new(Arc::new(FallbackInput), Arc::new(HidArmState::new(true)))),
+    ]);
+
+    let client = OpenAiClient::new(&endpoint);
+    let capture = Capture::new();
+    let outcome = run_tool_loop(
+        &client,
+        &executor,
+        vec![ChatMessage::user("click the button for me")],
+        99,
+        &|t| capture.tokens.lock().unwrap().push_str(t),
+        &|e| capture.events.lock().unwrap().push(e.clone()),
+    )
+    .await
+    .expect("scripted conversation must resolve");
+
+    assert_eq!(outcome.text, "I could not drive the mouse on this machine.");
+
+    // Tool phases: one Call for input_action, one ok:false result carrying the
+    // typed `unsupported` failure — the UI/model-visible failure surface (R007).
+    let events = capture.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 2, "one call + one result: {events:?}");
+    let ToolEvent::Call(call) = &events[0] else { panic!("first event must be Call") };
+    assert_eq!(call.call.name, INPUT_ACTION_TOOL);
+    assert_eq!(
+        call.call.arguments, r#"{"action":"mouse-click","button":"left"}"#,
+        "split argument deltas must reassemble byte-for-byte"
+    );
+    let ToolEvent::Result(result) = &events[1] else { panic!("second event must be Result") };
+    assert!(!result.ok, "FallbackInput must fail typed, not silently succeed");
+    assert_eq!(result.name, INPUT_ACTION_TOOL);
+    assert_eq!(result.failure.as_deref(), Some("unsupported"));
+
+    // Request 0 advertises BOTH tools — the model can reach memory and HID in
+    // the same conversation.
+    let req0 = scripted::body_json(&captured, 0);
+    let tool_names: Vec<&str> = req0["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tool_names, vec!["memory_search", "input_action"]);
+
+    // Request 1: the typed failure rode back to the model as the tool-role turn.
+    let req1 = scripted::body_json(&captured, 1);
+    let messages = req1["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "user + assistant echo + tool result");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_hid_1");
+    let tool_content = messages[2]["content"].as_str().unwrap();
+    assert!(
+        tool_content.contains("unsupported") || tool_content.contains("only implemented on macOS"),
+        "the typed input error must ride to the model: {tool_content}"
+    );
+}
+
+/// The HID demo live (M005 S01): a scripted model emits an `input_action`
+/// mouse-move; the CompositeExecutor drives it through the *real* platform
+/// backend (`MacosInput` on a granted Mac) into the foreground application.
+/// `#[ignore]` because it synthesizes real input and needs Accessibility
+/// permission — run at slice UAT:
+///
+/// ```sh
+/// cargo test --manifest-path src-tauri/Cargo.toml --test chat_tool_calling \
+///   -- --ignored --nocapture live_input_tool_drives_real_backend
+/// ```
+///
+/// Without permission the only acceptable outcome is the typed
+/// `permission-denied` failure — never a panic or a hang.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "synthesizes real input; needs Accessibility permission (slice UAT)"]
+async fn live_input_tool_drives_real_backend() {
+    // Scripted model: one input_action mouse-move, then a text acknowledgement.
+    let round0 = scripted::sse_200(&[
+        scripted::sse_tool_delta(0, Some("call_hid_live"), Some(INPUT_ACTION_TOOL), None),
+        scripted::sse_tool_delta(0, None, None, Some(r#"{"action":"mouse-move","x":200,"y":200}"#)),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let round1 = scripted::sse_200(&[
+        scripted::sse_token("Moved the cursor."),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let (endpoint, _captured) = scripted::spawn(vec![round0, round1]).await;
+
+    // The real platform backend behind the same managed-state seam production
+    // mounts (MacosInput on macOS, FallbackInput elsewhere).
+    let executor: CompositeExecutor = CompositeExecutor::new(vec![Box::new(InputTool::new(
+        InputState::with_platform_backend().backend(),
+        Arc::new(HidArmState::new(true)),
+    ))]);
+
+    let client = OpenAiClient::new(&endpoint);
+    let capture = Capture::new();
+    run_tool_loop(
+        &client,
+        &executor,
+        vec![ChatMessage::user("move the mouse to 200,200")],
+        1,
+        &|t| capture.tokens.lock().unwrap().push_str(t),
+        &|e| capture.events.lock().unwrap().push(e.clone()),
+    )
+    .await
+    .expect("scripted HID conversation must resolve");
+
+    let events = capture.events.lock().unwrap().clone();
+    let ToolEvent::Result(result) = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e, ToolEvent::Result(_)))
+        .expect("an input_action result must be emitted")
+    else {
+        unreachable!()
+    };
+    eprintln!("live HID result: ok={} failure={:?}", result.ok, result.failure);
+    if !result.ok {
+        // On an ungranted machine the only allowed failure is the typed
+        // permission-denied the walkthrough keys on.
+        assert_eq!(
+            result.failure.as_deref(),
+            Some("permission-denied"),
+            "ungranted HID must fail typed permission-denied, got {:?}",
+            result.failure
+        );
+    }
+}
+
 /// The roadmap demo live: seed a real store with embedded memories, ask the
 /// real model about earlier work, and require that it answers by actually
 /// calling memory_search and citing the stored content.
@@ -453,4 +616,99 @@ async fn live_tool_calling_against_lm_studio() {
         "answer must cite the seeded debugging memory: {}",
         outcome.text
     );
+}
+
+/// The S02 slice demo live: a scripted model calls `screen_query`, then aims an
+/// `input_action` mouse-move at coordinates on screen — the whole
+/// query-then-aim path through the *real* platform backends
+/// (`MacosScreenQuery` + `MacosInput` on a granted Mac), driven by the
+/// production `run_tool_loop` over the exact composite mount. `#[ignore]`
+/// because it captures the real screen and synthesizes real input — needs both
+/// Screen Recording and Accessibility permission. Run at slice UAT:
+///
+/// ```sh
+/// cargo test --manifest-path src-tauri/Cargo.toml --test chat_tool_calling \
+///   -- --ignored --nocapture live_screen_query_then_aim
+/// ```
+///
+/// Without permission the only acceptable failures are the typed
+/// `permission-denied` (Screen Recording for the query, Accessibility for the
+/// move) — never a panic or a hang. The test completing at all is the proof
+/// that the real query-then-aim path neither deadlocks nor aborts.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "captures the screen and synthesizes input; needs Screen Recording + Accessibility (slice UAT)"]
+async fn live_screen_query_then_aim() {
+    // Round 0: the model queries the screen. Round 1: it aims an input_action
+    // mouse-move at a point (fixed here — the scripted server cannot read the
+    // live query result, so the demo exercises the real backends, not model
+    // targeting). Round 2: a text acknowledgement ends the loop.
+    let round0 = scripted::sse_200(&[
+        scripted::sse_tool_delta(0, Some("call_sq_live"), Some(SCREEN_QUERY_TOOL), None),
+        scripted::sse_tool_delta(0, None, None, Some("{}")),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let round1 = scripted::sse_200(&[
+        scripted::sse_tool_delta(0, Some("call_aim_live"), Some(INPUT_ACTION_TOOL), None),
+        scripted::sse_tool_delta(0, None, None, Some(r#"{"action":"mouse-move","x":200,"y":200}"#)),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let round2 = scripted::sse_200(&[
+        scripted::sse_token("Queried the screen and moved the cursor."),
+        "data: [DONE]\n\n".to_string(),
+    ]);
+    let (endpoint, _captured) = scripted::spawn(vec![round0, round1, round2]).await;
+
+    // The exact production composite over the real platform backends behind the
+    // same managed-state seams production mounts.
+    let executor = CompositeExecutor::new(vec![
+        Box::new(ScreenQueryTool::new(ScreenQueryState::with_platform_backend().backend())),
+        Box::new(InputTool::new(
+            InputState::with_platform_backend().backend(),
+            Arc::new(HidArmState::new(true)),
+        )),
+    ]);
+
+    let client = OpenAiClient::new(&endpoint);
+    let capture = Capture::new();
+    let outcome = run_tool_loop(
+        &client,
+        &executor,
+        vec![ChatMessage::user("look at the screen, then move the mouse to a target")],
+        1,
+        &|t| capture.tokens.lock().unwrap().push_str(t),
+        &|e| capture.events.lock().unwrap().push(e.clone()),
+    )
+    .await
+    .expect("scripted query-then-aim conversation must resolve");
+
+    // The loop terminated with a text answer — no deadlock, no abort.
+    assert_eq!(outcome.text, "Queried the screen and moved the cursor.");
+
+    // Every executed tool either succeeded or failed with the typed
+    // permission-denied kind. Nothing else is acceptable on an ungranted
+    // machine, and a panic/hang would have aborted the test before here.
+    let events = capture.events.lock().unwrap().clone();
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ToolEvent::Result(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "one result per tool call (screen_query, input_action)");
+    for result in results {
+        eprintln!(
+            "live query-then-aim: {} ok={} failure={:?}",
+            result.name, result.ok, result.failure
+        );
+        if !result.ok {
+            assert_eq!(
+                result.failure.as_deref(),
+                Some("permission-denied"),
+                "{} must fail typed permission-denied when ungranted, got {:?}",
+                result.name,
+                result.failure,
+            );
+        }
+    }
 }

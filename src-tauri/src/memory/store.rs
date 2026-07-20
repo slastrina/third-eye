@@ -236,6 +236,21 @@ impl MemoryStore {
         Ok(n as usize)
     }
 
+    /// Structural introspection of the `memories` table: `(column name,
+    /// declared type)` in definition order, via `PRAGMA table_info`. Exposed so
+    /// the R011/R023 persistence proof (an integration test, no access to the
+    /// private connection) can pin that the store has no coordinate column and
+    /// only ever declares INTEGER/TEXT types — the same invariant the in-crate
+    /// `schema_is_text_and_metadata_only` unit test asserts.
+    pub fn column_info(&self) -> Result<Vec<(String, String)>, MemoryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        let cols = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(cols)
+    }
+
     /// FTS5 bm25 keyword search: best (lowest bm25) first. User text is
     /// never spliced into the MATCH grammar — each whitespace token is
     /// double-quoted (inner quotes escaped) so operators like `AND`, `-` or

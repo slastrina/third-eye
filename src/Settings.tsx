@@ -16,13 +16,19 @@ import { useEffect, useReducer, useState } from "react";
 import {
   bannerDetail,
   bannerTitle,
+  hidArmedStatus,
   modelInfo,
   nudgeStatus,
+  onHidStateChanged,
   onModelInfoBroadcast,
   onNudgeState,
   onPrivacyChanged,
+  openInputSettings,
   privacyStatus,
+  setHidRunMode,
   setNudgesEnabled,
+  type HidRunMode,
+  type InputError,
   type NudgeStatus,
 } from "./chat";
 import {
@@ -72,6 +78,8 @@ import {
 } from "./privacy-state";
 import {
   autostartStatus,
+  HID_RUN_MODE_OPTIONS,
+  hidModeShowsAutoRunWarning,
   hideSettingsWindow,
   hotkeyStatus,
   initialSettingsState,
@@ -100,6 +108,22 @@ import {
 
 /** Sentinel select value for "no pin" — a real model id is never empty. */
 const DEFAULT_OPTION = "";
+
+/** Human title for a refused HID arm / persist failure (R007 — every failure
+ *  is typed and visible, never a silent no-op). `permission-denied` drives the
+ *  walkthrough rather than this banner, so it is rendered separately. */
+function hidErrorTitle(error: InputError): string {
+  switch (error.kind) {
+    case "permission-denied":
+      return "Accessibility permission needed";
+    case "disabled":
+      return "Input Control is disarmed";
+    case "unsupported":
+      return "Input Control isn't supported here";
+    case "input-failed":
+      return "Input Control couldn't be saved";
+  }
+}
 
 function Settings() {
   const [state, dispatch] = useReducer(settingsReducer, initialSettingsState);
@@ -142,6 +166,12 @@ function Settings() {
     privacyStatus().then(
       (status) => dispatch({ type: "privacy", status }),
       (err) => console.debug("settings: privacy_status unavailable:", err),
+    );
+    // Health-as-value: safe to poll, never rejects backend-side. The MEM115
+    // fallback if the hid://state subscription can't attach.
+    hidArmedStatus().then(
+      (status) => dispatch({ type: "hid", status }),
+      (err) => console.debug("settings: hid_armed_status unavailable:", err),
     );
     hotkeyStatus().then(
       (status) => dispatch({ type: "hotkey", status }),
@@ -189,6 +219,10 @@ function Settings() {
     const unlistens = [
       onModelInfoBroadcast((info) => dispatch({ type: "model-info", info })),
       onPrivacyChanged((status) => dispatch({ type: "privacy", status })),
+      // HID arming truth flows one way, backend → UI: an arm/disarm from any
+      // surface (this window or a future tray path) broadcasts the resulting
+      // HidArmedStatus as hid://state.
+      onHidStateChanged((status) => dispatch({ type: "hid", status })),
       // Watcher truth flows one way, backend → UI: a tray toggle, a privacy
       // pause, and a tick error all arrive as watcher://state; extracted
       // snippets ride watcher://observation.
@@ -249,6 +283,23 @@ function Settings() {
       // Never rejects backend-side; a persist failure rides status.error.
       (status) => dispatch({ type: "privacy", status }),
       (err) => console.debug("settings: set_privacy_mode unavailable:", err),
+    );
+  };
+
+  const selectHidMode = (mode: HidRunMode) => {
+    setHidRunMode(mode).then(
+      // Never rejects backend-side; a refused select (permission-denied) or
+      // persist failure rides status.error, and a rolled-back mode comes back
+      // as the authoritative snapshot (R007 — always a visible outcome).
+      (status) => dispatch({ type: "hid", status }),
+      (err) => console.debug("settings: set_hid_run_mode unavailable:", err),
+    );
+  };
+
+  const openAccessibilitySettings = () => {
+    console.debug("hid: opening Accessibility settings from walkthrough");
+    openInputSettings().catch((err) =>
+      console.debug("settings: open_input_settings unavailable:", err),
     );
   };
 
@@ -530,6 +581,92 @@ function Settings() {
               </>
             )}
           </div>
+        </section>
+
+        <section className="settings-section" aria-labelledby="settings-hid-heading">
+          <h2 id="settings-hid-heading" className="settings-section-title">
+            Input Control
+          </h2>
+          <label className="settings-row">
+            <span className="settings-row-label">Input Control (HID)</span>
+            <select
+              className="settings-select"
+              aria-label="Input Control mode"
+              data-hid-mode={state.hid?.mode ?? "off"}
+              // Inert when state hasn't loaded (outside the app) or the
+              // platform has no HID backend (FallbackInput, supported=false).
+              disabled={state.hid === null || !state.hid.permission.supported}
+              value={state.hid?.mode ?? "off"}
+              onChange={(event) => selectHidMode(event.target.value as HidRunMode)}
+            >
+              {HID_RUN_MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="settings-hint">
+            Off by default. When armed, Third Eye can move the pointer, click,
+            and type on your behalf. Ask prompts before each action; Auto-run
+            performs them without asking. Needs macOS Accessibility permission;
+            switching to Off reverts to fully inert.
+          </p>
+          {state.hid && hidModeShowsAutoRunWarning(state.hid.mode) && (
+            // Auto-run performs every HID action without a prompt — the most
+            // dangerous posture, so it is called out explicitly (R007).
+            <div className="settings-warning" role="alert" data-hid-autorun-warning>
+              <strong>Auto-run dangerously allows all input</strong>
+              <span>
+                Third Eye will click and type on your behalf with no prompt for
+                each action. Only use this for a task you are actively watching.
+              </span>
+            </div>
+          )}
+          {state.hid === null && (
+            <p className="settings-unavailable">
+              Input Control state is unavailable outside the app.
+            </p>
+          )}
+          {state.hid && !state.hid.permission.supported && (
+            <p className="settings-unavailable">
+              Input Control isn't supported on this platform.
+            </p>
+          )}
+          {state.hid &&
+            state.hid.permission.supported &&
+            !state.hid.permission.granted && (
+              // R007: guidance, never silence. Shown whenever Accessibility is
+              // ungranted — arming is refused until the user grants it.
+              <div className="capture-walkthrough" role="alert">
+                <strong>Accessibility permission needed</strong>
+                <ol className="capture-walkthrough-steps">
+                  <li>
+                    Open System Settings below — it lands on Privacy &amp;
+                    Security → Accessibility.
+                  </li>
+                  <li>Turn on Third Eye in the list (macOS may ask to relaunch the app).</li>
+                  <li>Come back and switch Input Control on.</li>
+                </ol>
+                <div className="capture-walkthrough-actions">
+                  <button
+                    type="button"
+                    className="chat-retry"
+                    onClick={openAccessibilitySettings}
+                  >
+                    Open System Settings
+                  </button>
+                </div>
+              </div>
+            )}
+          {state.hid?.error && state.hid.error.kind !== "permission-denied" && (
+            // permission-denied is rendered as the walkthrough above; any other
+            // typed failure (persist, unsupported) surfaces as a banner.
+            <div className="settings-error" role="alert">
+              <strong>{hidErrorTitle(state.hid.error)}</strong>
+              <span>{state.hid.error.detail}</span>
+            </div>
+          )}
         </section>
 
         <section className="settings-section" aria-labelledby="settings-watcher-heading">

@@ -23,7 +23,7 @@ use objc2_foundation::{NSArray, NSDictionary};
 use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
 };
-use screencapturekit::screenshot_manager::CGImage as ScCGImage;
+use screencapturekit::screenshot_manager::{CGImage as ScCGImage, CGImageExt};
 
 use super::{OcrEngine, OcrError};
 use crate::capture::macos::capture_display_image_blocking;
@@ -123,6 +123,107 @@ fn recognize_text(image: &objc2_core_graphics::CGImage) -> Result<Vec<String>, O
         }
     }
     Ok(lines)
+}
+
+/// One recognized on-screen text run with its bounding box already
+/// converted from Vision's normalized, lower-left-origin space to absolute
+/// top-left screen pixels — the shape the screen_query tool hands the model
+/// so it can aim an input_action click. Coordinates are transient: they are
+/// produced per query and never persisted (R011).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextElement {
+    pub text: String,
+    /// Left edge in top-left-origin screen pixels.
+    pub x: i32,
+    /// Top edge in top-left-origin screen pixels.
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Run accurate-level Vision text recognition and return each observation's
+/// best candidate *with* its bounding box, converted to top-left-origin
+/// screen pixels. `cw`/`ch` are the source image's pixel width/height — the
+/// normalization basis. Vision boxes are normalized 0..1 with the origin at
+/// the image's LOWER-left corner; we scale by the pixel dimensions and flip
+/// Y so callers get the same top-left screen space the input backend uses.
+///
+/// Mirrors [`recognize_text`] but keeps geometry; the text-only path stays
+/// the R011 proof (no coordinate ever crosses [`OcrEngine::extract`]).
+fn recognize_text_with_bounds(
+    image: &objc2_core_graphics::CGImage,
+    cw: u32,
+    ch: u32,
+) -> Result<Vec<TextElement>, OcrError> {
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+
+    // Safety: `image` is a valid CGImage borrow for the whole call and the
+    // empty options dictionary matches the expected generic shape.
+    let handler = unsafe {
+        VNImageRequestHandler::initWithCGImage_options(
+            VNImageRequestHandler::alloc(),
+            image,
+            &NSDictionary::<_, AnyObject>::new(),
+        )
+    };
+
+    let base: Retained<VNRequest> = Retained::into_super(Retained::into_super(request.clone()));
+    handler
+        .performRequests_error(&NSArray::from_retained_slice(&[base]))
+        .map_err(|e| OcrError::RecognitionFailed {
+            detail: format!("Vision performRequests failed: {}", e.localizedDescription()),
+        })?;
+
+    let cwf = cw as f64;
+    let chf = ch as f64;
+    let mut elements = Vec::new();
+    if let Some(observations) = request.results() {
+        for observation in observations.iter() {
+            if let Some(best) = observation.topCandidates(1).iter().next() {
+                let text = best.string().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                // Safety: `boundingBox` is inherited from
+                // VNDetectedObjectObservation; normalized 0..1, lower-left
+                // origin (objc2-vision VNObservation.rs).
+                let bbox: objc2_core_foundation::CGRect = unsafe { observation.boundingBox() };
+                let x = (bbox.origin.x * cwf).round() as i32;
+                let width = (bbox.size.width * cwf).round() as i32;
+                let height = (bbox.size.height * chf).round() as i32;
+                // Flip Y: Vision's origin.y is the box's bottom in lower-left
+                // space; the top edge in top-left space is
+                // (1 - origin.y - height) scaled to pixels.
+                let y = ((1.0 - bbox.origin.y - bbox.size.height) * chf).round() as i32;
+                elements.push(TextElement { text, x, y, width, height });
+            }
+        }
+    }
+    Ok(elements)
+}
+
+/// The coordinate-bearing sibling of [`extract_blocking`]: capture the
+/// primary display, recognize its text with bounding boxes, and return the
+/// elements. The source image's own pixel `width()`/`height()` are the
+/// normalization basis (NOT `max_dimension`, which only caps the capture) so
+/// the flipped boxes land in real screen pixels. The `CGImage` is a local
+/// that dies at the end of this function — only the elements escape (R011).
+pub fn extract_elements_blocking(max_dimension: u32) -> Result<Vec<TextElement>, OcrError> {
+    let start = Instant::now();
+    let image = capture_display_image_blocking(max_dimension)?;
+    let (cw, ch) = (image.width() as u32, image.height() as u32);
+    let result = recognize_text_with_bounds(as_vision_cgimage(&image), cw, ch);
+    match &result {
+        Ok(elements) => log::debug!(
+            "screen_query: {} element(s) in {} ms",
+            elements.len(),
+            start.elapsed().as_millis()
+        ),
+        Err(err) => log::error!("screen_query: {} ({err})", err.kind()),
+    }
+    result
 }
 
 #[cfg(test)]
@@ -228,6 +329,35 @@ mod tests {
         let image = render_text_image("", 400, 200, 64.0);
         let lines = recognize_text(&image).expect("blank image still recognizes cleanly");
         assert!(lines.is_empty(), "expected no text, got {lines:?}");
+    }
+
+    /// The non-ignored bounding-box proof (slice must-have 1): accurate-level
+    /// recognition on a synthetic in-memory image returns the word WITH a
+    /// pixel box, and the lower-left→top-left flip lands inside the image.
+    #[test]
+    fn recognize_text_with_bounds_returns_flipped_pixel_box() {
+        let (w, h) = (900usize, 200usize);
+        let image = render_text_image("TARGET", w, h, 64.0);
+        let elements = recognize_text_with_bounds(&image, w as u32, h as u32)
+            .expect("recognition succeeds on in-memory image");
+        assert!(!elements.is_empty(), "no elements recognized");
+        let joined = elements
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        assert!(joined.contains("TARGET"), "missing TARGET in {elements:?}");
+        // Every box must be a positive-area region inside the source image,
+        // with a flipped-Y top edge in [0, height).
+        for el in &elements {
+            assert!(el.x > 0, "x not positive: {el:?}");
+            assert!(el.width > 0, "width not positive: {el:?}");
+            assert!(el.height > 0, "height not positive: {el:?}");
+            assert!(el.x + el.width <= w as i32, "box exceeds width: {el:?}");
+            assert!(el.y >= 0 && el.y < h as i32, "flipped y out of [0,h): {el:?}");
+            assert!(el.y + el.height <= h as i32, "box exceeds height: {el:?}");
+        }
     }
 
     /// Live run of the full trait pipeline against the real screen (MEM038

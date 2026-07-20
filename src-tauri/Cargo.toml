@@ -98,6 +98,13 @@ objc2-vision = "0.3"
 # Frontmost-app name for TextObservation.appContext (S01 watcher):
 # NSWorkspace/NSRunningApplication — two message sends, no AX spelunking.
 objc2-app-kit = "0.3"
+# HID event synthesis (input/macos.rs): enigo wraps CGEvent for mouse/keyboard
+# without hand-rolling per-platform FFI. macOS-ONLY (R020) — on Linux it pulls
+# X11/libxdo and on Windows win32; declaring it here keeps the cross-target
+# checks compiling FallbackInput with zero new system deps. enigo holds a
+# !Send CGEventSource (enigo#96), so MacosInput never stores an Enigo — it is
+# constructed fresh per action inside spawn_blocking.
+enigo = "0.6"
 
 # CoreText renders the synthetic in-memory image the NON-ignored Vision test
 # recognizes — Vision on an in-memory CGImage needs no TCC permission.

@@ -13,6 +13,7 @@ import {
   initialChatState,
   nudgeContextMessage,
   nextProbeDelay,
+  showStopButton,
   startHealthProbe,
   stripFailedTail,
   toCaptureFlowError,
@@ -21,11 +22,19 @@ import {
   MEMORY_SEARCH_TOOL,
   MODEL_INFO_EVENT,
   PRIVACY_EVENT,
+  RUN_STATE_EVENT,
+  HID_STATE_EVENT,
+  HID_APPROVAL_EVENT,
   TOOL_CALL_EVENT,
   TOOL_RESULT_EVENT,
+  type ActionKind,
+  type ApprovalVerdict,
+  type HidApprovalRequest,
   type CaptureError,
   type CapturedFrame,
   type ChatState,
+  type HidArmedStatus,
+  type InputError,
   type LlmError,
   type LlmHealth,
   type ToolCallPayload,
@@ -492,6 +501,110 @@ describe("chatReducer privacy mode (S07)", () => {
   });
 });
 
+describe("HID arming IPC contract (S03/M005)", () => {
+  it("keeps the broadcast event name in sync with the Rust contract", () => {
+    // src-tauri/src/input/commands.rs pins HID_STATE_EVENT to this same string.
+    expect(HID_STATE_EVENT).toBe("hid://state");
+  });
+
+  it("HidArmedStatus carries armed, the permission snapshot, and null error on success", () => {
+    // The serde camelCase shape apply_hid_armed broadcasts and hid_armed_status
+    // returns — armed off by default, a granted+supported permission, no error.
+    const status: HidArmedStatus = {
+      armed: false,
+      mode: "off",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    expect(status.armed).toBe(false);
+    expect(status.mode).toBe("off");
+    expect(status.permission).toEqual({ granted: true, supported: true });
+    expect(status.error).toBeNull();
+  });
+
+  it("a refused arm rides a typed permission-denied error the walkthrough keys on", () => {
+    // D038: an ungranted arm never claims armed; the error is typed, never a
+    // silent no-op (R007), and the Settings walkthrough matches on `kind`.
+    const denied: InputError = {
+      kind: "permission-denied",
+      detail: "Accessibility not granted; enable Third Eye in System Settings",
+    };
+    const status: HidArmedStatus = {
+      armed: false,
+      mode: "off",
+      permission: { granted: false, supported: true },
+      error: denied,
+    };
+    expect(status.armed).toBe(false);
+    expect(status.error?.kind).toBe("permission-denied");
+  });
+
+  it("carries the three-way run mode the Settings selector reads (S04/T05)", () => {
+    // The serde camelCase shape apply_hid_run_mode broadcasts on hid://state:
+    // an active mode reports armed=true; Off is the inert default.
+    const ask: HidArmedStatus = {
+      armed: true,
+      mode: "ask",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    expect(ask.mode).toBe("ask");
+    expect(ask.armed).toBe(true);
+    const autoRun: HidArmedStatus = {
+      armed: true,
+      mode: "auto-run",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    expect(autoRun.mode).toBe("auto-run");
+  });
+
+  it("a persist failure rides a typed input-failed error, never silence", () => {
+    const persistFailed: InputError = {
+      kind: "input-failed",
+      detail: "failed to persist hidEnabled to settings.json",
+    };
+    const status: HidArmedStatus = {
+      armed: false,
+      mode: "off",
+      permission: { granted: true, supported: true },
+      error: persistFailed,
+    };
+    expect(status.error?.kind).toBe("input-failed");
+    if (status.error?.kind === "input-failed") {
+      expect(status.error.detail).toContain("settings.json");
+    }
+  });
+});
+
+describe("HID approval IPC contract (S04/M005)", () => {
+  it("keeps the approval-request event name in sync with the Rust contract", () => {
+    // src-tauri/src/llm/commands.rs pins HID_APPROVAL_EVENT to this same string.
+    expect(HID_APPROVAL_EVENT).toBe("hid://approval-request");
+  });
+
+  it("ApprovalRequestPayload carries the correlation id, kind, and human summary", () => {
+    // The serde camelCase shape the gate emits and the overlay reads.
+    const request: HidApprovalRequest = {
+      approvalId: 3,
+      kind: "mouse-click",
+      summary: "Click the left mouse button",
+    };
+    expect(request.approvalId).toBe(3);
+    expect(request.kind).toBe("mouse-click");
+    expect(request.summary).toContain("Click");
+  });
+
+  it("the verdict and kind wire strings match the Rust kebab-case serde tags", () => {
+    // respond_hid_approval deserializes these exact ApprovalVerdict strings, and
+    // ActionKind mirrors InputAction's `action` tag.
+    const verdicts: ApprovalVerdict[] = ["allow-once", "allow-kind", "deny"];
+    expect(verdicts).toEqual(["allow-once", "allow-kind", "deny"]);
+    const kinds: ActionKind[] = ["mouse-move", "mouse-click", "type-text", "key-press"];
+    expect(kinds).toHaveLength(4);
+  });
+});
+
 describe("chatReducer tool events (S03)", () => {
   const toolCall = (requestId: number, name = MEMORY_SEARCH_TOOL): ToolCallPayload => ({
     requestId,
@@ -779,5 +892,54 @@ describe("nudge context preload composition", () => {
     expect(bare.content).not.toContain("Relevant stored memories");
     expect(bare.content).not.toContain("frontmost app");
     expect(bare.content).toContain(nudge.screenText);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Run-state + Stop control (S04 T04)
+// ---------------------------------------------------------------------------
+
+describe("chat run-state and the Stop control", () => {
+  it("pins the run-state event string as the IPC contract", () => {
+    // The Rust const test asserts the same string on the backend side.
+    expect(RUN_STATE_EVENT).toBe("llm://run-state");
+  });
+
+  it("hides the Stop control while idle", () => {
+    expect(showStopButton(initialChatState)).toBe(false);
+  });
+
+  it("shows the Stop control the moment a question is submitted", () => {
+    // Submit flips runPhase to "running" before the backend broadcast lands, so
+    // the control appears immediately.
+    const submitted = chatReducer(initialChatState, { type: "submit", question: "do a task" });
+    expect(submitted.runPhase).toBe("running");
+    expect(showStopButton(submitted)).toBe(true);
+  });
+
+  it("keeps the Stop control up while the run streams, then clears it on the idle broadcast", () => {
+    const running = started("do a task", 1);
+    expect(showStopButton(running)).toBe(true);
+
+    // A natural finish: the backend broadcasts idle.
+    const idle = chatReducer(running, { type: "run-state", phase: "idle" });
+    expect(idle.runPhase).toBe("idle");
+    expect(showStopButton(idle)).toBe(false);
+  });
+
+  it("clears the Stop control when a run is stopped", () => {
+    const running = started("do a task", 1);
+    const stopped = chatReducer(running, { type: "run-state", phase: "stopped" });
+    expect(stopped.runPhase).toBe("stopped");
+    expect(showStopButton(stopped)).toBe(false);
+  });
+
+  it("clears the Stop control when the chat invoke itself fails (no backend run)", () => {
+    // request-failed means no backend task started, so no run-state broadcast
+    // will arrive — the reducer must clear runPhase itself.
+    const submitted = chatReducer(initialChatState, { type: "submit", question: "do a task" });
+    const failed = chatReducer(submitted, { type: "request-failed", detail: "ipc down" });
+    expect(failed.runPhase).toBe("idle");
+    expect(showStopButton(failed)).toBe(false);
   });
 });

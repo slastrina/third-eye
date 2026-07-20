@@ -5,8 +5,10 @@
 // no Tauri runtime or DOM is needed.
 
 import { describe, expect, it } from "vitest";
-import type { ModelInfo, PrivacyStatus } from "./chat";
+import type { HidArmedStatus, ModelInfo, PrivacyStatus } from "./chat";
 import {
+  HID_RUN_MODE_OPTIONS,
+  hidModeShowsAutoRunWarning,
   initialSettingsState,
   laneOptions,
   modelsErrorDetail,
@@ -104,6 +106,71 @@ describe("settingsReducer privacy and status", () => {
     });
     s = settingsReducer(s, { type: "privacy", status: { enabled: false, error: null } });
     expect(s.privacy?.enabled).toBe(false);
+  });
+
+  it("stores the HID arming status without touching model state", () => {
+    const armed: HidArmedStatus = {
+      armed: true,
+      mode: "ask",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    let s: SettingsState = settingsReducer(initialSettingsState, {
+      type: "model-info",
+      info: routing,
+    });
+    s = settingsReducer(s, { type: "hid", status: armed });
+    expect(s.hid).toEqual(armed);
+    expect(s.modelInfo).toEqual(routing);
+  });
+
+  it("a later HID broadcast is authoritative — a disarm from any surface overwrites", () => {
+    const armed: HidArmedStatus = {
+      armed: true,
+      mode: "ask",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    let s = settingsReducer(initialSettingsState, { type: "hid", status: armed });
+    s = settingsReducer(s, {
+      type: "hid",
+      status: { armed: false, mode: "off", permission: { granted: true, supported: true }, error: null },
+    });
+    expect(s.hid?.armed).toBe(false);
+    expect(s.hid?.mode).toBe("off");
+  });
+
+  it("a refused arm rides a typed permission-denied error the walkthrough keys on", () => {
+    // D038: an ungranted arm stays disarmed and surfaces a typed error (R007).
+    const refused: HidArmedStatus = {
+      armed: false,
+      mode: "off",
+      permission: { granted: false, supported: true },
+      error: { kind: "permission-denied", detail: "Accessibility not granted" },
+    };
+    const s = settingsReducer(initialSettingsState, { type: "hid", status: refused });
+    expect(s.hid?.armed).toBe(false);
+    expect(s.hid?.error?.kind).toBe("permission-denied");
+  });
+
+  it("renders the persisted run mode and warns only on Auto-run (S04/T05)", () => {
+    // The selector reflects the mode carried on the authoritative hid://state
+    // snapshot; the "dangerously allows all input" warning shows only for
+    // auto-run, never for off/ask.
+    const autoRun: HidArmedStatus = {
+      armed: true,
+      mode: "auto-run",
+      permission: { granted: true, supported: true },
+      error: null,
+    };
+    const s = settingsReducer(initialSettingsState, { type: "hid", status: autoRun });
+    expect(s.hid?.mode).toBe("auto-run");
+    expect(hidModeShowsAutoRunWarning("auto-run")).toBe(true);
+    expect(hidModeShowsAutoRunWarning("ask")).toBe(false);
+    expect(hidModeShowsAutoRunWarning("off")).toBe(false);
+
+    // The selector offers exactly the three modes, Off first as the default.
+    expect(HID_RUN_MODE_OPTIONS.map((o) => o.value)).toEqual(["off", "ask", "auto-run"]);
   });
 
   it("stores hotkey and autostart health without touching model state", () => {

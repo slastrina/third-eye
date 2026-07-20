@@ -15,20 +15,27 @@
 //! name the endpoint and typed error kind; debug logs cover request start,
 //! cancellation, token count, and done.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::oneshot;
+
+use crate::input::commands::SessionWhitelist;
+use crate::input::ActionKind;
 
 use super::guard::{GuardState, GuardTelemetry};
 use super::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
 use super::toolloop::{
-    run_tool_loop, MemorySearchTool, ToolEvent, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
+    run_tool_loop_with_stop, ApprovalGate, ApprovalPrompt, ApprovalVerdict, CompositeExecutor,
+    InputTool, MemorySearchTool, ScreenQueryTool, ToolEvent, ToolExecutor, TOOL_CALL_EVENT,
+    TOOL_RESULT_EVENT,
 };
-use super::{ChatMessage, ChatRequest, LlmClient, LlmError, LlmHealth};
+use super::{ChatMessage, LlmClient, LlmError, LlmHealth};
 
 /// Event names — the string half of the IPC contract with `src/chat.ts`.
 pub const TOKEN_EVENT: &str = "llm://token";
@@ -45,6 +52,169 @@ pub const MODEL_INFO_EVENT: &str = "llm://model-info";
 /// snapshot app-wide, so the Settings guard surface stays truthful without
 /// polling. The string half of the contract with `src/privacy-state.ts`.
 pub const PRIVACY_STATE_EVENT: &str = "privacy://state";
+/// HID approval-request broadcast (S04 T03): when the approval gate hits an
+/// `Ask`-mode action whose kind is not yet whitelisted, it emits this event
+/// carrying the pending action's summary and awaits the overlay's verdict via
+/// the `respond_hid_approval` IPC. The string half of the contract with
+/// `src/chat.ts` (pinned by a Rust test and its TS twin).
+pub const HID_APPROVAL_EVENT: &str = "hid://approval-request";
+/// Chat run-state broadcast (S04 T04): every transition of the in-flight run —
+/// `running` when a chat starts, `stopped` when the user's Stop cuts it short,
+/// `idle` on a natural finish or error — emits this app-wide so the overlay's
+/// Stop control appears exactly while a run is active and clears when it ends.
+/// The string half of the contract with `src/chat.ts` (pinned by a Rust test
+/// and its TS twin).
+pub const RUN_STATE_EVENT: &str = "llm://run-state";
+
+/// The chat loop's coarse run-state (S04 T04). `Running` while a chat task drives
+/// its tool rounds; `Stopped` when the user hit Stop; `Idle` otherwise. Serialized
+/// kebab-case so `src/chat.ts` shares the exact wire strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunPhase {
+    Idle,
+    Running,
+    Stopped,
+}
+
+/// The `llm://run-state` / `run_state` payload — the current [`RunPhase`]. A
+/// struct (not the bare enum) so the surface can grow without a breaking IPC
+/// change, and camelCase to match every other event payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStatePayload {
+    pub phase: RunPhase,
+}
+
+/// How long the gate waits for the overlay's approval verdict before failing
+/// closed. A slow (or absent) user is a [`ApprovalVerdict::Deny`], never a hung
+/// tool loop (R006): a HID action is refused unless the user actively allows it.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `hid://approval-request` payload — the pending action the overlay must
+/// approve or deny. `approvalId` correlates the emitted request with the
+/// `respond_hid_approval` reply; `summary` is the human sentence the overlay
+/// shows. Pixel-free by construction: a kind tag and a summary string, never a
+/// screenshot or persisted coordinate (R011/R023).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequestPayload {
+    pub approval_id: u64,
+    pub kind: ActionKind,
+    pub summary: String,
+}
+
+/// App-shared HID approval state (S04 T03): the session-scoped by-kind whitelist
+/// the gate consults and the pending-verdict registry the `respond_hid_approval`
+/// command delivers into. Managed once, cloned into every chat run's gate — so
+/// an "Always allow this kind" grant made in one run survives to the next within
+/// the app session, and clears on app exit (this state dropping) so no grant
+/// outlives the session (R023).
+pub struct ApprovalState {
+    whitelist: Arc<Mutex<SessionWhitelist>>,
+    /// Correlation-id → the waiting gate's verdict sender. An entry lives only
+    /// between the request emit and the reply/timeout, then is removed.
+    pending: Mutex<HashMap<u64, oneshot::Sender<ApprovalVerdict>>>,
+    next_id: AtomicU64,
+}
+
+impl Default for ApprovalState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApprovalState {
+    pub fn new() -> Self {
+        Self {
+            whitelist: Arc::new(Mutex::new(SessionWhitelist::new())),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// The shared session whitelist handle the gate mutates on "Always allow".
+    pub fn whitelist(&self) -> Arc<Mutex<SessionWhitelist>> {
+        self.whitelist.clone()
+    }
+
+    /// Allocate a correlation id and register a one-shot channel the overlay's
+    /// reply will be delivered into.
+    fn register(&self) -> (u64, oneshot::Receiver<ApprovalVerdict>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Drop a pending waiter without a verdict — the timeout / emit-failure path.
+    fn cancel(&self, id: u64) {
+        self.pending.lock().unwrap().remove(&id);
+    }
+
+    /// Deliver a verdict to the gate waiting on `id`. Returns whether a live
+    /// waiter existed — a stale id (already timed out / replied) is a no-op the
+    /// command logs, never a panic.
+    fn respond(&self, id: u64, verdict: ApprovalVerdict) -> bool {
+        match self.pending.lock().unwrap().remove(&id) {
+            Some(tx) => tx.send(verdict).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// The production [`ApprovalPrompt`]: emits `hid://approval-request` to the
+/// overlay and awaits the `respond_hid_approval` reply through the shared
+/// [`ApprovalState`] registry, with a bounded [`APPROVAL_TIMEOUT`]. Every
+/// non-verdict outcome — a failed emit (no overlay), a closed channel, or a
+/// timeout — resolves to [`ApprovalVerdict::Deny`] so a HID action is never
+/// performed without an explicit allow (fail-closed, R006/R016 posture).
+struct OverlayApprovalPrompt {
+    app: AppHandle,
+    state: Arc<ApprovalState>,
+    request_id: u64,
+}
+
+impl OverlayApprovalPrompt {
+    fn new(app: AppHandle, state: Arc<ApprovalState>, request_id: u64) -> Self {
+        Self { app, state, request_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalPrompt for OverlayApprovalPrompt {
+    async fn request(&self, kind: ActionKind, summary: String) -> ApprovalVerdict {
+        let (approval_id, rx) = self.state.register();
+        log::info!(
+            "llm: HID approval requested id={approval_id} kind={kind:?} (request={})",
+            self.request_id
+        );
+        let payload = ApprovalRequestPayload { approval_id, kind, summary };
+        if let Err(e) = self.app.emit(HID_APPROVAL_EVENT, payload) {
+            log::warn!("llm: HID approval-request emit failed id={approval_id}: {e}; denying");
+            self.state.cancel(approval_id);
+            return ApprovalVerdict::Deny;
+        }
+        match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(verdict)) => {
+                log::info!("llm: HID approval id={approval_id} verdict={verdict:?}");
+                verdict
+            }
+            Ok(Err(_closed)) => {
+                log::warn!("llm: HID approval id={approval_id} channel closed; denying");
+                ApprovalVerdict::Deny
+            }
+            Err(_elapsed) => {
+                self.state.cancel(approval_id);
+                log::warn!(
+                    "llm: HID approval id={approval_id} timed out after {}s; denying",
+                    APPROVAL_TIMEOUT.as_secs()
+                );
+                ApprovalVerdict::Deny
+            }
+        }
+    }
+}
 
 /// One content delta. Fired per token in arrival order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -85,6 +255,11 @@ struct ActiveRequest {
     /// `None` between `begin` and `arm` — the window where the task is being
     /// spawned and there is nothing to abort yet.
     aborter: Option<Aborter>,
+    /// Cooperative Stop flag (S04 T04): the `stop_chat` command flips this and
+    /// the tool loop observes it between rounds/actions, terminating with a
+    /// typed `stopped` outcome rather than a hard-abort that would emit nothing.
+    /// Shared into the spawned task's `should_stop` closure.
+    stop: Arc<AtomicBool>,
 }
 
 /// Managed chat state: the routing seam plus single-flight request tracking.
@@ -98,12 +273,23 @@ pub struct LlmState {
     probe: OpenAiClient,
     next_request_id: AtomicU64,
     active: Mutex<Option<ActiveRequest>>,
+    /// Coarse chat run-state (S04 T04): the health-as-value the `run_state`
+    /// command reads and the `llm://run-state` broadcast carries. Mutated only
+    /// through [`Self::mark_running`] / [`Self::request_stop`] /
+    /// [`Self::finish_with_phase`] so every transition is one auditable seam.
+    run_phase: Mutex<RunPhase>,
 }
 
 impl LlmState {
     pub fn new(router: Arc<ModelRouter>) -> Self {
         let probe = OpenAiClient::new(router.endpoint());
-        Self { router, probe, next_request_id: AtomicU64::new(1), active: Mutex::new(None) }
+        Self {
+            router,
+            probe,
+            next_request_id: AtomicU64::new(1),
+            active: Mutex::new(None),
+            run_phase: Mutex::new(RunPhase::Idle),
+        }
     }
 
     /// State backed by the configured LM Studio endpoint with the canonical
@@ -214,8 +400,72 @@ impl LlmState {
             }
             log::debug!("llm: request {} cancelled (superseded by request {})", prev.id, id);
         }
-        *active = Some(ActiveRequest { id, aborter: None });
+        *active = Some(ActiveRequest { id, aborter: None, stop: Arc::new(AtomicBool::new(false)) });
         id
+    }
+
+    /// The cooperative Stop flag of the active request, when it is `id` — the
+    /// chat task clones this into its `should_stop` closure (S04 T04). A
+    /// superseded or absent id yields a fresh never-set flag (a dead handle:
+    /// that run is already gone), so the closure is always safe to build.
+    fn stop_flag(&self, id: u64) -> Arc<AtomicBool> {
+        let active = self.active.lock().unwrap();
+        match active.as_ref() {
+            Some(req) if req.id == id => req.stop.clone(),
+            _ => Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Current coarse run-state (health-as-value) — the `run_state` command and
+    /// the terminal broadcast read this.
+    fn run_phase(&self) -> RunPhase {
+        *self.run_phase.lock().unwrap()
+    }
+
+    /// Mark the just-begun run Running (its request owns the slot). Returns the
+    /// phase so the `chat` command broadcasts it.
+    fn mark_running(&self) -> RunPhase {
+        *self.run_phase.lock().unwrap() = RunPhase::Running;
+        RunPhase::Running
+    }
+
+    /// Signal the in-flight run to stop cooperatively (S04 T04): flips the active
+    /// request's Stop flag — the tool loop observes it at the next round/action
+    /// boundary and terminates with a typed stopped outcome (not a hard-abort
+    /// that would emit nothing) — and moves the phase to Stopped. A stop with
+    /// nothing in flight is a no-op returning the current phase; never an error.
+    fn request_stop(&self) -> RunPhase {
+        let active = self.active.lock().unwrap();
+        match active.as_ref() {
+            Some(req) => {
+                req.stop.store(true, Ordering::SeqCst);
+                let id = req.id;
+                drop(active);
+                *self.run_phase.lock().unwrap() = RunPhase::Stopped;
+                log::info!("llm: stop requested for in-flight request {id}");
+                RunPhase::Stopped
+            }
+            None => {
+                drop(active);
+                self.run_phase()
+            }
+        }
+    }
+
+    /// Clear the active slot at a terminal state and record the resulting run
+    /// phase — but only if `id` still owns the slot. A superseded request
+    /// returns `None` (its successor is already Running; a stale terminal must
+    /// not clobber that), so the caller broadcasts only a real transition.
+    fn finish_with_phase(&self, id: u64, phase: RunPhase) -> Option<RunPhase> {
+        let mut active = self.active.lock().unwrap();
+        if active.as_ref().map(|r| r.id) == Some(id) {
+            *active = None;
+            drop(active);
+            *self.run_phase.lock().unwrap() = phase;
+            Some(phase)
+        } else {
+            None
+        }
     }
 
     /// Attach the abort handle once the stream task exists. A no-op if the
@@ -229,15 +479,6 @@ impl LlmState {
         }
     }
 
-    /// Clear the active slot when a stream reaches a terminal state. Only the
-    /// request that owns the slot may clear it — a finished request that was
-    /// already superseded must not cancel its successor's tracking.
-    fn finish(&self, id: u64) {
-        let mut active = self.active.lock().unwrap();
-        if active.as_ref().map(|r| r.id) == Some(id) {
-            *active = None;
-        }
-    }
 }
 
 /// Start a streaming chat completion. Returns the request id immediately;
@@ -256,6 +497,12 @@ pub async fn chat(
         client.endpoint(),
         messages.len()
     );
+
+    // Run-state: this request now owns the slot, so the run is Running. Broadcast
+    // it before the task spawns so the overlay's Stop control appears immediately
+    // (S04 T04). The cooperative Stop flag is cloned into the loop's should_stop.
+    let stop = state.stop_flag(id);
+    broadcast_run_state(&app, state.mark_running());
 
     let task_app = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
@@ -298,39 +545,98 @@ pub async fn chat(
             }
         };
 
-        // memory_search is available exactly when the S02 store opened this
-        // run; without it the request runs tools-free (the pre-S03 path) and
-        // the absence is logged, not silent.
+        // The model reaches HID input and screen_query unconditionally
+        // (S01/S02, M005) and memory_search exactly when the S02 store opened
+        // this run — the CompositeExecutor advertises whichever tools exist and
+        // dispatches by name (D037). memory_search's absence is logged, not
+        // silent; the input and screen-query tools are always mounted, so there
+        // is no tools-free path. screen_query's coordinates flow only to the
+        // model (to aim an input_action) and never reach the store (R011/R023).
         let memory = task_app.state::<crate::memory::MemoryState>();
-        let result = match memory.store() {
+        let input_state = task_app.state::<crate::input::commands::InputState>();
+        let screen_state = task_app.state::<crate::screenquery::commands::ScreenQueryState>();
+        let mut executors: Vec<Box<dyn ToolExecutor>> = Vec::new();
+        match memory.store() {
             Some(store) => {
-                let tool = MemorySearchTool::new(store, memory.embedder(client.endpoint()));
-                run_tool_loop(client.as_ref(), &tool, messages, id, &on_token, &on_event).await
+                executors.push(Box::new(MemorySearchTool::new(
+                    store,
+                    memory.embedder(client.endpoint()),
+                )));
             }
             None => {
-                log::info!(
-                    "llm: request {id} runs without tools (memory store unavailable)"
-                );
-                client.stream_chat(&ChatRequest::new(messages), &on_token).await
+                log::info!("llm: request {id} runs without memory_search (store unavailable)");
             }
-        };
+        }
+        // The InputTool draws BOTH its backend and its armed-state handle from
+        // the managed InputState (D038/S03): the composite advertises
+        // input_action only while HID is armed, and a disarmed action reaching
+        // execute() is refused before the backend is touched — one shared holder,
+        // no separate mount. In S04 it is wrapped by the ApprovalGate so every
+        // HID action is gated through the per-action approval resolver before it
+        // reaches the backend.
+        //
+        // Run mode (S04/T05): the gate snapshots the persisted three-way run mode
+        // the user picked in Settings (Off/Ask/Auto-run), applied AX-gated into
+        // the shared InputState — Off stays inert (D038), Ask prompts inline per
+        // not-yet-whitelisted kind, Auto-run performs without prompting.
+        let approval = task_app.state::<Arc<ApprovalState>>();
+        let mode = input_state.mode();
+        let approver = Arc::new(OverlayApprovalPrompt::new(
+            task_app.clone(),
+            approval.inner().clone(),
+            id,
+        ));
+        executors.push(Box::new(ApprovalGate::new(
+            InputTool::new(input_state.backend(), input_state.arm_state()),
+            mode,
+            approval.whitelist(),
+            approver,
+        )));
+        executors.push(Box::new(ScreenQueryTool::new(screen_state.backend())));
+        let executor = CompositeExecutor::new(executors);
+        // The loop observes the cooperative Stop flag between rounds/actions and
+        // terminates with a typed stopped outcome (S04 T04).
+        let should_stop = move || stop.load(Ordering::SeqCst);
+        let result = run_tool_loop_with_stop(
+            client.as_ref(),
+            &executor,
+            messages,
+            id,
+            &on_token,
+            &on_event,
+            &should_stop,
+        )
+        .await;
         let total_ms = started.elapsed().as_millis() as u64;
 
+        // A user-stopped run ends Stopped; a natural finish or error ends Idle.
+        // The terminal phase is broadcast below only if this request still owns
+        // the slot (a superseded task must not clobber its successor's Running).
+        let terminal_phase =
+            if matches!(&result, Ok(outcome) if outcome.stopped) { RunPhase::Stopped } else { RunPhase::Idle };
+
         match result {
-            Ok(outcome) => {
+            Ok(loop_outcome) => {
+                let outcome = loop_outcome.outcome;
                 let first_token_ms = first_token_at
                     .lock()
                     .unwrap()
                     .map(|t| t.duration_since(started).as_millis() as u64);
                 log::info!(
-                    "llm stream total: {total_ms} ms, {} tokens (request={id})",
-                    outcome.token_count
+                    "llm stream total: {total_ms} ms, {} tokens stopped={} (request={id})",
+                    outcome.token_count,
+                    loop_outcome.stopped
                 );
                 log::debug!(
-                    "llm: request {id} done tokens={} chars={}",
+                    "llm: request {id} done tokens={} chars={} stopped={}",
                     outcome.token_count,
-                    outcome.text.chars().count()
+                    outcome.text.chars().count(),
+                    loop_outcome.stopped
                 );
+                // A stopped run still emits DONE with whatever text streamed, so
+                // the assistant message settles visibly (never silent, R006); the
+                // Stopped run-state broadcast below is what tells the UI it was cut
+                // short.
                 let payload = DoneEvent {
                     request_id: id,
                     text: outcome.text,
@@ -355,7 +661,9 @@ pub async fn chat(
             }
         }
 
-        task_app.state::<LlmState>().finish(id);
+        if let Some(phase) = task_app.state::<LlmState>().finish_with_phase(id, terminal_phase) {
+            broadcast_run_state(&task_app, phase);
+        }
     });
 
     state.arm(id, Box::new(move || handle.abort()));
@@ -447,6 +755,36 @@ fn broadcast_model_info(app: &AppHandle, info: &ModelInfo) {
     }
 }
 
+/// Emit the chat run-state to every window (S04 T04): the overlay's Stop control
+/// keys on this. Emission failure is logged, not fatal — the state stays
+/// queryable via `run_state`, same posture as the model-info/privacy broadcasts.
+fn broadcast_run_state(app: &AppHandle, phase: RunPhase) {
+    if let Err(e) = app.emit(RUN_STATE_EVENT, RunStatePayload { phase }) {
+        log::warn!("llm: run-state broadcast failed: {e}");
+    }
+}
+
+/// Stop the in-flight chat run (S04 T04): flips the cooperative Stop flag so the
+/// tool loop terminates at the next round/action boundary with a typed stopped
+/// outcome, and broadcasts the resulting run-state. Health-as-value: never
+/// rejects — a Stop with nothing in flight returns the current phase (`idle`),
+/// so the overlay can fire it without racing the run's own completion.
+#[tauri::command]
+pub fn stop_chat(app: AppHandle, state: State<'_, LlmState>) -> RunStatePayload {
+    let phase = state.request_stop();
+    broadcast_run_state(&app, phase);
+    log::debug!("llm: stop_chat -> {phase:?}");
+    RunStatePayload { phase }
+}
+
+/// Current chat run-state (health-as-value, like `llm_health`): `idle` /
+/// `running` / `stopped`. Never rejects — the overlay queries it at mount to
+/// render the Stop control truthfully before any broadcast arrives.
+#[tauri::command]
+pub fn run_state(state: State<'_, LlmState>) -> RunStatePayload {
+    RunStatePayload { phase: state.run_phase() }
+}
+
 /// Queryable routing state (health-as-value, like `llm_health`): the active
 /// lane, the shared endpoint, and every configured lane with its model id.
 #[tauri::command]
@@ -467,6 +805,28 @@ pub fn guard_status(state: State<'_, Arc<GuardState>>) -> GuardTelemetry {
         snapshot.last_block_reason
     );
     snapshot
+}
+
+/// Deliver the overlay's verdict for a pending HID approval (S04 T03). The gate
+/// is blocked awaiting this reply (or its timeout); a verdict resolves it. Never
+/// rejects — an unknown or already-expired `approvalId` (the gate timed out
+/// first, or a double reply) is a logged no-op returning `false`, so the overlay
+/// can fire-and-forget without racing the timeout into an error.
+#[tauri::command]
+pub fn respond_hid_approval(
+    state: State<'_, Arc<ApprovalState>>,
+    approval_id: u64,
+    verdict: ApprovalVerdict,
+) -> bool {
+    let delivered = state.respond(approval_id, verdict);
+    if delivered {
+        log::debug!("llm: HID approval reply id={approval_id} verdict={verdict:?} delivered");
+    } else {
+        log::warn!(
+            "llm: HID approval reply id={approval_id} verdict={verdict:?} for unknown/expired request (no-op)"
+        );
+    }
+    delivered
 }
 
 /// Install the `privacy://state` emitter on the shared [`GuardState`]
@@ -508,6 +868,7 @@ pub fn env_endpoint(value: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::router::{Lane, HEAVY_LANE, THIN_LANE};
+    use super::super::ChatRequest;
     use super::*;
     use std::sync::atomic::AtomicBool;
 
@@ -584,7 +945,7 @@ mod tests {
         let aborted = Arc::new(AtomicBool::new(false));
         let id = s.begin();
         s.arm(id, flag_aborter(&aborted));
-        s.finish(id);
+        s.finish_with_phase(id, RunPhase::Idle);
 
         s.begin();
         assert!(!aborted.load(Ordering::SeqCst), "finished request must not be aborted");
@@ -599,7 +960,7 @@ mod tests {
         s.arm(new, flag_aborter(&aborted));
 
         // The superseded task reaches its terminal state late: must be a no-op.
-        s.finish(old);
+        s.finish_with_phase(old, RunPhase::Idle);
         s.begin();
         assert!(aborted.load(Ordering::SeqCst), "successor tracking was lost to a stale finish");
     }
@@ -612,7 +973,7 @@ mod tests {
         let new = s.begin();
         s.arm(old, flag_aborter(&stale)); // stale arm: request already superseded
 
-        s.finish(new);
+        s.finish_with_phase(new, RunPhase::Idle);
         s.begin();
         assert!(!stale.load(Ordering::SeqCst), "stale aborter must never be installed");
     }
@@ -625,6 +986,141 @@ mod tests {
         assert_eq!(DONE_EVENT, "llm://done");
         assert_eq!(ERROR_EVENT, "llm://error");
         assert_eq!(MODEL_INFO_EVENT, "llm://model-info");
+    }
+
+    #[test]
+    fn run_state_event_name_and_wire_strings_are_the_ipc_contract() {
+        // src/chat.ts pins the same event string and phase strings — the const
+        // pair is the contract lock (S04 T04).
+        assert_eq!(RUN_STATE_EVENT, "llm://run-state");
+        assert_eq!(serde_json::to_value(RunPhase::Idle).unwrap(), "idle");
+        assert_eq!(serde_json::to_value(RunPhase::Running).unwrap(), "running");
+        assert_eq!(serde_json::to_value(RunPhase::Stopped).unwrap(), "stopped");
+        let v = serde_json::to_value(RunStatePayload { phase: RunPhase::Running }).unwrap();
+        assert_eq!(v["phase"], "running");
+    }
+
+    #[test]
+    fn run_phase_begins_idle_and_marks_running_on_begin() {
+        let s = state();
+        assert_eq!(s.run_phase(), RunPhase::Idle, "a fresh state is idle");
+        s.begin();
+        assert_eq!(s.mark_running(), RunPhase::Running);
+        assert_eq!(s.run_phase(), RunPhase::Running);
+    }
+
+    #[test]
+    fn request_stop_flips_the_flag_and_moves_to_stopped() {
+        let s = state();
+        let id = s.begin();
+        s.mark_running();
+        let flag = s.stop_flag(id);
+        assert!(!flag.load(Ordering::SeqCst), "the flag starts unset");
+
+        assert_eq!(s.request_stop(), RunPhase::Stopped);
+        assert!(flag.load(Ordering::SeqCst), "stop must flip the loop's cooperative flag");
+        assert_eq!(s.run_phase(), RunPhase::Stopped);
+    }
+
+    #[test]
+    fn request_stop_with_nothing_in_flight_is_an_idle_no_op() {
+        let s = state();
+        // Never began a request: stop is a health-as-value no-op returning idle.
+        assert_eq!(s.request_stop(), RunPhase::Idle);
+        assert_eq!(s.run_phase(), RunPhase::Idle);
+    }
+
+    #[test]
+    fn finish_with_phase_only_the_owner_transitions_the_run_state() {
+        let s = state();
+        let old = s.begin();
+        s.mark_running();
+        // A newer request supersedes `old` and owns the slot.
+        s.begin();
+        // The superseded task reaching its terminal state must not clobber the
+        // successor's Running phase.
+        assert_eq!(s.finish_with_phase(old, RunPhase::Idle), None);
+        assert_eq!(s.run_phase(), RunPhase::Running, "a stale finish left the phase alone");
+    }
+
+    #[test]
+    fn stop_flag_for_a_superseded_id_is_a_dead_handle() {
+        let s = state();
+        let old = s.begin();
+        s.begin(); // supersede
+        // The old id no longer owns the slot: it gets a fresh never-set flag, so
+        // a late should_stop closure over it can never falsely stop the new run.
+        assert!(!s.stop_flag(old).load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn hid_approval_event_name_is_the_ipc_contract() {
+        // src/chat.ts pins the same string on the TS side — the two const tests
+        // are the contract-lock pair (S04 T03).
+        assert_eq!(HID_APPROVAL_EVENT, "hid://approval-request");
+    }
+
+    #[test]
+    fn approval_request_payload_serializes_camel_case() {
+        // The overlay reads approvalId + kind + summary; a change here is a
+        // breaking IPC change the frontend must match.
+        let v = serde_json::to_value(ApprovalRequestPayload {
+            approval_id: 3,
+            kind: ActionKind::MouseClick,
+            summary: "Click the left mouse button".into(),
+        })
+        .unwrap();
+        assert_eq!(v["approvalId"], 3);
+        assert_eq!(v["kind"], "mouse-click");
+        assert_eq!(v["summary"], "Click the left mouse button");
+    }
+
+    #[test]
+    fn approval_verdict_deserializes_the_kebab_case_wire_strings() {
+        // The exact strings src/chat.ts sends over respond_hid_approval.
+        assert_eq!(
+            serde_json::from_str::<ApprovalVerdict>("\"allow-once\"").unwrap(),
+            ApprovalVerdict::AllowOnce
+        );
+        assert_eq!(
+            serde_json::from_str::<ApprovalVerdict>("\"allow-kind\"").unwrap(),
+            ApprovalVerdict::AllowKind
+        );
+        assert_eq!(
+            serde_json::from_str::<ApprovalVerdict>("\"deny\"").unwrap(),
+            ApprovalVerdict::Deny
+        );
+        // A garbage verdict is rejected, not silently coerced.
+        assert!(serde_json::from_str::<ApprovalVerdict>("\"allow-everything\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_state_delivers_the_verdict_to_the_waiting_gate() {
+        let s = Arc::new(ApprovalState::new());
+        let (id, rx) = s.register();
+        assert!(s.respond(id, ApprovalVerdict::AllowKind), "a live waiter must accept the verdict");
+        assert_eq!(rx.await.unwrap(), ApprovalVerdict::AllowKind);
+    }
+
+    #[test]
+    fn approval_state_respond_to_unknown_or_expired_id_is_a_false_no_op() {
+        let s = ApprovalState::new();
+        // Never registered.
+        assert!(!s.respond(999, ApprovalVerdict::Deny));
+        // Registered then cancelled (the timeout path): a late reply is a no-op.
+        let (id, _rx) = s.register();
+        s.cancel(id);
+        assert!(!s.respond(id, ApprovalVerdict::AllowOnce), "a cancelled waiter must not accept");
+    }
+
+    #[test]
+    fn approval_state_whitelist_handle_is_shared() {
+        // The gate mutates the whitelist through the same Arc the state holds, so
+        // an "Always allow" grant is visible on the next run's gate.
+        let s = ApprovalState::new();
+        let wl = s.whitelist();
+        wl.lock().unwrap().allow(ActionKind::TypeText);
+        assert!(s.whitelist().lock().unwrap().contains(ActionKind::TypeText));
     }
 
     #[test]

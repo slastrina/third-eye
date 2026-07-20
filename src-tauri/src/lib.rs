@@ -9,6 +9,7 @@ pub mod cloud;
 pub mod config;
 #[cfg(desktop)]
 pub mod hotkey;
+pub mod input;
 pub mod llm;
 #[cfg(desktop)]
 pub mod memory;
@@ -16,6 +17,7 @@ pub mod memory;
 pub mod nudge;
 pub mod ocr;
 pub mod overlay;
+pub mod screenquery;
 pub mod privacy;
 pub mod settings_window;
 #[cfg(desktop)]
@@ -94,6 +96,21 @@ pub fn run() {
         .manage(guard.clone())
         .manage(llm::commands::LlmState::with_default_endpoint(guard))
         .manage(capture::commands::CaptureState::with_platform_backend())
+        // HID input (M005/S01): the managed InputControl backend the composite
+        // executor's InputTool draws from — enigo-backed on macOS, typed
+        // unsupported elsewhere. Advertised unconditionally in S01; the
+        // off-by-default arming gate lands in S03.
+        .manage(input::commands::InputState::with_platform_backend())
+        // HID approval gate (M005/S04): the session-scoped by-kind whitelist and
+        // the pending-verdict registry the ApprovalGate consults and the
+        // respond_hid_approval command delivers into. Managed once, cloned into
+        // every chat run's gate.
+        .manage(std::sync::Arc::new(llm::commands::ApprovalState::new()))
+        // Screen query (M005/S02): the managed ScreenQuery backend the composite
+        // executor's ScreenQueryTool draws from — Vision-backed on macOS, typed
+        // unsupported elsewhere. Advertised unconditionally alongside input_action;
+        // returns transient on-screen coordinates that never reach the store (R011).
+        .manage(screenquery::commands::ScreenQueryState::with_platform_backend())
         // Privacy mode (S07): one shared toggle core serving the tray check
         // item and the set_privacy_mode IPC; persisted state applied in
         // setup() before the tray builds.
@@ -113,11 +130,18 @@ pub fn run() {
             llm::commands::list_models,
             llm::commands::model_info,
             llm::commands::guard_status,
+            llm::commands::respond_hid_approval,
+            llm::commands::stop_chat,
+            llm::commands::run_state,
             capture::commands::capture_screen,
             capture::commands::capture_permission_status,
             capture::commands::open_capture_settings,
             capture::commands::set_privacy_mode,
             capture::commands::privacy_status,
+            input::commands::set_hid_armed,
+            input::commands::set_hid_run_mode,
+            input::commands::hid_armed_status,
+            input::commands::open_input_settings,
             watcher::commands::set_watcher_enabled,
             watcher::commands::watcher_status,
             memory::commands::memory_search,
@@ -166,6 +190,14 @@ pub fn run() {
             // reflect it across restarts.
             #[cfg(desktop)]
             capture::commands::apply_persisted_privacy_mode(app.handle());
+
+            // Persisted HID arming (M005 S03, D038): applied after privacy so
+            // the arming choice survives restart. The AX gate re-checks the
+            // live Accessibility grant inside the applier — a revoked grant
+            // comes up disarmed, so the persisted choice can never re-arm HID
+            // without a real permission.
+            #[cfg(desktop)]
+            input::commands::apply_persisted_hid_armed(app.handle());
 
             // Persisted watcher toggle (S01) follows the same contract:
             // applied after privacy (the loop's gating input), before the

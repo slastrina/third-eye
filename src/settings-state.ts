@@ -12,7 +12,7 @@
 // Settings.tsx and hijack the `./Settings` import — .ts wins resolution.)
 
 import { invoke } from "@tauri-apps/api/core";
-import type { LlmError, ModelInfo, PrivacyStatus } from "./chat";
+import type { HidArmedStatus, HidRunMode, LlmError, ModelInfo, PrivacyStatus } from "./chat";
 
 /** Global-hotkey health `{ shortcut, registered, error }` — the serde
  *  camelCase serialization of Rust's HotkeyStatus (read-only here). */
@@ -101,6 +101,12 @@ export interface SettingsState {
   /** Privacy toggle state; `error` carries a persist failure. Null until
    *  the mount-time query resolves (toggle renders unavailable). */
   privacy: PrivacyStatus | null;
+  /** HID arming snapshot behind the arming toggle; `error` carries a refused
+   *  arm (permission-denied → walkthrough) or persist failure. Null until the
+   *  mount-time `hid_armed_status` query resolves (selector renders unavailable
+   *  outside a Tauri runtime). Fed by that query, `set_hid_run_mode` responses,
+   *  and the `hid://state` broadcast — the backend status is authoritative. */
+  hid: HidArmedStatus | null;
   hotkey: HotkeyStatus | null;
   autostart: AutostartStatus | null;
 }
@@ -112,6 +118,7 @@ export const initialSettingsState: SettingsState = {
   modelsError: null,
   laneError: null,
   privacy: null,
+  hid: null,
   hotkey: null,
   autostart: null,
 };
@@ -123,6 +130,7 @@ export type SettingsAction =
   | { type: "model-info"; info: ModelInfo }
   | { type: "lane-error"; lane: string; detail: string }
   | { type: "privacy"; status: PrivacyStatus }
+  | { type: "hid"; status: HidArmedStatus }
   | { type: "hotkey"; status: HotkeyStatus }
   | { type: "autostart"; status: AutostartStatus };
 
@@ -147,6 +155,11 @@ export function settingsReducer(state: SettingsState, action: SettingsAction): S
       // Mount-time query, set_privacy_mode responses, and the
       // capture://privacy broadcast (tray toggles included) land here.
       return { ...state, privacy: action.status };
+    case "hid":
+      // Mount-time hid_armed_status query, set_hid_run_mode responses, and the
+      // hid://state broadcast (any future tray path included) land here — the
+      // backend status is authoritative (cross-window sync, MEM115 fallback).
+      return { ...state, hid: action.status };
     case "hotkey":
       return { ...state, hotkey: action.status };
     case "autostart":
@@ -168,6 +181,24 @@ export function laneOptions(models: string[] | null, currentModelId: string | nu
     return [currentModelId, ...list];
   }
   return list;
+}
+
+/** The HID run-mode selector options (S04), in display order: Off first (the
+ *  safe default), then the two armed modes. `label` is the human sentence the
+ *  Settings `<select>` renders; `value` is the kebab-case wire tag `setHidRunMode`
+ *  sends and `hid://state` carries. Off replaces the S03 boolean toggle. */
+export const HID_RUN_MODE_OPTIONS: { value: HidRunMode; label: string }[] = [
+  { value: "off", label: "Off — no input (default)" },
+  { value: "ask", label: "Ask — approve each action" },
+  { value: "auto-run", label: "Auto-run — no prompts" },
+];
+
+/** Whether the selected mode warrants the "dangerously allows all input"
+ *  warning: only `auto-run`, which performs every HID action without a prompt.
+ *  Off and Ask never show it. Pure so the warning is unit-testable without a
+ *  render (src/settings.test.ts). */
+export function hidModeShowsAutoRunWarning(mode: HidRunMode): boolean {
+  return mode === "auto-run";
 }
 
 /** Short human title for a failed model-list fetch. */

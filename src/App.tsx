@@ -19,11 +19,15 @@ import {
   onNudgeDismiss,
   onNudgeShow,
   onPrivacyChanged,
+  onRunState,
   openCaptureSettings,
   privacyStatus,
+  runState,
   sendChat,
   setModel,
+  showStopButton,
   startHealthProbe,
+  stopChat,
   stripFailedTail,
   toCaptureFlowError,
 } from "./chat";
@@ -183,6 +187,22 @@ function App() {
     };
   }, []);
 
+  // Chat run-state snapshot for the Stop control (S04 T04). Outside a Tauri
+  // runtime the invoke rejects and the control simply stays hidden (idle) —
+  // never a crash (same absorb posture as model_info above).
+  useEffect(() => {
+    let cancelled = false;
+    runState().then(
+      (payload) => {
+        if (!cancelled) dispatchChat({ type: "run-state", phase: payload.phase });
+      },
+      (err) => console.debug("llm: run_state unavailable:", err),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Screen Recording permission snapshot for the attach affordance. Outside
   // a Tauri runtime the invoke rejects and the button simply renders in its
   // default state — never a crash (same posture as model_info above).
@@ -223,6 +243,9 @@ function App() {
     const unlistens = [
       onModelInfoBroadcast((info) => dispatchChat({ type: "model-info", info })),
       onPrivacyChanged((status) => dispatchChat({ type: "privacy", status })),
+      // Run-state (S04 T04): the backend broadcasts running/stopped/idle so the
+      // Stop control tracks the in-flight run without polling.
+      onRunState((payload) => dispatchChat({ type: "run-state", phase: payload.phase })),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -262,6 +285,16 @@ function App() {
     captureScreen().then(
       (frame) => dispatchChat({ type: "attach-done", frame }),
       (err) => dispatchChat({ type: "attach-error", error: toCaptureFlowError(err) }),
+    );
+  };
+
+  // Stop the in-flight run. The backend broadcasts the resulting run-state, but
+  // apply the returned phase directly too so the control clears without waiting
+  // for the round-trip (never rejects backend-side — an idle stop is a no-op).
+  const stopRun = () => {
+    stopChat().then(
+      (payload) => dispatchChat({ type: "run-state", phase: payload.phase }),
+      (err) => console.warn("llm: stop_chat failed:", err),
     );
   };
 
@@ -347,6 +380,18 @@ function App() {
             onChange={(event) => setDraft(event.target.value)}
           />
         </form>
+        {showStopButton(chat) && (
+          <div className="run-controls">
+            <button
+              type="button"
+              className="chat-stop"
+              aria-label="Stop the running task"
+              onClick={stopRun}
+            >
+              Stop
+            </button>
+          </div>
+        )}
         {trayNotice && (
           <div className="tray-notice" role="status">
             <div className="chat-banner-text">

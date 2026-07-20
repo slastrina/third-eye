@@ -518,6 +518,21 @@ body,
   color: rgba(255, 255, 255, 0.9);
 }
 
+/* Auto-run "dangerously allows all input" callout (S04): amber, distinct from
+   the red error banner — a deliberate high-risk choice, not a failure. */
+.settings-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 176, 32, 0.16);
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
 .settings-status-row {
   display: flex;
   align-items: center;
