@@ -146,6 +146,17 @@ pub fn run() {
         // elsewhere. Activation needs no TCC; the tool is gated as a HID-class
         // action (ActionKind::FocusApp) through the same ApprovalGate as input.
         .manage(appfocus::commands::AppFocusState::with_platform_backend())
+        // External MCP tools (M007 S02): the managed holder a chat run mounts an
+        // McpExecutor from when an already-serving MCP client peer has been
+        // injected. Empty by default — the mount logs its absence and the run
+        // proceeds with only the built-in tools; the settings-driven spawn that
+        // injects a peer is S04.
+        .manage(llm::mcp::McpState::new())
+        // Remote MCP server auth (M007 S05, R018): the keychain-backed store for
+        // a remote HTTP/SSE server's bearer token. Only presence crosses IPC; the
+        // token bytes flow inbound once and back out only to the http connect path
+        // through the crate-internal get_token. Managed beside CloudKeysState.
+        .manage(llm::commands::McpAuthState::new())
         // Privacy mode (S07): one shared toggle core serving the tray check
         // item and the set_privacy_mode IPC; persisted state applied in
         // setup() before the tray builds.
@@ -172,6 +183,14 @@ pub fn run() {
             llm::commands::respond_hid_approval,
             llm::commands::stop_chat,
             llm::commands::run_state,
+            llm::commands::set_mcp_run_mode,
+            llm::commands::mcp_status,
+            llm::commands::respond_mcp_approval,
+            llm::commands::mcp_servers,
+            llm::commands::set_mcp_servers,
+            llm::commands::set_mcp_auth,
+            llm::commands::delete_mcp_auth,
+            llm::commands::mcp_auth_status,
             capture::commands::capture_screen,
             capture::commands::capture_permission_status,
             capture::commands::open_capture_settings,
@@ -292,6 +311,26 @@ pub fn run() {
             #[cfg(desktop)]
             llm::commands::apply_persisted_lane_models(app.handle());
 
+            // Persisted MCP run mode (M007 S04, R016): a present settings.json
+            // key restores the user's Off/Ask/Auto-run choice; absent/garbage
+            // keeps the fail-closed default (Off, inert — no external tool runs
+            // without an explicit choice). In-memory only — no re-save, no
+            // broadcast; the already-mounted gate reads it live through McpState,
+            // and the T03 spawn launch task reads the enabled server list next.
+            #[cfg(desktop)]
+            llm::commands::apply_persisted_mcp_run_mode(app.handle());
+
+            // External MCP server spawn (M007 S04 T03): read the enabled server
+            // list and, if any, spawn its child + bounded handshake and inject the
+            // peer into McpState so the already-mounted gate's Some(peer) branch
+            // lights up and the agent sees the server's tools. Async (the npx
+            // first-run handshake can take up to 2 min) so it joins the
+            // async_runtime::spawn family below rather than blocking setup(). A
+            // spawn/handshake failure degrades to crashed health — the app keeps
+            // running; the child is cancelled cleanly on exit (the RunEvent hook).
+            #[cfg(desktop)]
+            llm::mcp_spawn::launch_on_startup(app.handle().clone());
+
             // Heavy-lane cloud routing (M004 S05): evaluated AFTER the local
             // lane pins are settled so the revert path has the right local
             // fallback, and after the persisted opt-in + provider are restored.
@@ -354,6 +393,26 @@ pub fn run() {
             );
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Build (not the terminal `.run`) so the event loop callback below can
+        // hook RunEvent::Exit for clean MCP child shutdown (M007 S04 T03).
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Clean MCP child shutdown on app exit (R020, no unix/windows-only
+            // kill): cancel the spawned server's RunningService via its portable
+            // cancellation token so the service loop stops and the child
+            // terminates. Best-effort and exactly-once (the handle is taken); no
+            // child spawned → no handle → a no-op.
+            #[cfg(desktop)]
+            if let tauri::RunEvent::Exit = event {
+                if let Some(token) =
+                    app_handle.state::<llm::mcp::McpState>().take_shutdown_handle()
+                {
+                    token.cancel();
+                    log::info!("llm: MCP server child cancelled cleanly on app exit");
+                }
+            }
+            #[cfg(not(desktop))]
+            let _ = (app_handle, event);
+        });
 }

@@ -327,7 +327,7 @@ pub struct ToolOutcome {
 impl ToolOutcome {
     /// A typed failure: the model sees `{"error": detail}` (so it can
     /// recover or answer without the tool), the UI sees the kind.
-    fn failure(kind: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn failure(kind: &str, detail: impl Into<String>) -> Self {
         let detail = detail.into();
         Self {
             content: serde_json::json!({ "error": detail }).to_string(),

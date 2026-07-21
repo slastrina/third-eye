@@ -12,8 +12,12 @@
 
 pub mod commands;
 pub mod guard;
+pub mod mcp;
+pub mod mcp_keystore;
+pub mod mcp_spawn;
 pub mod openai;
 pub mod router;
+pub mod skills;
 pub mod toolloop;
 
 use async_trait::async_trait;

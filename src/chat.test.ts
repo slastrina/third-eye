@@ -25,11 +25,14 @@ import {
   RUN_STATE_EVENT,
   HID_STATE_EVENT,
   HID_APPROVAL_EVENT,
+  MCP_APPROVAL_EVENT,
   TOOL_CALL_EVENT,
   TOOL_RESULT_EVENT,
   type ActionKind,
   type ApprovalVerdict,
   type HidApprovalRequest,
+  type McpApprovalRequest,
+  type McpApprovalVerdict,
   type CaptureError,
   type CapturedFrame,
   type ChatState,
@@ -659,6 +662,34 @@ describe("HID approval IPC contract (S04/M005)", () => {
       "focus-app",
     ];
     expect(kinds).toHaveLength(5);
+  });
+});
+
+describe("MCP approval IPC contract (S04/M007)", () => {
+  it("keeps the approval-request event name in sync with the Rust contract", () => {
+    // src-tauri/src/llm/commands.rs pins MCP_APPROVAL_EVENT to this same string
+    // (mcp_approval_event_name_is_the_ipc_contract) — the const-test pair lock.
+    expect(MCP_APPROVAL_EVENT).toBe("mcp://approval-request");
+  });
+
+  it("McpApprovalRequest carries the correlation id, namespaced tool name, and summary", () => {
+    // The serde camelCase shape the MCP gate emits and the overlay reads —
+    // pixel-free: id + toolName + a bounded human summary (R011).
+    const request: McpApprovalRequest = {
+      approvalId: 7,
+      toolName: "mcp__weather_forecast",
+      summary: 'Call mcp__weather_forecast({"city":"Paris"})',
+    };
+    expect(request.approvalId).toBe(7);
+    expect(request.toolName).toBe("mcp__weather_forecast");
+    expect(request.summary).toContain("mcp__weather_forecast");
+  });
+
+  it("the verdict wire strings match the Rust kebab-case serde tags", () => {
+    // respond_mcp_approval deserializes these exact McpApprovalVerdict strings.
+    // Keyed on the tool NAME (allow-tool), unlike the HID twin's allow-kind.
+    const verdicts: McpApprovalVerdict[] = ["allow-once", "allow-tool", "deny"];
+    expect(verdicts).toEqual(["allow-once", "allow-tool", "deny"]);
   });
 });
 

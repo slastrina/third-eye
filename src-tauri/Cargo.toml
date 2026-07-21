@@ -25,7 +25,13 @@ futures-util = "0.3"
 # safe), openssl on Linux (libssl-dev already installed by linux-check.sh).
 # The LM Studio loopback path stays plain-http and never negotiates TLS.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# process + io-util (added S02 T01): the production McpExecutor references
+# rmcp's TokioChildProcess/serve path, so the LIBRARY (not just dev tests) now
+# needs tokio's `process` (spawn the MCP server child) and `io-util` (async
+# stdio read/write for the transport). Both are pure Rust on every target — no
+# C, no windows-sys — so they stay green on the Windows-msvc cross-check and the
+# Linux container check (R020).
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process", "io-util"] }
 # Encode pipeline (capture/encode.rs): PNG only — no other codecs needed,
 # and the pipeline is unit-tested cross-platform with synthetic pixels.
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -36,10 +42,50 @@ regex = "1"
 # Endpoint trust classification for the privacy guard (llm/guard.rs): URL
 # parsing only, no DNS. Already in the tree via reqwest — zero new compile cost.
 url = "2"
+# Official MCP Rust SDK (D041, MEM159/MEM160) for the M007 MCP host. The
+# stdio-child-process client feature set: `client` (JSON-RPC client +
+# tokio-stream) and `transport-child-process` (spawns an MCP server over stdio;
+# transitively activates tokio/process + tokio/io-util via transport-async-rw).
+# Its stdio path is pure Rust (process-wrap, tokio-util, which is NOT pulled by
+# this set) — no C, no windows-sys — so it stays green on the Windows-msvc
+# cross-check and the Linux container check with no new system dep. Production
+# McpExecutor wiring is S02; S01 exercises this crate only via the live test.
+#
+# S05 adds the remote HTTP/SSE transport:
+# - `transport-streamable-http-client-reqwest` — the StreamableHttpClientTransport
+#   + reqwest StreamableHttpClient impl + from_uri/from_config constructors.
+# - `reqwest-native-tls` — routes rmcp's reqwest onto the SAME native-tls stack
+#   S03 already chose (SecureTransport/macOS, schannel/msvc, openssl/Linux). We
+#   deliberately do NOT enable the plain `reqwest` feature: it activates
+#   `reqwest?/rustls`, compiling a SECOND TLS backend (rustls + ring/aws-lc-rs,
+#   carrying C/asm) — dependency bloat + a direct R020 msvc/Linux cross-check
+#   risk. R020 gate: Cargo.lock must contain no `aws-lc-sys`.
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
+# YAML frontmatter parser for markdown skill packs (M007 S06, llm/skills.rs).
+# serde_yml is the maintained successor to the deprecated serde_yaml; it
+# deserializes the SKILL.md frontmatter block straight into a #[derive(Deserialize)]
+# struct, matching the serde pattern used everywhere else. It is pure Rust
+# (libyml is a Rust translation of libyaml — no C, no windows-sys) so the R020
+# Windows-msvc and Linux cross-checks stay green and Cargo.lock stays free of
+# aws-lc-sys. Only the frontmatter YAML uses it; the `---` split is hand-rolled.
+serde_yml = "0.0.12"
 
 [dev-dependencies]
-# net + io-util power the raw TcpListener mock server in llm tests.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# net + io-util power the raw TcpListener mock server in llm tests; `process`
+# is added for the M007 live stdio wire-proof (tests/mcp_stdio_live.rs), which
+# builds a tokio::process::Command child for rmcp's TokioChildProcess transport.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
+
+# The rmcp `server` feature (ServerHandler + transport-async-rw, pulling only
+# schemars + pastey — already in Cargo.lock, both pure Rust with no C /
+# windows-sys, so the R020 Windows-msvc and Linux cross-checks stay green)
+# powers the in-process fake MCP server the S02 T03 contract test serves over a
+# tokio::io::duplex pair: a tiny hand-written ServerHandler advertising a fake
+# tool, driving the true tools/list + tools/call protocol through a REAL rmcp
+# client with no child process and no network (unlike the #[ignore]-gated
+# mcp_stdio_live.rs). Dev-only — the production dep above stays the minimal
+# client set; feature unification adds `server` to it only for the test build.
+rmcp = { version = "2.2", default-features = false, features = ["server"] }
 
 # MockRuntime + get_ipc_response for the capability-ACL regression test
 # (tests/capability_acl.rs, MEM115). Dev-only: feature unification does not

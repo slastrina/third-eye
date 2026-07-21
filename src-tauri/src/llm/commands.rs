@@ -28,6 +28,11 @@ use crate::input::commands::SessionWhitelist;
 use crate::input::ActionKind;
 
 use super::guard::{GuardState, GuardTelemetry};
+use super::mcp::{
+    McpApprovalGate, McpApprovalPrompt, McpApprovalVerdict, McpExecutor, McpHealthStatus,
+    McpRunMode, McpServerConfig, McpState,
+};
+use super::mcp_keystore::{McpAuthError, McpAuthStore};
 use super::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
 use super::toolloop::{
@@ -35,7 +40,7 @@ use super::toolloop::{
     FocusAppTool, FocusedApp, InputTool, MemorySearchTool, ScreenQueryTool, ScreenSeen, ToolEvent,
     ToolExecutor, HID_SYSTEM_PROMPT, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
 };
-use super::{ChatMessage, LlmClient, LlmError, LlmHealth, Role};
+use super::{skills, ChatMessage, LlmClient, LlmError, LlmHealth, Role};
 
 /// Event names — the string half of the IPC contract with `src/chat.ts`.
 pub const TOKEN_EVENT: &str = "llm://token";
@@ -66,6 +71,20 @@ pub const PRIVACY_STATE_EVENT: &str = "privacy://state";
 /// the `respond_hid_approval` IPC. The string half of the contract with
 /// `src/chat.ts` (pinned by a Rust test and its TS twin).
 pub const HID_APPROVAL_EVENT: &str = "hid://approval-request";
+/// MCP tool approval-request broadcast (S03 T02): when the [`McpApprovalGate`]
+/// hits an `Ask`-mode call whose tool name is not yet allowlisted, it emits this
+/// event carrying the pending call's summary and awaits the overlay's verdict via
+/// the S04 `respond_mcp_approval` IPC (the MCP twin of [`HID_APPROVAL_EVENT`]).
+/// The string half of the contract with `src/chat.ts` — its reply command lands
+/// in S04; until then an `Ask` prompt fails closed (times out → Deny).
+pub const MCP_APPROVAL_EVENT: &str = "mcp://approval-request";
+/// MCP host health broadcast (S04 T02): every lifecycle transition — spawn
+/// start, handshake ready, a spawn/handshake/mid-session crash — and every
+/// run-mode change emits the resulting [`McpHealthStatus`] app-wide, so the
+/// Settings MCP surface stays truthful without polling (the `cloud://optin` /
+/// `watcher://state` health-as-value precedent). The string half of the
+/// contract with `src/mcp-state.ts` (pinned by a Rust test and its TS twin).
+pub const MCP_STATE_EVENT: &str = "mcp://state";
 /// Chat run-state broadcast (S04 T04): every transition of the in-flight run —
 /// `running` when a chat starts, `stopped` when the user's Stop cuts it short,
 /// `idle` on a natural finish or error — emits this app-wide so the overlay's
@@ -219,6 +238,79 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
                     APPROVAL_TIMEOUT.as_secs()
                 );
                 ApprovalVerdict::Deny
+            }
+        }
+    }
+}
+
+/// The `mcp://approval-request` payload — the pending external MCP tool call the
+/// overlay must approve or deny (S03 T02). `approvalId` correlates the emitted
+/// request with the S04 `respond_mcp_approval` reply; `toolName` is the namespaced
+/// tool name; `summary` is the human sentence the overlay shows. Pixel-free and
+/// argument-bounded by construction (R011/R023) — the MCP twin of
+/// [`ApprovalRequestPayload`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpApprovalRequestPayload {
+    pub approval_id: u64,
+    pub tool_name: String,
+    pub summary: String,
+}
+
+/// The production [`McpApprovalPrompt`]: emits `mcp://approval-request` to the
+/// overlay and awaits the reply through the shared [`McpState`] registry, with a
+/// bounded [`APPROVAL_TIMEOUT`] (shared with the HID gate). Every non-verdict
+/// outcome — a failed emit (no overlay), a closed channel, or a timeout —
+/// resolves to [`McpApprovalVerdict::Deny`] so an MCP tool action is never
+/// performed without an explicit allow (fail-closed, R006/R016 posture). Reaches
+/// the managed [`McpState`] through the [`AppHandle`] at call time so it needs no
+/// owned `Arc` handle (the state is managed by value).
+struct OverlayMcpApprovalPrompt {
+    app: AppHandle,
+    request_id: u64,
+}
+
+impl OverlayMcpApprovalPrompt {
+    fn new(app: AppHandle, request_id: u64) -> Self {
+        Self { app, request_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpApprovalPrompt for OverlayMcpApprovalPrompt {
+    async fn request(&self, tool_name: String, summary: String) -> McpApprovalVerdict {
+        let mcp = self.app.state::<McpState>();
+        let (approval_id, rx) = mcp.register();
+        log::info!(
+            "llm: MCP approval requested id={approval_id} tool={tool_name} (request={})",
+            self.request_id
+        );
+        let payload = McpApprovalRequestPayload {
+            approval_id,
+            tool_name: tool_name.clone(),
+            summary,
+        };
+        if let Err(e) = self.app.emit(MCP_APPROVAL_EVENT, payload) {
+            log::warn!("llm: MCP approval-request emit failed id={approval_id}: {e}; denying");
+            mcp.cancel(approval_id);
+            return McpApprovalVerdict::Deny;
+        }
+        match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(verdict)) => {
+                log::info!("llm: MCP approval id={approval_id} verdict={verdict:?}");
+                verdict
+            }
+            Ok(Err(_closed)) => {
+                log::warn!("llm: MCP approval id={approval_id} channel closed; denying");
+                McpApprovalVerdict::Deny
+            }
+            Err(_elapsed) => {
+                mcp.cancel(approval_id);
+                log::warn!(
+                    "llm: MCP approval id={approval_id} timed out after {}s; denying",
+                    APPROVAL_TIMEOUT.as_secs()
+                );
+                McpApprovalVerdict::Deny
             }
         }
     }
@@ -499,6 +591,30 @@ impl LlmState {
 
 }
 
+/// Compose the discovered markdown skill packs (M007 S06) into one system-turn
+/// instruction block. Each skill's `description` (its documented triggering
+/// signal, mirroring `.agents/skills/*/SKILL.md`) leads its Markdown `body` (the
+/// instructions), so the model can decide which skill matches the task and follow
+/// its steps. Returns `None` when nothing was discovered — an empty discovery dir
+/// must never add a hollow system turn. `discover_skills` already fail-soft-skips
+/// and logs malformed/missing packs, so this only ever sees good skills.
+fn compose_skills_prompt(discovered: &[skills::Skill]) -> Option<String> {
+    if discovered.is_empty() {
+        return None;
+    }
+    let mut prompt = String::from(
+        "You have access to the following skills. Each skill's description says when to use it; \
+         when a skill matches the task, follow its instructions.\n",
+    );
+    for skill in discovered {
+        prompt.push_str(&format!(
+            "\n## Skill: {}\n{}\n\n{}\n",
+            skill.name, skill.description, skill.body
+        ));
+    }
+    Some(prompt)
+}
+
 /// Start a streaming chat completion. Returns the request id immediately;
 /// tokens and the terminal outcome arrive as `llm://*` events tagged with it.
 /// Any in-flight request is aborted first (single-flight).
@@ -641,6 +757,44 @@ pub async fn chat(
             screen_seen,
             focused_app,
         )));
+        // External MCP tools (M007 S02): when an already-serving MCP client peer
+        // has been injected for this run, mount an McpExecutor so the agent loop
+        // SEES the server's tools — each namespaced under `mcp__` so a collision
+        // with the four built-ins (memory_search / input_action / screen_query /
+        // focus_app) is structurally impossible. Absence is logged, never silent,
+        // never fatal (mirrors the memory_search Some/None at :589-599); the full
+        // settings-driven spawn/lifecycle that injects the peer is S04.
+        //
+        // S03: the McpExecutor is WRAPPED in the McpApprovalGate BEFORE being
+        // pushed, so no production MCP tool-action path reaches the server's
+        // call_tool choke point unguarded — the runtime half of R016's extension
+        // of the guard boundary to external tool actions, mirroring the HID
+        // ApprovalGate wrap above and pinned structurally by
+        // scripts/check-mcp-guard.sh (T03). The gate reads its run mode and
+        // session allowlist through McpState seams so S04 wires persisted config
+        // with no gate change; the prompt seam emits mcp://approval-request and
+        // fails closed (Deny) on timeout/emit-failure.
+        let mcp = task_app.state::<McpState>();
+        match mcp.peer() {
+            Some(peer) => match McpExecutor::connect(peer).await {
+                Ok(mcp_executor) => {
+                    let mcp_mode = mcp.mode();
+                    let mcp_approver = Arc::new(OverlayMcpApprovalPrompt::new(task_app.clone(), id));
+                    executors.push(Box::new(McpApprovalGate::new(
+                        mcp_executor,
+                        mcp_mode,
+                        mcp.allowlist(),
+                        mcp_approver,
+                    )));
+                }
+                Err(e) => log::warn!(
+                    "llm: request {id} MCP tools unavailable — tools/list handshake failed: {e}"
+                ),
+            },
+            None => {
+                log::info!("llm: request {id} runs without MCP tools (no server peer injected)");
+            }
+        }
         let executor = CompositeExecutor::new(executors);
         // Ground the model in the focus→query→click discipline (M005 targeting
         // fix). Only when the caller didn't already send a system turn — the
@@ -650,6 +804,25 @@ pub async fn chat(
         if !messages.iter().any(|m| m.role == Role::System) {
             messages.insert(0, ChatMessage::system(HID_SYSTEM_PROMPT));
             log::debug!("llm: request {id} grounded with HID orchestration system prompt");
+        }
+        // Load discovered markdown skill packs (M007 S06) into the system turn so
+        // a dropped-in SKILL.md visibly shapes behavior for a matching task. The
+        // discovery dir resolves through the fail-soft config triad (unset/garbage
+        // → app_data_dir/skills); discover_skills already logs+skips malformed or
+        // missing packs and returns an empty vec for a missing dir, so this path is
+        // never fatal. Prepended as its own LEADING system message — after the HID
+        // check above (so HID grounding still fires when the caller sent no system
+        // turn) and ahead of everything else, never clobbering the caller-sent
+        // system turn (summon-from-nudge). An empty discovery injects nothing.
+        let skills_dir = crate::config::resolve_skills_dir(&task_app);
+        let discovered = skills::discover_skills(&skills_dir);
+        if let Some(skill_prompt) = compose_skills_prompt(&discovered) {
+            messages.insert(0, ChatMessage::system(skill_prompt));
+            log::info!(
+                "llm: request {id} loaded {} skill(s) into the system turn from {}",
+                discovered.len(),
+                skills_dir.display()
+            );
         }
         // The loop observes the cooperative Stop flag between rounds/actions and
         // terminates with a typed stopped outcome (S04 T04).
@@ -887,6 +1060,236 @@ pub fn respond_hid_approval(
     delivered
 }
 
+/// The one shared MCP run-mode applier (S04 T02) — the MCP twin of
+/// [`crate::input::commands::apply_hid_run_mode`]. Every mode mutation (the
+/// `set_mcp_run_mode` IPC, and any future path) funnels through here so they
+/// cannot drift: it sets the in-memory mode the already-mounted gate
+/// (`commands.rs` chat-task) snapshots per run, persists it to settings.json,
+/// and on a persist failure ROLLS BACK the in-memory mode so an unpersisted
+/// choice can never silently take effect for the session while the store still
+/// says otherwise (fail-closed, the hotkey/opt-in precedent — a persisted
+/// `off` must win on the next restart). Always emits and returns the resulting
+/// [`McpHealthStatus`]; a persist failure is logged, never thrown (R007). No
+/// gate change: the gate reads the mode through the [`McpState`] seam.
+pub fn apply_mcp_run_mode(app: &AppHandle, desired: McpRunMode, via: &str) -> McpHealthStatus {
+    let state = app.state::<McpState>();
+    let previous = state.mode();
+    state.set_mode(desired);
+    match crate::config::save_mcp_run_mode(app, desired) {
+        Ok(()) => log::info!("llm: MCP run mode = {desired:?} (via {via})"),
+        Err(e) => {
+            // Roll the in-memory mode back to the persisted value: an unpersisted
+            // Ask/AutoRun must not run external tools this session when the store
+            // still says off (R016 fail-closed). The error names the persist path.
+            state.set_mode(previous);
+            log::error!("llm: MCP run mode persist failed, rolled back to {previous:?}: {e}");
+        }
+    }
+    let status = state.status();
+    // Broadcast failure is cosmetic — the truth stays queryable via `mcp_status`
+    // — so it is logged, never bubbled (the `cloud://optin` posture).
+    if let Err(e) = app.emit(MCP_STATE_EVENT, status.clone()) {
+        log::warn!("llm: MCP state broadcast failed: {e}");
+    }
+    status
+}
+
+/// Apply the persisted MCP run mode at startup (called from `setup()`).
+/// In-memory only: no re-save, no broadcast — nothing is listening yet. An
+/// absent/garbage key keeps the fail-closed default (`Off`, inert — no external
+/// tool runs without an explicit choice, R016); load/interpret failures are
+/// logged inside `config`, never fatal.
+pub fn apply_persisted_mcp_run_mode(app: &AppHandle) {
+    if let Some(mode) = crate::config::load_mcp_run_mode(app) {
+        app.state::<McpState>().set_mode(mode);
+        log::info!("llm: applied persisted MCP run mode ({mode:?})");
+    }
+}
+
+/// Select the MCP run mode from the UI (S04 T02) — the MCP twin of
+/// `set_hid_run_mode`. Returns the resulting [`McpHealthStatus`] instead of
+/// erroring: a persist failure is data the caller renders (rolled back and
+/// logged), the same health-as-value contract as `set_cloud_optin` (R007).
+#[tauri::command]
+pub fn set_mcp_run_mode(app: AppHandle, mode: McpRunMode) -> McpHealthStatus {
+    apply_mcp_run_mode(&app, mode, "ipc")
+}
+
+/// Current MCP host health — health-as-value beside `cloud_optin_status` and
+/// `run_state` (R007): the `{ phase, lastError, updatedAt, mode, toolCount }`
+/// value at any time, never an error. The Settings MCP surface queries it at
+/// mount to render the health line before any `mcp://state` broadcast arrives.
+#[tauri::command]
+pub fn mcp_status(state: State<'_, McpState>) -> McpHealthStatus {
+    state.status()
+}
+
+/// Deliver the overlay's verdict for a pending MCP tool-call approval (S04 T04)
+/// — the MCP twin of [`respond_hid_approval`]. The [`McpApprovalGate`]'s prompt
+/// seam ([`OverlayMcpApprovalPrompt`]) is blocked awaiting this reply (or its
+/// timeout); a verdict resolves it. Never rejects — an unknown or already-expired
+/// `approvalId` (the gate timed out first, or a double reply) is a logged no-op
+/// returning `false`, so the overlay can fire-and-forget without racing the
+/// timeout into an error. Reaches the pending-verdict registry through the
+/// managed [`McpState`] (managed by value, beside the HID `ApprovalState`).
+#[tauri::command]
+pub fn respond_mcp_approval(
+    state: State<'_, McpState>,
+    approval_id: u64,
+    verdict: McpApprovalVerdict,
+) -> bool {
+    let delivered = state.respond(approval_id, verdict);
+    if delivered {
+        log::debug!("llm: MCP approval reply id={approval_id} verdict={verdict:?} delivered");
+    } else {
+        log::warn!(
+            "llm: MCP approval reply id={approval_id} verdict={verdict:?} for unknown/expired request (no-op)"
+        );
+    }
+    delivered
+}
+
+/// The queryable MCP server-list state (S04 T04) — health-as-value beside
+/// [`McpHealthStatus`] and `CloudHeavyProviderStatus` (R007): the persisted
+/// `mcpServers` list plus the most recent `persistError`, a value at any time,
+/// never an IPC rejection. `servers` is always the authoritative persisted list
+/// (on a save failure it stays the last-persisted list, so the UI never shows an
+/// unpersisted change as if it took); `persistError` names a failed `save_mcp_servers`
+/// so a change that could not be written stays visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServersStatus {
+    pub servers: Vec<McpServerConfig>,
+    pub persist_error: Option<String>,
+}
+
+/// Current persisted MCP server list — health-as-value, never an error. The
+/// Settings MCP surface queries it at mount to render the server rows. An absent
+/// key / unopenable store collapses to the empty list (logged in `config`).
+#[tauri::command]
+pub fn mcp_servers(app: AppHandle) -> McpServersStatus {
+    McpServersStatus {
+        servers: crate::config::load_mcp_servers(&app).unwrap_or_default(),
+        persist_error: None,
+    }
+}
+
+/// Persist the MCP server list from the Settings add/remove surface (S04 T04).
+/// Never rejects backend-side (the `set_cloud_heavy_provider` contract, R007): on
+/// success returns the saved list with a null `persistError`; on a persist failure
+/// it returns the still-authoritative previously-persisted list with `persistError`
+/// set, so an unpersisted change never appears to have taken — the change takes
+/// effect at the next startup launch task, so a silent revert on restart would be
+/// invisible otherwise. The list edit is spawn-inert until restart by design (the
+/// launch task reads `mcpServers` at startup), so there is no live in-memory list
+/// to roll back — the persisted store is the single source of truth.
+#[tauri::command]
+pub fn set_mcp_servers(app: AppHandle, servers: Vec<McpServerConfig>) -> McpServersStatus {
+    match crate::config::save_mcp_servers(&app, &servers) {
+        Ok(()) => {
+            log::info!("llm: persisted {} MCP server(s) via settings", servers.len());
+            McpServersStatus { servers, persist_error: None }
+        }
+        Err(e) => {
+            // The store still holds the previous list; surface THAT as the truth so
+            // the UI cannot show an unpersisted edit as saved (fail-closed).
+            log::error!("llm: MCP server list persist failed: {e}");
+            McpServersStatus {
+                servers: crate::config::load_mcp_servers(&app).unwrap_or_default(),
+                persist_error: Some(e),
+            }
+        }
+    }
+}
+
+/// Managed state: one production [`McpAuthStore`] for the app's lifetime — the
+/// keychain home for remote MCP server bearer tokens (S05 T03, R018), beside
+/// [`crate::cloud::commands::CloudKeysState`]. The store handle is crate-visible
+/// so the http connect path (T04) can read a token for the `Authorization`
+/// header through the crate-internal `get_token`; the IPC surface below only
+/// ever exposes presence.
+pub struct McpAuthState {
+    store: McpAuthStore,
+}
+
+impl McpAuthState {
+    pub fn new() -> Self {
+        Self { store: McpAuthStore::new() }
+    }
+
+    /// The keystore handle — the http connect path (T04) reads tokens through
+    /// this (and through the crate-internal `get_token` only).
+    pub fn store(&self) -> &McpAuthStore {
+        &self.store
+    }
+}
+
+impl Default for McpAuthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Presence-only snapshot for one MCP auth account — the entire outbound IPC
+/// vocabulary of the MCP keystore, the twin of `CloudKeyStatus`. A single
+/// camelCase boolean; adding any string field here (above all one that could
+/// carry the token) should trip the `mcp_auth_status_carries_presence_boolean_only`
+/// contract test.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuthStatus {
+    pub present: bool,
+}
+
+/// IPC: store a bearer token for a remote MCP server's `authRef` account. The
+/// token crosses IPC inbound here — the one legitimate crossing — and is handed
+/// straight to the OS store, never held or echoed. Returns the fresh presence so
+/// the Settings row renders truth without a second query (the `set_cloud_api_key`
+/// contract).
+#[tauri::command]
+pub fn set_mcp_auth(
+    state: State<'_, McpAuthState>,
+    auth_ref: String,
+    token: String,
+) -> Result<McpAuthStatus, McpAuthError> {
+    state.store.set_token(&auth_ref, &token).map_err(|e| {
+        // The account key is non-secret (it is the settings.json authRef); the
+        // token bytes are never logged.
+        log::error!("llm: set MCP auth failed for {} ({})", auth_ref.trim(), e.kind());
+        e
+    })?;
+    Ok(McpAuthStatus { present: state.store.token_present(&auth_ref)? })
+}
+
+/// IPC: delete a remote MCP server's stored bearer token. Deleting an absent
+/// token succeeds (the `delete_cloud_api_key` contract). Returns the fresh
+/// presence (`false` on success).
+#[tauri::command]
+pub fn delete_mcp_auth(
+    state: State<'_, McpAuthState>,
+    auth_ref: String,
+) -> Result<McpAuthStatus, McpAuthError> {
+    state.store.delete_token(&auth_ref).map_err(|e| {
+        log::error!("llm: delete MCP auth failed for {} ({})", auth_ref.trim(), e.kind());
+        e
+    })?;
+    Ok(McpAuthStatus { present: state.store.token_present(&auth_ref)? })
+}
+
+/// IPC: presence snapshot for one `authRef` account — the Settings MCP surface
+/// renders the write-only token field's "stored / not stored" state from this.
+/// Presence only, ever: the token itself has no outbound command (R018).
+#[tauri::command]
+pub fn mcp_auth_status(
+    state: State<'_, McpAuthState>,
+    auth_ref: String,
+) -> Result<McpAuthStatus, McpAuthError> {
+    state.store.token_present(&auth_ref).map(|present| McpAuthStatus { present }).map_err(|e| {
+        log::error!("llm: MCP auth status query failed for {} ({})", auth_ref.trim(), e.kind());
+        e
+    })
+}
+
 /// Install the `privacy://state` emitter on the shared [`GuardState`]
 /// (called once from `setup()`): the one choke point that makes all three
 /// mutation sites — guarded forward, guard block, watcher redaction —
@@ -929,6 +1332,21 @@ mod tests {
     use super::super::ChatRequest;
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The outbound MCP-auth IPC contract: exactly one camelCase presence
+    /// boolean. Any new field — above all a string that could carry the bearer
+    /// token — fails this test and forces a deliberate contract change (the
+    /// `CloudKeyStatus` presence-only pin, R018).
+    #[test]
+    fn mcp_auth_status_carries_presence_boolean_only() {
+        for present in [true, false] {
+            let v = serde_json::to_value(McpAuthStatus { present }).unwrap();
+            let obj = v.as_object().unwrap();
+            assert_eq!(obj.len(), 1, "status must stay presence-only: {obj:?}");
+            assert_eq!(obj["present"], present);
+            assert!(obj.values().all(|value| value.is_boolean()));
+        }
+    }
 
     struct NoopClient;
 
@@ -1116,6 +1534,78 @@ mod tests {
         // src/chat.ts pins the same string on the TS side — the two const tests
         // are the contract-lock pair (S04 T03).
         assert_eq!(HID_APPROVAL_EVENT, "hid://approval-request");
+    }
+
+    #[test]
+    fn mcp_state_event_name_is_the_ipc_contract() {
+        // src/mcp-state.ts (T04) listens on this exact string — the const test
+        // pair is the contract lock, beside cloud://optin / watcher://state.
+        assert_eq!(MCP_STATE_EVENT, "mcp://state");
+    }
+
+    #[test]
+    fn mcp_approval_event_name_is_the_ipc_contract() {
+        // src/chat.ts pins the same string on the TS side — the two const tests
+        // are the contract-lock pair (S04 T04), the MCP twin of the HID pair.
+        assert_eq!(MCP_APPROVAL_EVENT, "mcp://approval-request");
+    }
+
+    #[test]
+    fn mcp_approval_request_payload_serializes_camel_case() {
+        // src/chat.ts's McpApprovalRequest reads approvalId + toolName + summary;
+        // a change here is a breaking IPC change the frontend must match.
+        let v = serde_json::to_value(McpApprovalRequestPayload {
+            approval_id: 7,
+            tool_name: "mcp__weather_forecast".into(),
+            summary: "Call mcp__weather_forecast({\"city\":\"Paris\"})".into(),
+        })
+        .unwrap();
+        assert_eq!(v["approvalId"], 7);
+        assert_eq!(v["toolName"], "mcp__weather_forecast");
+        assert_eq!(v["summary"], "Call mcp__weather_forecast({\"city\":\"Paris\"})");
+    }
+
+    #[test]
+    fn mcp_approval_verdict_deserializes_the_kebab_case_wire_strings() {
+        // The exact strings src/chat.ts sends over respond_mcp_approval.
+        assert_eq!(
+            serde_json::from_str::<McpApprovalVerdict>("\"allow-once\"").unwrap(),
+            McpApprovalVerdict::AllowOnce
+        );
+        assert_eq!(
+            serde_json::from_str::<McpApprovalVerdict>("\"allow-tool\"").unwrap(),
+            McpApprovalVerdict::AllowTool
+        );
+        assert_eq!(
+            serde_json::from_str::<McpApprovalVerdict>("\"deny\"").unwrap(),
+            McpApprovalVerdict::Deny
+        );
+        // A garbage verdict is rejected, not silently coerced to a permissive one.
+        assert!(serde_json::from_str::<McpApprovalVerdict>("\"allow-everything\"").is_err());
+    }
+
+    #[test]
+    fn mcp_servers_status_serializes_camel_case() {
+        // src/mcp-state.ts's McpServersStatus reads servers + persistError; the
+        // server entries carry the camelCase McpServerConfig shape.
+        let v = serde_json::to_value(McpServersStatus {
+            servers: vec![McpServerConfig {
+                id: "weather".into(),
+                command: "npx".into(),
+                args: vec!["-y".into(), "@ref/weather".into()],
+                enabled: true,
+                transport: crate::llm::mcp::McpTransport::Stdio,
+                url: None,
+                auth_ref: None,
+            }],
+            persist_error: Some("failed to persist mcpServers to settings.json".into()),
+        })
+        .unwrap();
+        assert_eq!(v["servers"][0]["id"], "weather");
+        assert_eq!(v["servers"][0]["command"], "npx");
+        assert_eq!(v["servers"][0]["args"][1], "@ref/weather");
+        assert_eq!(v["servers"][0]["enabled"], true);
+        assert_eq!(v["persistError"], "failed to persist mcpServers to settings.json");
     }
 
     #[test]

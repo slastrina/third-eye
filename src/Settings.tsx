@@ -48,6 +48,28 @@ import {
   setCloudOptin,
   type CloudProvider,
 } from "./cloud-state";
+import {
+  MCP_RUN_MODE_OPTIONS,
+  MCP_TRANSPORT_OPTIONS,
+  deleteMcpAuth,
+  initialMcpViewState,
+  isMcpAuthError,
+  mcpAuthRef,
+  mcpAuthStatus,
+  mcpHealthLine,
+  mcpModeShowsAutoRunWarning,
+  mcpReducer,
+  mcpServers,
+  mcpStatus,
+  onMcpStateChanged,
+  setMcpAuth,
+  setMcpRunMode,
+  setMcpServers,
+  type McpAuthError,
+  type McpRunMode,
+  type McpServerConfig,
+  type McpTransport,
+} from "./mcp-state";
 import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geometry";
 import {
   drawerEdgeOf,
@@ -159,6 +181,34 @@ function Settings() {
   const [watcher, dispatchWatcher] = useReducer(watcherReducer, initialWatcherViewState);
   const [memory, dispatchMemory] = useReducer(memoryReducer, initialMemoryViewState);
   const [cloud, dispatchCloud] = useReducer(cloudReducer, initialCloudViewState);
+  const [mcp, dispatchMcp] = useReducer(mcpReducer, initialMcpViewState);
+  // The add-server draft lives in local component state — never in the reducer,
+  // which only ever holds the backend-authoritative persisted list. Cleared the
+  // instant a server is handed to set_mcp_servers.
+  const [serverDraft, setServerDraft] = useState<{
+    id: string;
+    transport: McpTransport;
+    command: string;
+    args: string;
+    url: string;
+    token: string;
+  }>({
+    id: "",
+    transport: "stdio",
+    command: "",
+    args: "",
+    url: "",
+    token: "",
+  });
+  // Per-authRef presence of a stored bearer token — booleans only, backend
+  // authoritative (never the token). Refreshed from mcp_auth_status whenever the
+  // http server list changes. The write-only token drafts live keyed by server
+  // id, never in a reducer, so an entered token can never round-trip back into
+  // rendered view state (the never-echo property); cleared the instant handed to
+  // set_mcp_auth. A typed store failure rides mcpAuthError.
+  const [mcpAuthPresent, setMcpAuthPresent] = useState<Record<string, boolean>>({});
+  const [mcpTokenDrafts, setMcpTokenDrafts] = useState<Record<string, string>>({});
+  const [mcpAuthError, setMcpAuthError] = useState<McpAuthError | null>(null);
   // The masked key drafts live only in local component state, keyed by
   // provider — never in the reducer, so an entered key can never round-trip
   // back into rendered view state (the never-echo property). Cleared the
@@ -247,6 +297,16 @@ function Settings() {
       (status) => dispatchCloud({ type: "heavy", status }),
       (err) => console.debug("settings: cloud_heavy_provider unavailable:", err),
     );
+    // MCP host health + server list — health-as-value, safe to poll (R007). The
+    // mcp://state subscription is the live path; these are the boot snapshot.
+    mcpStatus().then(
+      (status) => dispatchMcp({ type: "health", status }),
+      (err) => console.debug("settings: mcp_status unavailable:", err),
+    );
+    mcpServers().then(
+      (status) => dispatchMcp({ type: "servers", status }),
+      (err) => console.debug("settings: mcp_servers unavailable:", err),
+    );
     // Health-as-value beside the overlay geometry (R007): a PresentationStatus
     // at any time, never an error. Rejects only outside a Tauri runtime, where
     // the presentation stays null and the section shows its unavailable note.
@@ -284,6 +344,10 @@ function Settings() {
       // Cloud opt-in truth flows one way too: a toggle from any window
       // broadcasts the resulting status as cloud://optin.
       onCloudOptin((status) => dispatchCloud({ type: "optin", status })),
+      // MCP host health flows one way, backend → UI: a run-mode change from any
+      // window OR a spawn/ready/crash lifecycle transition broadcasts the
+      // resulting McpHealthStatus as mcp://state.
+      onMcpStateChanged((status) => dispatchMcp({ type: "health", status })),
       // Overlay presentation truth flows one way, backend → UI: a mode/extent
       // change from this window OR a live resize on the overlay webview
       // broadcasts the resulting PresentationStatus as overlay://presentation.
@@ -299,6 +363,30 @@ function Settings() {
       unlistens.forEach((u) => u.then((f) => f()));
     };
   }, []);
+
+  // Token presence for each remote (http) server's authRef — health-as-value,
+  // booleans only (R018). Re-queried whenever the persisted list changes so a
+  // freshly-added http server, a removed one, or a token set/cleared elsewhere
+  // stays truthful. Outside a Tauri runtime mcp_auth_status rejects and the row
+  // simply shows "Not stored".
+  useEffect(() => {
+    const servers = mcp.servers;
+    if (servers === null) return;
+    let cancelled = false;
+    for (const server of servers) {
+      if (server.transport !== "http" || !server.authRef) continue;
+      const authRef = server.authRef;
+      mcpAuthStatus(authRef).then(
+        (status) => {
+          if (!cancelled) setMcpAuthPresent((prev) => ({ ...prev, [authRef]: status.present }));
+        },
+        (err) => console.debug("settings: mcp_auth_status unavailable:", err),
+      );
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [mcp.servers]);
 
   // In-page close: the window is borderless, so the button and Escape are
   // the only ways out. Rejection outside Tauri is absorbed.
@@ -409,6 +497,120 @@ function Settings() {
       (status) => dispatchCloud({ type: "heavy", status }),
       (err) => console.debug("settings: set_cloud_heavy_provider unavailable:", err),
     );
+  };
+
+  const selectMcpMode = (mode: McpRunMode) => {
+    setMcpRunMode(mode).then(
+      // Never rejects backend-side; a persist failure rides lastError on the
+      // returned McpHealthStatus (rolled back), the set_hid_run_mode contract.
+      (status) => dispatchMcp({ type: "health", status }),
+      (err) => console.debug("settings: set_mcp_run_mode unavailable:", err),
+    );
+  };
+
+  // Persist the whole list on every add/remove — set_mcp_servers is the single
+  // write path and returns the authoritative persisted list (or the previous
+  // one plus persistError on failure), so the reducer stays backend-truthful.
+  const persistServers = (servers: McpServerConfig[]) => {
+    setMcpServers(servers).then(
+      (status) => dispatchMcp({ type: "servers", status }),
+      (err) => console.debug("settings: set_mcp_servers unavailable:", err),
+    );
+  };
+
+  // Whether the current add-server draft is complete enough to persist: a stdio
+  // server needs an id + command; an http server needs an id + url (the token is
+  // optional — an unauthenticated remote server is valid).
+  const draftReady = (() => {
+    if (serverDraft.id.trim().length === 0) return false;
+    return serverDraft.transport === "http"
+      ? serverDraft.url.trim().length > 0
+      : serverDraft.command.trim().length > 0;
+  })();
+
+  const addServer = () => {
+    const id = serverDraft.id.trim();
+    if (id.length === 0) return;
+    const existing = mcp.servers ?? [];
+    let entry: McpServerConfig;
+    if (serverDraft.transport === "http") {
+      const url = serverDraft.url.trim();
+      if (url.length === 0) return;
+      const token = serverDraft.token.trim();
+      // The token (if any) rides the keychain, never settings.json (R018): the
+      // config carries only the non-secret authRef account key. authRef is set
+      // whenever a token is entered so the connect path knows where to read it.
+      const authRef = token.length > 0 ? mcpAuthRef(id) : undefined;
+      entry = { id, command: "", args: [], enabled: true, transport: "http", url, authRef };
+      if (token.length > 0 && authRef) submitMcpAuth(authRef, token);
+    } else {
+      const command = serverDraft.command.trim();
+      if (command.length === 0) return;
+      // Split args on whitespace; empty tokens dropped. A blank args box → no args.
+      const args =
+        serverDraft.args.trim().length === 0 ? [] : serverDraft.args.trim().split(/\s+/);
+      entry = { id, command, args, enabled: true, transport: "stdio" };
+    }
+    // Replace an entry with the same id rather than duplicating the key.
+    const next = [...existing.filter((s) => s.id !== id), entry];
+    persistServers(next);
+    setServerDraft({ id: "", transport: "stdio", command: "", args: "", url: "", token: "" });
+  };
+
+  const removeServer = (id: string) => {
+    const server = (mcp.servers ?? []).find((s) => s.id === id);
+    // Removing an http server clears its stored bearer token too — a dangling
+    // keychain secret for a server the user deleted is a leak (R018).
+    if (server?.transport === "http" && server.authRef) {
+      const authRef = server.authRef;
+      deleteMcpAuth(authRef).then(
+        (status) => setMcpAuthPresent((prev) => ({ ...prev, [authRef]: status.present })),
+        (err) => console.debug("settings: delete_mcp_auth unavailable:", err),
+      );
+    }
+    persistServers((mcp.servers ?? []).filter((s) => s.id !== id));
+  };
+
+  // Store a bearer token for a remote server's authRef — the one legitimate
+  // inbound crossing of token material (R018). Presence comes straight back so
+  // the row renders truth without a second query; a typed store failure rides
+  // mcpAuthError (never silence). Clears the write-only draft on success.
+  const submitMcpAuth = (authRef: string, token: string) => {
+    setMcpAuth(authRef, token).then(
+      (status) => {
+        setMcpAuthPresent((prev) => ({ ...prev, [authRef]: status.present }));
+        setMcpAuthError(null);
+      },
+      (err) => {
+        if (isMcpAuthError(err)) setMcpAuthError(err);
+        else console.debug("settings: set_mcp_auth unavailable:", err);
+      },
+    );
+  };
+
+  const submitServerToken = (id: string) => {
+    const token = (mcpTokenDrafts[id] ?? "").trim();
+    if (token.length === 0) return;
+    submitMcpAuth(mcpAuthRef(id), token);
+    setMcpTokenDrafts((prev) => ({ ...prev, [id]: "" }));
+  };
+
+  const removeServerToken = (id: string) => {
+    const authRef = mcpAuthRef(id);
+    deleteMcpAuth(authRef).then(
+      (status) => {
+        setMcpAuthPresent((prev) => ({ ...prev, [authRef]: status.present }));
+        setMcpAuthError(null);
+      },
+      (err) => {
+        if (isMcpAuthError(err)) setMcpAuthError(err);
+        else console.debug("settings: delete_mcp_auth unavailable:", err);
+      },
+    );
+  };
+
+  const toggleServerEnabled = (id: string, enabled: boolean) => {
+    persistServers((mcp.servers ?? []).map((s) => (s.id === id ? { ...s, enabled } : s)));
   };
 
   const selectPresentationMode = (mode: PresentationMode) => {
@@ -1047,6 +1249,253 @@ function Settings() {
                 </div>
               )}
             </>
+          )}
+        </section>
+
+        <section className="settings-section" aria-labelledby="settings-mcp-heading">
+          <h2 id="settings-mcp-heading" className="settings-section-title">
+            MCP Servers
+          </h2>
+          <label className="settings-row">
+            <span className="settings-row-label">External tools mode</span>
+            <select
+              className="settings-select"
+              aria-label="External MCP tools mode"
+              data-mcp-mode={mcp.health?.mode ?? "off"}
+              // Inert until the mount-time mcp_status resolves (outside the app
+              // it stays null and the section shows its unavailable note).
+              disabled={mcp.health === null}
+              value={mcp.health?.mode ?? "off"}
+              onChange={(event) => selectMcpMode(event.target.value as McpRunMode)}
+            >
+              {MCP_RUN_MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="settings-hint">
+            Off by default. When on, Third Eye can call tools from external MCP
+            servers you add below. Ask prompts before each new tool; Auto-run runs
+            them without asking. Servers are spawned at startup — add or change one
+            here and restart to apply.
+          </p>
+          {mcp.health && mcpModeShowsAutoRunWarning(mcp.health.mode) && (
+            // Auto-run runs every external tool without a prompt — the most
+            // permissive posture, called out explicitly (R007).
+            <div className="settings-warning" role="alert" data-mcp-autorun-warning>
+              <strong>Auto-run runs every external tool without asking</strong>
+              <span>
+                Third Eye will call any tool an enabled server advertises with no
+                prompt. Only use this with servers you trust.
+              </span>
+            </div>
+          )}
+          {mcp.health && (
+            <div className="settings-status-row">
+              <span className="settings-row-label">Status</span>
+              <span className="settings-status-value" data-mcp-phase={mcp.health.phase}>
+                {mcpHealthLine(mcp.health)}
+              </span>
+            </div>
+          )}
+          {mcp.health === null && (
+            <p className="settings-unavailable">
+              MCP state is unavailable outside the app.
+            </p>
+          )}
+          {mcp.servers?.map((server) => (
+            <div
+              key={server.id}
+              className="cloud-provider"
+              data-mcp-server={server.id}
+              data-mcp-server-transport={server.transport}
+            >
+              <div className="settings-status-row">
+                <span className="settings-row-label">{server.id}</span>
+                <span className="settings-status-value">
+                  {server.transport === "http"
+                    ? (server.url ?? "")
+                    : `${server.command}${server.args.length > 0 ? ` ${server.args.join(" ")}` : ""}`}
+                </span>
+              </div>
+              {server.transport === "http" && (
+                // Write-only bearer token, presence-shown — the MCP twin of the
+                // cloud key row (R018): the token crosses only inbound to the
+                // keychain, and the field only ever reflects "Stored / Not stored".
+                <div className="settings-row">
+                  <span
+                    className="settings-status-value"
+                    data-mcp-auth-present={mcpAuthPresent[mcpAuthRef(server.id)] ? "true" : "false"}
+                  >
+                    {mcpAuthPresent[mcpAuthRef(server.id)] ? "Token stored" : "No token"}
+                  </span>
+                  <input
+                    type="password"
+                    className="settings-key-input"
+                    aria-label={`Bearer token for ${server.id}`}
+                    data-mcp-server-token={server.id}
+                    placeholder={
+                      mcpAuthPresent[mcpAuthRef(server.id)] ? "Replace token" : "Paste bearer token"
+                    }
+                    value={mcpTokenDrafts[server.id] ?? ""}
+                    onChange={(event) =>
+                      setMcpTokenDrafts((prev) => ({ ...prev, [server.id]: event.target.value }))
+                    }
+                  />
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    data-mcp-server-token-save={server.id}
+                    disabled={(mcpTokenDrafts[server.id] ?? "").trim().length === 0}
+                    onClick={() => submitServerToken(server.id)}
+                  >
+                    Save
+                  </button>
+                  {mcpAuthPresent[mcpAuthRef(server.id)] && (
+                    <button
+                      type="button"
+                      className="memory-delete"
+                      data-mcp-server-token-delete={server.id}
+                      aria-label={`Remove token for ${server.id}`}
+                      onClick={() => removeServerToken(server.id)}
+                    >
+                      Remove token
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="settings-row">
+                <label className="settings-row-label">
+                  <input
+                    type="checkbox"
+                    className="settings-toggle"
+                    aria-label={`Enable ${server.id}`}
+                    data-mcp-server-enabled={server.id}
+                    checked={server.enabled}
+                    onChange={(event) => toggleServerEnabled(server.id, event.target.checked)}
+                  />
+                  Enabled
+                </label>
+                <button
+                  type="button"
+                  className="memory-delete"
+                  data-mcp-server-delete={server.id}
+                  aria-label={`Remove ${server.id}`}
+                  onClick={() => removeServer(server.id)}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+          {mcpAuthError && (
+            <div className="settings-error" role="alert" data-mcp-auth-error>
+              <strong>Token couldn't be saved</strong>
+              <span>{mcpAuthError.detail}</span>
+            </div>
+          )}
+          <div className="settings-row">
+            <input
+              type="text"
+              className="settings-key-input"
+              aria-label="Server id"
+              data-mcp-draft-id
+              placeholder="id (e.g. weather)"
+              value={serverDraft.id}
+              onChange={(event) =>
+                setServerDraft((draft) => ({ ...draft, id: event.target.value }))
+              }
+            />
+            <select
+              className="settings-select"
+              aria-label="Server transport"
+              data-mcp-draft-transport={serverDraft.transport}
+              value={serverDraft.transport}
+              onChange={(event) =>
+                setServerDraft((draft) => ({
+                  ...draft,
+                  transport: event.target.value as McpTransport,
+                }))
+              }
+            >
+              {MCP_TRANSPORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            {serverDraft.transport === "http" ? (
+              <>
+                <input
+                  type="text"
+                  className="settings-key-input"
+                  aria-label="Server URL"
+                  data-mcp-draft-url
+                  placeholder="url (e.g. https://mcp.example.com/sse)"
+                  value={serverDraft.url}
+                  onChange={(event) =>
+                    setServerDraft((draft) => ({ ...draft, url: event.target.value }))
+                  }
+                />
+                <input
+                  type="password"
+                  className="settings-key-input"
+                  aria-label="Server bearer token"
+                  data-mcp-draft-token
+                  placeholder="bearer token (optional)"
+                  value={serverDraft.token}
+                  onChange={(event) =>
+                    setServerDraft((draft) => ({ ...draft, token: event.target.value }))
+                  }
+                />
+              </>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  className="settings-key-input"
+                  aria-label="Server command"
+                  data-mcp-draft-command
+                  placeholder="command (e.g. npx)"
+                  value={serverDraft.command}
+                  onChange={(event) =>
+                    setServerDraft((draft) => ({ ...draft, command: event.target.value }))
+                  }
+                />
+                <input
+                  type="text"
+                  className="settings-key-input"
+                  aria-label="Server args"
+                  data-mcp-draft-args
+                  placeholder="args (space-separated)"
+                  value={serverDraft.args}
+                  onChange={(event) =>
+                    setServerDraft((draft) => ({ ...draft, args: event.target.value }))
+                  }
+                />
+              </>
+            )}
+            <button
+              type="button"
+              className="settings-refresh"
+              data-mcp-server-add
+              disabled={mcp.servers === null || !draftReady}
+              onClick={addServer}
+            >
+              Add
+            </button>
+          </div>
+          <p className="settings-hint">
+            Remote (HTTP/SSE) servers connect to a URL with an optional bearer
+            token stored in your OS keychain — never in settings.json.
+          </p>
+          {mcp.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Server list couldn't be saved</strong>
+              <span>{mcp.persistError}</span>
+            </div>
           )}
         </section>
 

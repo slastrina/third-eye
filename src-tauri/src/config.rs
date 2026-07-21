@@ -389,6 +389,257 @@ pub fn save_hid_run_mode(
     Ok(())
 }
 
+/// Store key holding the MCP run mode (M007 S04, D038 twin) — the three-way
+/// gate for external MCP tool actions, the MCP twin of [`HID_RUN_MODE_KEY`].
+/// Absent means `off` — the default and the structurally-inert state; there is
+/// no env fallback. The value is the kebab-case wire name of
+/// [`crate::llm::mcp::McpRunMode`] (`off`/`ask`/`auto-run`), so garbage in the
+/// store must fail safe to `off` (never silently let an external server's tools
+/// run without approval, R016).
+pub const MCP_RUN_MODE_KEY: &str = "mcpRunMode";
+
+/// Read the persisted MCP run mode. `None` means nothing usable is persisted
+/// (no store, no key — both logged where relevant): the caller keeps the default
+/// (`off`, inert).
+pub fn load_mcp_run_mode(app: &AppHandle) -> Option<crate::llm::mcp::McpRunMode> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(MCP_RUN_MODE_KEY)?;
+    Some(stored_mcp_run_mode(&value))
+}
+
+/// Interpret one stored MCP run-mode value. Only a recognized kebab-case mode
+/// tag (`off`/`ask`/`auto-run`) is trusted; anything else — an unknown string, a
+/// non-string, or null — is logged and treated as `off` (inert) rather than
+/// silently letting an external server's tools run without approval on garbage
+/// data. `off` is the only safe fallback for the MCP gate (R016).
+fn stored_mcp_run_mode(value: &serde_json::Value) -> crate::llm::mcp::McpRunMode {
+    match serde_json::from_value::<crate::llm::mcp::McpRunMode>(value.clone()) {
+        Ok(mode) => mode,
+        Err(_) => {
+            log::warn!("config: {MCP_RUN_MODE_KEY} holds unrecognized value {value}; treating as off");
+            crate::llm::mcp::McpRunMode::Off
+        }
+    }
+}
+
+/// Persist the MCP run mode. The error names the failed persist path; the caller
+/// (the MCP applier, T02) rolls the in-memory mode back so an unpersisted choice
+/// can never silently revert on restart (hotkey precedent).
+pub fn save_mcp_run_mode(app: &AppHandle, mode: crate::llm::mcp::McpRunMode) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    let wire = serde_json::json!(mode);
+    store.set(MCP_RUN_MODE_KEY, wire.clone());
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {MCP_RUN_MODE_KEY}={wire} to {path}: {e}"))?;
+    log::info!("config: persisted {MCP_RUN_MODE_KEY}={wire} to {path}");
+    Ok(())
+}
+
+/// Store key holding the user-configured external MCP servers (M007 S04). Absent
+/// means the empty list — no external server is spawned, the default. The value
+/// is a JSON array of [`crate::llm::mcp::McpServerConfig`] records (camelCase),
+/// repaired item-by-item on load: a single corrupt entry is dropped, never
+/// nuking a good sibling, and an absent key yields an empty list.
+pub const MCP_SERVERS_KEY: &str = "mcpServers";
+
+/// Read the persisted MCP server list. `None` means nothing usable is persisted
+/// (no store, no key — both logged where relevant): the caller keeps the default
+/// (empty — no external server). A present-but-partly-garbage array is repaired
+/// entry-by-entry inside [`stored_mcp_servers`], never rejected whole.
+pub fn load_mcp_servers(app: &AppHandle) -> Option<Vec<crate::llm::mcp::McpServerConfig>> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(MCP_SERVERS_KEY)?;
+    Some(stored_mcp_servers(&value))
+}
+
+/// Interpret one stored server-list value with per-entry repair (modelled on
+/// [`stored_overlay_presentation`]'s field-by-field contract): a non-array value
+/// collapses to the empty list; each array element is parsed by
+/// [`stored_mcp_server`] and a corrupt entry is dropped and logged rather than
+/// taking the whole list down (a corrupt entry never nukes a good sibling).
+fn stored_mcp_servers(value: &serde_json::Value) -> Vec<crate::llm::mcp::McpServerConfig> {
+    let Some(items) = value.as_array() else {
+        log::warn!("config: {MCP_SERVERS_KEY} is not a JSON array (got {value}); using empty list");
+        return Vec::new();
+    };
+    items.iter().filter_map(stored_mcp_server).collect()
+}
+
+/// Interpret one stored server entry with field-level repair, transport-aware
+/// (S05). A valid entry needs a non-blank `id` plus, per its `transport`, either
+/// a non-blank `command` (stdio — nothing to spawn otherwise) or a non-blank,
+/// http(s)-parseable `url` (http — nothing to connect to otherwise); the entry is
+/// dropped and logged when that is missing/invalid. The `transport` discriminator
+/// fails safe to `stdio` when absent or unknown, so an S04 entry with no
+/// `transport` key stays the local stdio server it was. `args` is repaired to
+/// only its string elements (a non-array or non-string element is skipped, not
+/// fatal); `enabled` trusts only a JSON boolean and fails safe to `false`; an
+/// http entry's `authRef` is a trimmed non-secret reference (`None` when absent).
+/// This keeps a corrupt field from dropping an otherwise-usable entry while a
+/// structurally unusable entry (no id, or no usable spawn/connect target) is
+/// dropped — never nuking a good sibling.
+fn stored_mcp_server(value: &serde_json::Value) -> Option<crate::llm::mcp::McpServerConfig> {
+    use crate::llm::mcp::McpTransport;
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => {
+            log::warn!("config: {MCP_SERVERS_KEY} entry is not an object (got {value}); dropping it");
+            return None;
+        }
+    };
+    let trimmed_str = |key: &str| {
+        obj.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let Some(id) = trimmed_str("id") else {
+        log::warn!("config: {MCP_SERVERS_KEY} entry has no non-blank id (got {value}); dropping it");
+        return None;
+    };
+    // Transport discriminator: only "http" opts into the remote path; absent
+    // (S04 entries), "stdio", or any unknown value fails safe to the local stdio
+    // path so a garbled discriminator never routes an entry onto the network.
+    let transport = match obj.get("transport").and_then(serde_json::Value::as_str) {
+        Some("http") => McpTransport::Http,
+        Some("stdio") | None => McpTransport::Stdio,
+        Some(other) => {
+            log::warn!(
+                "config: {MCP_SERVERS_KEY} entry {id} has unknown transport {other:?}; treating as stdio"
+            );
+            McpTransport::Stdio
+        }
+    };
+    let args = match obj.get("args") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|a| match a.as_str() {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    log::warn!(
+                        "config: {MCP_SERVERS_KEY} entry {id} has a non-string arg {a}; skipping it"
+                    );
+                    None
+                }
+            })
+            .collect(),
+        Some(other) => {
+            log::warn!(
+                "config: {MCP_SERVERS_KEY} entry {id} has a non-array args {other}; treating as empty"
+            );
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let enabled = match obj.get("enabled") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        None => false,
+        Some(other) => {
+            log::warn!(
+                "config: {MCP_SERVERS_KEY} entry {id} has non-boolean enabled {other}; treating as disabled"
+            );
+            false
+        }
+    };
+    match transport {
+        McpTransport::Stdio => {
+            let Some(command) = trimmed_str("command") else {
+                log::warn!(
+                    "config: {MCP_SERVERS_KEY} entry {id} (stdio) has no non-blank command (got {value}); dropping it"
+                );
+                return None;
+            };
+            // url/auth_ref are meaningless for stdio — repaired away to the
+            // canonical stdio shape rather than carried as dead data.
+            Some(crate::llm::mcp::McpServerConfig {
+                id,
+                command,
+                args,
+                enabled,
+                transport,
+                url: None,
+                auth_ref: None,
+            })
+        }
+        McpTransport::Http => {
+            let Some(url) = trimmed_str("url") else {
+                log::warn!(
+                    "config: {MCP_SERVERS_KEY} entry {id} (http) has no non-blank url (got {value}); dropping it"
+                );
+                return None;
+            };
+            if !is_http_url(&url) {
+                log::warn!(
+                    "config: {MCP_SERVERS_KEY} entry {id} (http) has an invalid url {url}; dropping it"
+                );
+                return None;
+            }
+            // command is unused for http; carry any trimmed value but never let
+            // its absence drop the entry.
+            let command = trimmed_str("command").unwrap_or_default();
+            Some(crate::llm::mcp::McpServerConfig {
+                id,
+                command,
+                args,
+                enabled,
+                transport,
+                url: Some(url),
+                auth_ref: trimmed_str("authRef"),
+            })
+        }
+    }
+}
+
+/// Whether `candidate` is a usable remote MCP endpoint: a syntactically valid
+/// URL with an `http`/`https` scheme and a host. Rejects blanks, relative refs,
+/// and non-web schemes (`ws://`, `file://`) so a corrupt http entry is dropped
+/// by [`stored_mcp_server`] rather than handed to the transport at connect time.
+fn is_http_url(candidate: &str) -> bool {
+    match url::Url::parse(candidate) {
+        Ok(parsed) => matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Persist the MCP server list as one composite JSON array. The error names the
+/// failed persist path; the caller (the settings command, T04) rolls the
+/// in-memory list back and surfaces the failure as data so an unpersisted change
+/// can never silently revert on restart (hotkey/opt-in precedent).
+pub fn save_mcp_servers(
+    app: &AppHandle,
+    servers: &[crate::llm::mcp::McpServerConfig],
+) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    let wire = serde_json::to_value(servers)
+        .map_err(|e| format!("failed to serialize {MCP_SERVERS_KEY}: {e}"))?;
+    store.set(MCP_SERVERS_KEY, wire.clone());
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {MCP_SERVERS_KEY}={wire} to {path}: {e}"))?;
+    log::info!("config: persisted {MCP_SERVERS_KEY} ({} server(s)) to {path}", servers.len());
+    Ok(())
+}
+
 /// Store key holding the heavy-lane cloud provider selection (M004 S04).
 /// Absent/null means no cloud provider is selected — the default. The value is
 /// the provider's kebab-case wire name ("openai" / "anthropic"), kept
@@ -888,6 +1139,99 @@ pub fn save_overlay_presentation(
     Ok(())
 }
 
+/// Store key holding the skills-discovery directory (M007 S06). Absent, blank,
+/// or garbage means the default — `app_data_dir/skills` resolved by
+/// [`default_skills_dir`]. The value is a filesystem path string; users drop
+/// `<name>/SKILL.md` packs into this directory and the pure skills module (S06
+/// T02) walks it, so a corrupt value must fail safe to the default discovery
+/// directory rather than sending the walker at a garbage path.
+pub const SKILLS_DIR_KEY: &str = "skillsDir";
+
+/// The app-data-relative subdirectory used as the default skills-discovery
+/// directory when nothing usable is persisted.
+pub const SKILLS_DIR_DEFAULT_SUBDIR: &str = "skills";
+
+/// Read the persisted skills-discovery directory. `None` means nothing usable
+/// is persisted (no store, no key, or garbage — all logged where relevant): the
+/// caller resolves the default via [`default_skills_dir`] / [`resolve_skills_dir`].
+/// `Some(dir)` is a user-set, non-blank path.
+pub fn load_skills_dir(app: &AppHandle) -> Option<String> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(SKILLS_DIR_KEY)?;
+    stored_skills_dir(&value)
+}
+
+/// Interpret one stored skills-directory value (the `stored_model_pin` template:
+/// a trimmed string). A non-blank string is trusted (trimmed); a blank string,
+/// null, or non-string is logged and treated as unset (`None`) so the caller
+/// falls back to the default discovery directory rather than walking a garbage
+/// path — the fail-soft direction here is "use the default skills dir" (R006/R007).
+fn stored_skills_dir(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                log::warn!(
+                    "config: {SKILLS_DIR_KEY} holds a blank string; using default skills dir"
+                );
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Null => None,
+        other => {
+            log::warn!(
+                "config: {SKILLS_DIR_KEY} holds non-string value {other}; using default skills dir"
+            );
+            None
+        }
+    }
+}
+
+/// Persist the skills-discovery directory. The error names the failed persist
+/// path; the caller rolls its in-memory value back so an unpersisted change can
+/// never silently revert on restart (hotkey precedent).
+pub fn save_skills_dir(app: &AppHandle, dir: &str) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(SKILLS_DIR_KEY, serde_json::json!(dir));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {SKILLS_DIR_KEY}='{dir}' to {path}: {e}"))?;
+    log::info!("config: persisted {SKILLS_DIR_KEY}='{dir}' to {path}");
+    Ok(())
+}
+
+/// The default skills-discovery directory: `app_data_dir/skills`, falling back
+/// to the bare `skills` relative path if the app data dir cannot be resolved
+/// (mirrors [`store_path`]'s fallback — a resolution failure is never fatal).
+pub fn default_skills_dir(app: &AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(SKILLS_DIR_DEFAULT_SUBDIR))
+        .unwrap_or_else(|_| std::path::PathBuf::from(SKILLS_DIR_DEFAULT_SUBDIR))
+}
+
+/// Resolve the effective skills-discovery directory the walker (S06 T02/T04)
+/// should scan: the user-set path when one is persisted and usable, else the
+/// default from [`default_skills_dir`]. This is the single seam that folds the
+/// "unset or garbage → safe default" contract into one call for the caller.
+pub fn resolve_skills_dir(app: &AppHandle) -> std::path::PathBuf {
+    match load_skills_dir(app) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => default_skills_dir(app),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1351,262 @@ mod tests {
         ] {
             assert_eq!(stored_hid_run_mode(&bad), HidRunMode::Off, "bad value: {bad}");
         }
+    }
+
+    #[test]
+    fn stored_mcp_run_mode_round_trips_each_mode() {
+        // The persist round-trip proven at the interpreter level (the same level
+        // every other config test proves at): the wire tag save_mcp_run_mode
+        // writes reads back to the same mode. Covers all three of Off/Ask/AutoRun.
+        use crate::llm::mcp::McpRunMode;
+        for mode in [McpRunMode::Off, McpRunMode::Ask, McpRunMode::AutoRun] {
+            let stored = serde_json::json!(mode);
+            assert_eq!(stored_mcp_run_mode(&stored), mode, "wire form: {stored}");
+        }
+        // The exact kebab-case strings the store holds and src/chat.ts keys on.
+        assert_eq!(stored_mcp_run_mode(&serde_json::json!("off")), McpRunMode::Off);
+        assert_eq!(stored_mcp_run_mode(&serde_json::json!("ask")), McpRunMode::Ask);
+        assert_eq!(stored_mcp_run_mode(&serde_json::json!("auto-run")), McpRunMode::AutoRun);
+    }
+
+    #[test]
+    fn stored_garbage_mcp_run_mode_is_treated_as_off() {
+        // R016: garbage in the store must never silently let an external
+        // server's tools run without approval — off (inert) is the only safe
+        // fallback for the MCP gate. Unknown tags, wrong case, non-strings, and
+        // null all collapse to Off.
+        use crate::llm::mcp::McpRunMode;
+        for bad in [
+            serde_json::json!("on"),
+            serde_json::json!("Ask"),
+            serde_json::json!("auto_run"),
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+            serde_json::json!({"mode": "ask"}),
+            serde_json::json!(["ask"]),
+        ] {
+            assert_eq!(stored_mcp_run_mode(&bad), McpRunMode::Off, "bad value: {bad}");
+        }
+    }
+
+    #[test]
+    fn stored_mcp_servers_round_trips_a_serialized_list() {
+        // The persist round-trip proven at the interpreter level: the JSON
+        // save_mcp_servers writes reads back to the same list, args + enabled
+        // preserved.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        let servers = vec![
+            McpServerConfig {
+                id: "everything".to_string(),
+                command: "npx".to_string(),
+                args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+                enabled: true,
+                transport: McpTransport::Stdio,
+                url: None,
+                auth_ref: None,
+            },
+            McpServerConfig {
+                id: "local".to_string(),
+                command: "./server".to_string(),
+                args: vec![],
+                enabled: false,
+                transport: McpTransport::Stdio,
+                url: None,
+                auth_ref: None,
+            },
+        ];
+        let wire = serde_json::to_value(&servers).unwrap();
+        assert_eq!(stored_mcp_servers(&wire), servers);
+    }
+
+    #[test]
+    fn stored_mcp_servers_absent_or_non_array_is_empty() {
+        // Absent key → empty list (the default: no external server). A
+        // wholesale-garbage value (string, number, object, null) also collapses
+        // to empty rather than erroring.
+        for bad in [
+            serde_json::json!("everything"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!({ "id": "x", "command": "y" }),
+        ] {
+            assert!(stored_mcp_servers(&bad).is_empty(), "bad value: {bad}");
+        }
+    }
+
+    #[test]
+    fn stored_mcp_servers_drops_a_corrupt_entry_but_keeps_good_siblings() {
+        // Per-item repair (the acceptance seam): a corrupt entry (missing
+        // command, blank id, non-object) is dropped and logged, never nuking a
+        // good sibling.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        let value = serde_json::json!([
+            { "id": "good", "command": "npx", "args": ["-y", "pkg"], "enabled": true },
+            { "id": "no-command" },                       // missing command → dropped
+            { "id": "   ", "command": "run" },            // blank id → dropped
+            "not-an-object",                               // non-object → dropped
+            { "id": "second", "command": "./srv" }        // minimal, valid → kept
+        ]);
+        let got = stored_mcp_servers(&value);
+        assert_eq!(
+            got,
+            vec![
+                McpServerConfig {
+                    id: "good".to_string(),
+                    command: "npx".to_string(),
+                    args: vec!["-y".to_string(), "pkg".to_string()],
+                    enabled: true,
+                    transport: McpTransport::Stdio,
+                    url: None,
+                    auth_ref: None,
+                },
+                McpServerConfig {
+                    id: "second".to_string(),
+                    command: "./srv".to_string(),
+                    args: vec![],
+                    enabled: false,
+                    transport: McpTransport::Stdio,
+                    url: None,
+                    auth_ref: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stored_mcp_server_repairs_corrupt_fields_within_a_usable_entry() {
+        // Field-level repair: a usable entry (valid id + command) survives even
+        // when args is garbage or enabled is non-boolean — the bad field falls
+        // back (args → only its string elements, enabled → false), the entry is
+        // NOT dropped. id/command are trimmed.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        // Non-array args → empty; non-boolean enabled → false; fields trimmed.
+        let entry = serde_json::json!({ "id": "  x  ", "command": " run ", "args": "nope", "enabled": "yes" });
+        assert_eq!(
+            stored_mcp_server(&entry),
+            Some(McpServerConfig {
+                id: "x".to_string(),
+                command: "run".to_string(),
+                args: vec![],
+                enabled: false,
+                transport: McpTransport::Stdio,
+                url: None,
+                auth_ref: None,
+            })
+        );
+        // Array args with a non-string element → only the string args survive.
+        let entry = serde_json::json!({ "id": "y", "command": "srv", "args": ["--flag", 42, "--other"] });
+        assert_eq!(
+            stored_mcp_server(&entry).unwrap().args,
+            vec!["--flag".to_string(), "--other".to_string()]
+        );
+    }
+
+    #[test]
+    fn stored_mcp_server_without_transport_defaults_to_stdio() {
+        // Back-compat: an S04 entry has no `transport` key, so repair must keep
+        // treating it as a stdio server (non-blank command required, url/auth_ref
+        // None) rather than mis-routing or dropping it.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        let entry = serde_json::json!({ "id": "everything", "command": "npx", "enabled": true });
+        assert_eq!(
+            stored_mcp_server(&entry),
+            Some(McpServerConfig {
+                id: "everything".to_string(),
+                command: "npx".to_string(),
+                args: vec![],
+                enabled: true,
+                transport: McpTransport::Stdio,
+                url: None,
+                auth_ref: None,
+            })
+        );
+    }
+
+    #[test]
+    fn stored_mcp_server_keeps_a_valid_http_entry_with_auth_ref() {
+        // An http entry with a valid https url + authRef is kept; command is
+        // unused (empty ok). url/authRef are trimmed and carried through.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        let entry = serde_json::json!({
+            "id": " weather ",
+            "transport": "http",
+            "url": "  https://mcp.example.com/sse  ",
+            "authRef": " mcp:weather ",
+            "enabled": true
+        });
+        assert_eq!(
+            stored_mcp_server(&entry),
+            Some(McpServerConfig {
+                id: "weather".to_string(),
+                command: String::new(),
+                args: vec![],
+                enabled: true,
+                transport: McpTransport::Http,
+                url: Some("https://mcp.example.com/sse".to_string()),
+                auth_ref: Some("mcp:weather".to_string()),
+            })
+        );
+        // authRef is optional — an unauthenticated http server round-trips with None.
+        let entry = serde_json::json!({ "id": "open", "transport": "http", "url": "http://localhost:9000/mcp" });
+        let got = stored_mcp_server(&entry).unwrap();
+        assert_eq!(got.transport, McpTransport::Http);
+        assert_eq!(got.auth_ref, None);
+    }
+
+    #[test]
+    fn stored_mcp_servers_drops_a_corrupt_http_entry_but_keeps_good_siblings() {
+        // Transport-aware per-entry repair: an http entry with a blank or
+        // unparseable/non-web url is dropped (nothing to connect to), while a
+        // valid http sibling and a valid stdio sibling both survive.
+        use crate::llm::mcp::{McpServerConfig, McpTransport};
+        let value = serde_json::json!([
+            { "id": "good-http", "transport": "http", "url": "https://a.example/mcp", "enabled": true },
+            { "id": "blank-url", "transport": "http", "url": "   " },          // blank url → dropped
+            { "id": "no-url", "transport": "http" },                             // missing url → dropped
+            { "id": "bad-scheme", "transport": "http", "url": "ftp://x/y" },     // non-web scheme → dropped
+            { "id": "relative", "transport": "http", "url": "/just/a/path" },    // unparseable → dropped
+            { "id": "good-stdio", "command": "./srv" }                           // stdio sibling → kept
+        ]);
+        let got = stored_mcp_servers(&value);
+        assert_eq!(
+            got,
+            vec![
+                McpServerConfig {
+                    id: "good-http".to_string(),
+                    command: String::new(),
+                    args: vec![],
+                    enabled: true,
+                    transport: McpTransport::Http,
+                    url: Some("https://a.example/mcp".to_string()),
+                    auth_ref: None,
+                },
+                McpServerConfig {
+                    id: "good-stdio".to_string(),
+                    command: "./srv".to_string(),
+                    args: vec![],
+                    enabled: false,
+                    transport: McpTransport::Stdio,
+                    url: None,
+                    auth_ref: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stored_mcp_server_unknown_transport_fails_safe_to_stdio() {
+        // A garbled transport discriminator must never route an entry onto the
+        // network: it falls back to stdio, so a non-blank command is then
+        // required (present here → kept as stdio).
+        use crate::llm::mcp::McpTransport;
+        let entry = serde_json::json!({ "id": "x", "transport": "grpc", "command": "run", "url": "https://a/b" });
+        let got = stored_mcp_server(&entry).unwrap();
+        assert_eq!(got.transport, McpTransport::Stdio);
+        assert_eq!(got.command, "run");
+        assert_eq!(got.url, None);
     }
 
     #[test]
@@ -1342,6 +1942,37 @@ mod tests {
                 OverlayPresentation::default(),
                 "bad value: {bad}"
             );
+        }
+    }
+
+    #[test]
+    fn stored_skills_dir_trims_a_non_blank_path() {
+        // A user-set discovery directory is trusted and trimmed, like a lane pin.
+        assert_eq!(
+            stored_skills_dir(&serde_json::json!("  /Users/me/skills  ")),
+            Some("/Users/me/skills".into())
+        );
+        assert_eq!(
+            stored_skills_dir(&serde_json::json!("skills")),
+            Some("skills".into())
+        );
+    }
+
+    #[test]
+    fn stored_blank_or_garbage_skills_dir_is_unset() {
+        // R006/R007: a blank string, null, or non-string value must never send
+        // the walker at a garbage path — None means "fall back to the default
+        // discovery directory" (resolve_skills_dir → default_skills_dir).
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(["/skills"]),
+            serde_json::json!({ "dir": "/skills" }),
+        ] {
+            assert_eq!(stored_skills_dir(&bad), None, "bad value: {bad}");
         }
     }
 }

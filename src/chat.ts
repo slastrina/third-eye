@@ -495,6 +495,53 @@ export function respondHidApproval(
 }
 
 // ---------------------------------------------------------------------------
+// MCP per-tool approval IPC (S04/M007) — contract defined in
+// src-tauri/src/llm/commands.rs (event + payload) and the pure resolver in
+// src-tauri/src/llm/mcp.rs. The MCP twin of the HID approval contract above.
+// ---------------------------------------------------------------------------
+
+/** MCP approval-request broadcast: the backend MCP approval gate emits this when
+ *  an Ask-mode external tool call whose namespaced name is not yet allowlisted
+ *  needs the user's decision, and awaits a `respond_mcp_approval` reply. Keep in
+ *  sync with MCP_APPROVAL_EVENT in src-tauri/src/llm/commands.rs (pinned by a Rust
+ *  test and its TS twin). */
+export const MCP_APPROVAL_EVENT = "mcp://approval-request";
+
+/** The `mcp://approval-request` payload — the serde camelCase serialization of
+ *  Rust's McpApprovalRequestPayload. Pixel-free: a correlation id, the namespaced
+ *  tool name, and a bounded human summary (the tool name plus a short argument
+ *  preview) the overlay shows; never a screenshot or the full arguments (R011). */
+export interface McpApprovalRequest {
+  approvalId: number;
+  toolName: string;
+  summary: string;
+}
+
+/** The user's answer to an MCP approval prompt — the kebab-case wire strings
+ *  Rust's McpApprovalVerdict deserializes. Keyed on the tool NAME (not a fixed
+ *  kind like the HID twin): "allow-once" performs this one call; "allow-tool"
+ *  also allowlists that exact namespaced tool name for the session; "deny"
+ *  refuses. A missing/garbage verdict is rejected backend-side (fail-closed). */
+export type McpApprovalVerdict = "allow-once" | "allow-tool" | "deny";
+
+/** Subscribe to the MCP approval-request broadcast (`mcp://approval-request`). */
+export function onMcpApprovalRequest(
+  cb: (request: McpApprovalRequest) => void,
+): Promise<UnlistenFn> {
+  return listen<McpApprovalRequest>(MCP_APPROVAL_EVENT, (e) => cb(e.payload));
+}
+
+/** Deliver the user's verdict for a pending MCP tool-call approval. Resolves to
+ *  whether a live waiter received it (`false` if the gate already timed out) —
+ *  safe to fire-and-forget; the backend never rejects. */
+export function respondMcpApproval(
+  approvalId: number,
+  verdict: McpApprovalVerdict,
+): Promise<boolean> {
+  return invoke<boolean>("respond_mcp_approval", { approvalId, verdict });
+}
+
+// ---------------------------------------------------------------------------
 // Chat run-state + Stop control IPC (S04 T04) — contract defined in
 // src-tauri/src/llm/commands.rs
 // ---------------------------------------------------------------------------
