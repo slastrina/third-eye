@@ -87,8 +87,11 @@ mod platform {
             .map_err(|e| format!("settings NSPanel conversion failed: {e}"))?;
 
         // Nonactivating: the panel can become key (accept clicks and typing)
-        // without activating the app.
-        panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+        // without activating the app. Resizable: the conversion replaces the
+        // style mask, so the config's `resizable: true` must be re-asserted
+        // here or edge-drag resizing dies with the mask swap (borderless +
+        // Resizable gives edge-drag handles without a title bar).
+        panel.set_style_mask(StyleMask::empty().nonactivating_panel().resizable().into());
         // Floating: above normal windows but below the overlay's MainMenu+1 —
         // the overlay must stay on top if both are visible.
         panel.set_level(PanelLevel::Floating.value());
@@ -198,6 +201,10 @@ mod tests {
             .expect("settings window declared in tauri.conf.json");
         assert_eq!(win["visible"], false, "must be created hidden");
         assert_eq!(win["decorations"], false, "must be borderless");
+        assert_eq!(
+            win["resizable"], true,
+            "must be user-resizable (the NSPanel style mask re-asserts this on macOS)"
+        );
         assert_eq!(win["url"], "index.html?view=settings", "must render the settings view");
         assert_eq!(win["focus"], false, "must not request focus at creation");
     }

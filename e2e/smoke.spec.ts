@@ -64,8 +64,8 @@ test("drawer mode swaps the corner grip for an inner-edge resize handle", async 
   // SouthEast corner grip must NOT render (it would resize a full-span
   // left/right drawer's height and fight the anchor). Both live inside
   // .overlay-panel so pointer-events tracks overlay state (MEM148), never
-  // data-edge. Native startResizeDragging is manual-only (live NSPanel);
-  // here we assert the DOM contract.
+  // data-edge. The pointer-drag resize itself needs the live Tauri window
+  // (manual-only); here we assert the DOM contract.
   await page.goto("/?edge=left");
   const panel = page.locator(".overlay-panel");
   const edgeHandle = panel.locator(".overlay-drawer-resize-edge");

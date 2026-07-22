@@ -86,7 +86,7 @@ const section = (page: Page) =>
   page.locator("section", { has: page.locator("#settings-watcher-heading") });
 
 test("watcher section degrades to a named unavailable state outside Tauri", async ({ page }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
   await expect(watcher.getByRole("heading", { name: "Watch Screen" })).toBeVisible();
   // watcher_status rejects → toggle disabled with a named note, not a crash.
@@ -102,7 +102,7 @@ test("watcher section degrades to a named unavailable state outside Tauri", asyn
 
 test("live status renders and the toggle drives set_watcher_enabled", async ({ page }) => {
   await installWatcherIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
   const toggle = page.getByRole("checkbox", { name: "Watch Screen" });
   const state = watcher.locator(".settings-status-value");
@@ -128,7 +128,7 @@ test("live status renders and the toggle drives set_watcher_enabled", async ({ p
 
 test("watcher://observation feeds the snippet list, newest first, capped at 5", async ({ page }) => {
   await installWatcherIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
   await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeEnabled();
 
@@ -170,7 +170,7 @@ test("watcher://observation feeds the snippet list, newest first, capped at 5", 
 
 test("watcher://state broadcasts drive privacy pause and typed tick errors", async ({ page }) => {
   await installWatcherIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
   const state = watcher.locator(".settings-status-value");
   await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeEnabled();

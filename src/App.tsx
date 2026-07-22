@@ -50,12 +50,15 @@ import {
 } from "./overlay-state";
 import {
   centeredModalRect,
+  draggedExtent,
+  draggedModalSize,
   drawerRect,
   extentFromSize,
   isOnScreen,
-  RESIZE_GRIP_DIRECTION,
-  resizeDirectionForEdge,
   type Edge,
+  type OverlayPoint,
+  type OverlaySize,
+  type WorkArea,
 } from "./overlay-geometry";
 import {
   drawerEdgeOf,
@@ -541,13 +544,14 @@ function App() {
     );
   };
 
-  // Geometry (M006/S01): the header drags the whole panel, the corner grip
-  // resizes it — both via Tauri's native window drag on the same NSWindow the
-  // nonactivating NSPanel wraps, so moving/resizing never activates the app or
-  // voids click-through (D018). These live inside .overlay-panel, whose
-  // pointer-events is auto only in visible-focused, so an idle click-through
-  // overlay is not draggable — the correct security posture. Rejections here
-  // are benign (e.g. no Tauri runtime under vite dev), so absorb-and-log.
+  // Geometry (M006/S01): the header drags the whole panel via Tauri's native
+  // window drag (performWindowDragWithEvent — supported on macOS, unlike
+  // resize dragging); resizing is the JS drag loop below. Neither activates
+  // the app or voids click-through (D018). Both affordances live inside
+  // .overlay-panel, whose pointer-events is auto only in visible-focused, so
+  // an idle click-through overlay is not draggable — the correct security
+  // posture. Rejections here are benign (e.g. no Tauri runtime under vite
+  // dev), so absorb-and-log.
   const startPanelDrag = (event: React.MouseEvent) => {
     // Only a primary-button drag on the header moves the window; let clicks on
     // interactive children (buttons) through unmolested.
@@ -557,34 +561,132 @@ function App() {
       .catch((err) => console.debug("overlay: startDragging no-op:", err));
   };
 
-  const startPanelResize = (event: React.MouseEvent) => {
+  // Pointer-driven resize (M006/S03 fix): tao's drag_resize_window is
+  // NotSupported on macOS, so the native startResizeDragging this used to call
+  // silently no-oped there — the drawer's inner-edge bar and the modal corner
+  // grip rendered but dragging them did nothing. One JS loop now drives resize
+  // on every platform: at mousedown, snapshot the window's logical size and the
+  // active work area; on each mousemove, turn the pointer delta (screenX/Y —
+  // stable while the window itself moves/resizes; clientX/Y would drift) into a
+  // new rect via the pure dragged* helpers and apply it, latest-wins so a fast
+  // drag never queues stale rects behind slow IPC. Releasing anywhere ends the
+  // drag and persists via persistResizeEnd — a bar-local mouseup can't be
+  // relied on once the cursor leaves the 8px affordance. Outside a Tauri
+  // runtime the snapshot rejects and no listeners attach (absorb-and-log).
+  // `rectFor` returning null skips that move (nothing to anchor against).
+  const driveResizeDrag = (
+    event: React.MouseEvent,
+    rectFor: (
+      start: { size: OverlaySize; workArea: WorkArea | null },
+      from: OverlayPoint,
+      to: OverlayPoint,
+    ) => { x?: number; y?: number; width: number; height: number } | null,
+  ) => {
     if (event.button !== 0) return;
-    getCurrentWindow()
-      .startResizeDragging(RESIZE_GRIP_DIRECTION)
-      .catch((err) => console.debug("overlay: startResizeDragging no-op:", err));
+    const from = { x: event.screenX, y: event.screenY };
+    Promise.resolve()
+      .then(() => {
+        const win = getCurrentWindow();
+        return Promise.all([win.innerSize(), win.scaleFactor(), currentMonitor()]);
+      })
+      .then(([size, scale, monitor]) => {
+        const logical = size.toLogical(scale);
+        const start = {
+          size: { width: logical.width, height: logical.height },
+          workArea: monitor
+            ? { ...monitor.workArea, scaleFactor: monitor.scaleFactor }
+            : null,
+        };
+        const win = getCurrentWindow();
+        let latest: { x?: number; y?: number; width: number; height: number } | null =
+          null;
+        let inFlight = false;
+        let released = false;
+        // Persist only once the queue is drained — reading innerSize() while
+        // the final setSize is still in flight would persist a stale extent,
+        // and the broadcast re-apply would then visibly nudge the window.
+        const maybeFinish = () => {
+          if (released && !inFlight && !latest) persistResizeEnd();
+        };
+        const pump = () => {
+          if (inFlight || !latest) return;
+          const rect = latest;
+          latest = null;
+          inFlight = true;
+          const ops: Promise<unknown>[] = [
+            win.setSize(new LogicalSize(rect.width, rect.height)),
+          ];
+          if (rect.x !== undefined && rect.y !== undefined) {
+            ops.push(win.setPosition(new LogicalPosition(rect.x, rect.y)));
+          }
+          Promise.all(ops)
+            .catch((err) => console.debug("overlay: resize apply no-op:", err))
+            .finally(() => {
+              inFlight = false;
+              pump();
+              maybeFinish();
+            });
+        };
+        const onMove = (move: MouseEvent) => {
+          const rect = rectFor(start, from, { x: move.screenX, y: move.screenY });
+          if (rect) {
+            latest = rect;
+            pump();
+          }
+        };
+        const onUp = () => {
+          window.removeEventListener("mousemove", onMove);
+          window.removeEventListener("mouseup", onUp);
+          released = true;
+          maybeFinish();
+        };
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+      })
+      .catch((err) => console.debug("overlay: resize drag no-op:", err));
   };
 
-  // Drawer resize (M006/S03): in drawer mode the draggable affordance is the
-  // INNER edge (the one facing the screen interior), which grows the drawer's
-  // variable dimension via native startResizeDragging toward that direction.
-  // resizeDirectionForEdge maps the docked edge to it (left→East, right→West,
-  // top→South, bottom→North) so the drag grows inward instead of fighting the
-  // anchor. Same native-resize, non-activating, absorb-and-log posture as
-  // startPanelResize (D018); releasing leaves the new extent (S04 reads it back
-  // via innerSize()+extentFromSize to persist). The guard also narrows drawerEdge
-  // to non-null — the handle only renders in drawer mode, so this never no-ops
-  // in practice, but keeps the type honest without a non-null assertion.
+  // Modal (floating) corner grip: anchored top-left, both axes grow with the
+  // pointer; position never changes, so only setSize fires.
+  const startPanelResize = (event: React.MouseEvent) => {
+    driveResizeDrag(event, (start, from, to) => draggedModalSize(start.size, from, to));
+  };
+
+  // Drawer resize (M006/S03): the draggable affordance is the INNER edge bar
+  // (the one facing the screen interior — CSS positions it per data-edge), and
+  // only the drawer's variable axis changes. draggedExtent folds in the grow
+  // direction (left→+x, right→−x, top→+y, bottom→−y) so the drag grows inward
+  // instead of fighting the anchor, and drawerRect re-anchors the rect flush to
+  // the docked edge — a right/bottom drawer moves its origin as it grows. The
+  // extent is capped at the work-area span; with no monitor to anchor against
+  // (headless/detached) the move is skipped, same posture as the snap effect.
+  // The guard also narrows drawerEdge to non-null — the bar only renders in
+  // drawer mode, so this never no-ops in practice, but keeps the type honest.
   const startDrawerResize = (event: React.MouseEvent) => {
-    if (event.button !== 0 || !drawerEdge) return;
-    getCurrentWindow()
-      .startResizeDragging(resizeDirectionForEdge(drawerEdge))
-      .catch((err) => console.debug("overlay: startResizeDragging no-op:", err));
+    if (!drawerEdge) return;
+    const edge = drawerEdge;
+    driveResizeDrag(event, (start, from, to) => {
+      if (!start.workArea) return null;
+      const scale = start.workArea.scaleFactor;
+      const span =
+        edge === "left" || edge === "right"
+          ? start.workArea.size.width / scale
+          : start.workArea.size.height / scale;
+      const extent = draggedExtent(
+        edge,
+        extentFromSize(edge, start.size),
+        from,
+        to,
+        span,
+      );
+      return drawerRect(start.workArea, edge, extent);
+    });
   };
 
   // Persist a live resize (M006/S04): consumes the S03 extentFromSize read-back
-  // seam. On the resize affordance's mouseup — after native startResizeDragging
-  // hands the window back — read innerSize() (PHYSICAL px), convert to logical
-  // via the window scale factor (the pixels-vs-points boundary drawerRect also
+  // seam. Called by the drag loop's window-level mouseup once the last rect has
+  // been applied — read innerSize() (PHYSICAL px), convert to logical via the
+  // window scale factor (the pixels-vs-points boundary drawerRect also
   // honours), derive the mode's extent, and invoke set_overlay_extent so the new
   // shape is saved. The backend floors + persists and broadcasts the result,
   // which re-applies through the effect above — idempotent because extentFromSize
@@ -1150,14 +1252,12 @@ function App() {
             className="overlay-drawer-resize-edge"
             data-edge={drawerEdge}
             onMouseDown={startDrawerResize}
-            onMouseUp={persistResizeEnd}
             aria-hidden="true"
           />
         ) : (
           <div
             className="overlay-resize-grip"
             onMouseDown={startPanelResize}
-            onMouseUp={persistResizeEnd}
             aria-hidden="true"
           />
         )}

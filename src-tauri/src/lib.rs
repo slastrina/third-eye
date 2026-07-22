@@ -124,7 +124,6 @@ pub fn run() {
     builder
         .manage(overlay::OverlayManager::new())
         .manage(guard.clone())
-        .manage(llm::commands::LlmState::with_default_endpoint(guard))
         .manage(capture::commands::CaptureState::with_platform_backend())
         // HID input (M005/S01): the managed InputControl backend the composite
         // executor's InputTool draws from — enigo-backed on macOS, typed
@@ -179,6 +178,8 @@ pub fn run() {
             llm::commands::set_lane_model,
             llm::commands::list_models,
             llm::commands::model_info,
+            llm::commands::llm_endpoint_status,
+            llm::commands::set_llm_endpoint,
             llm::commands::guard_status,
             llm::commands::respond_hid_approval,
             llm::commands::stop_chat,
@@ -228,11 +229,23 @@ pub fn run() {
             onboarding::request_input_permission,
             onboarding::complete_first_run
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // Accessory policy: no Dock icon, and the app can never become
             // the active app — the overlay must never steal frontmost status.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // LLM chat state (S05 endpoint configurability): constructed here
+            // rather than at builder time because the persisted endpoint
+            // override lives in the settings store, which needs a live app
+            // handle. Managed before everything that reads it below (persisted
+            // lane pins, cloud routing, the ingest/nudge spawns); IPC cannot
+            // race this — setup completes before the event loop dispatches
+            // commands.
+            app.manage(llm::commands::LlmState::with_configured_endpoint(
+                app.handle(),
+                guard.clone(),
+            ));
 
             let overlay_window = app
                 .get_webview_window(OVERLAY_WINDOW_LABEL)

@@ -31,8 +31,9 @@ use super::{
     ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink,
 };
 
-/// The single definition site for the LM Studio endpoint. S05 makes this
-/// user-configurable; until then every layer reads it from here.
+/// The single definition site for the default LM Studio endpoint — the
+/// fallback when neither the persisted settings override (`llmEndpoint`,
+/// S05) nor the `THIRD_EYE_ENDPOINT` env var names one.
 pub const DEFAULT_ENDPOINT: &str = "http://localhost:1234";
 
 /// Failing fast on an unreachable endpoint is what turns "offline" into a
@@ -1214,7 +1215,8 @@ mod tests {
 
     #[test]
     fn default_endpoint_matches_project_constant() {
-        // Single definition site: S05 configurability replaces this constant.
+        // Single definition site: the settings override / THIRD_EYE_ENDPOINT
+        // fall back to this constant (S05).
         assert_eq!(DEFAULT_ENDPOINT, "http://localhost:1234");
         assert_eq!(LlmClient::endpoint(&OpenAiClient::default_endpoint()), DEFAULT_ENDPOINT);
     }

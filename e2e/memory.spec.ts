@@ -138,7 +138,7 @@ const section = (page: Page) =>
   page.locator("section", { has: page.locator("#settings-memory-heading") });
 
 test("memory section degrades to a named unavailable state outside Tauri", async ({ page }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.getByRole("heading", { name: "Memory" })).toBeVisible();
   // memory_list rejects with a plain string (no runtime) → the named message
@@ -157,7 +157,7 @@ test("stored memories render newest-first with health rows from memory_status", 
     records: seedRecords(3),
     ingest: { buffered: 3, distilledCount: 7, lastDistillAtMs: null, lastError: null },
   });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
 
   // Newest first: id 3 on top, id 1 last.
@@ -183,7 +183,7 @@ test("stored memories render newest-first with health rows from memory_status", 
 
 test("empty store shows the hint and hides pager and wipe controls", async ({ page }) => {
   await installMemoryIpcMock(page, { records: [] });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.locator(".settings-hint")).toHaveText("No memories stored yet");
   await expect(memory.locator(".memory-row")).toHaveCount(0);
@@ -205,7 +205,7 @@ test("an ingest LlmError from memory_status surfaces as an alert", async ({ page
       },
     },
   });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   const alert = memory.getByRole("alert");
   await expect(alert).toContainText("Local AI offline");
@@ -214,7 +214,7 @@ test("an ingest LlmError from memory_status surfaces as an alert", async ({ page
 
 test("pagination pages newest-first and clamps at both ends", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(30) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   const rows = memory.locator(".memory-row");
   const prev = memory.getByRole("button", { name: "Prev" });
@@ -246,7 +246,7 @@ test("pagination pages newest-first and clamps at both ends", async ({ page }) =
 
 test("inline edit persists through memory_update and survives a refetch", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(3) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   const topRow = memory.locator(".memory-row").first();
 
@@ -275,7 +275,7 @@ test("inline edit persists through memory_update and survives a refetch", async 
 
 test("a blank draft is rejected inline before any round-trip", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(1) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
 
   await memory.locator(".memory-summary").first().click();
@@ -291,7 +291,7 @@ test("a blank draft is rejected inline before any round-trip", async ({ page }) 
 
 test("a backend invalid-input rejection keeps edit mode open with the detail", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(1) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.locator(".memory-row")).toHaveCount(1);
 
@@ -313,7 +313,7 @@ test("a backend invalid-input rejection keeps edit mode open with the detail", a
 
 test("per-row delete is two-step: cancel disarms, confirm removes and re-polls status", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(3) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   const rows = memory.locator(".memory-row");
   await expect(rows).toHaveCount(3);
@@ -337,7 +337,7 @@ test("per-row delete is two-step: cancel disarms, confirm removes and re-polls s
 
 test("deleting a row that vanished shows the not-found banner and refreshes the list", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(2) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.locator(".memory-row")).toHaveCount(2);
 
@@ -357,7 +357,7 @@ test("deleting a row that vanished shows the not-found banner and refreshes the 
 
 test("wipe-all is two-step and lands on the Cleared notice then the empty state", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(3) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.locator(".memory-row")).toHaveCount(3);
 
@@ -384,7 +384,7 @@ test("wipe-all is two-step and lands on the Cleared notice then the empty state"
 
 test("a db failure on wipe surfaces as a dismissible banner and keeps the store", async ({ page }) => {
   await installMemoryIpcMock(page, { records: seedRecords(2) });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=memory");
   const memory = section(page);
   await expect(memory.locator(".memory-row")).toHaveCount(2);
 

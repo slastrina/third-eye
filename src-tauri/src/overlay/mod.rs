@@ -148,6 +148,17 @@ pub fn init_platform(app: &AppHandle) -> Result<(), String> {
     platform::init(app)
 }
 
+/// Hand keyboard focus back to the active app before synthesized typing
+/// (M005 follow-up: a nonactivating key panel swallows posted keystrokes even
+/// while another app is frontmost). Deliberately NOT a state-machine event —
+/// visibility and click-through are unchanged, only key status moves — so it
+/// lives beside [`dispatch`], not inside it. Wired as the
+/// [`crate::input::KeyboardFocusYield`] hook in the chat tool loop; blocks
+/// until the handoff is committed (see the macOS backend for the contract).
+pub fn yield_key_focus(app: &AppHandle) -> Result<(), String> {
+    platform::yield_key_focus(app)
+}
+
 /// Validate the transition, perform the platform side effect, then emit
 /// `overlay://state-changed`. Rolls the state back if the side effect fails.
 fn dispatch(app: &AppHandle, event: OverlayEvent) -> Result<OverlayState, String> {

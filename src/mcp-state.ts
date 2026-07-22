@@ -274,3 +274,85 @@ export function mcpHealthLine(health: McpHealthStatus): string {
         : "Tools unavailable";
   }
 }
+
+// ---------------------------------------------------------------------------
+// JSON editing (pure) — the settings window's "Edit as JSON" mode
+// ---------------------------------------------------------------------------
+
+/** Render the persisted server list as the pretty-printed JSON the user edits.
+ *  This is exactly the `mcpServers` array shape persisted in settings.json —
+ *  ids, transports, commands, urls, and (non-secret) authRefs. Bearer tokens
+ *  live only in the OS keychain and can never appear here (R018). */
+export function serversToJson(servers: McpServerConfig[]): string {
+  return JSON.stringify(servers, null, 2);
+}
+
+/** One typed reason the JSON editor refused a draft — surfaced verbatim in the
+ *  settings error banner, never a silent no-op (R007). */
+export interface McpJsonError {
+  detail: string;
+}
+
+/** Parse and validate a JSON draft into a persistable server list. Returns the
+ *  normalized list or a typed error naming the first offending entry; never
+ *  throws. Normalization fills the optional fields serde also defaults
+ *  (`args: []`, `enabled`), so a hand-trimmed entry round-trips the same way
+ *  settings.json would load it. Unknown extra keys are dropped rather than
+ *  persisted — the config file stays exactly the shape Rust deserializes. */
+export function parseServersJson(
+  text: string,
+): { servers: McpServerConfig[] } | { error: McpJsonError } {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    return { error: { detail: `Not valid JSON: ${e instanceof Error ? e.message : String(e)}` } };
+  }
+  if (!Array.isArray(raw)) {
+    return { error: { detail: "Expected a top-level JSON array of server entries." } };
+  }
+  const servers: McpServerConfig[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    const at = `entry ${i + 1}`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return { error: { detail: `${at}: expected an object.` } };
+    }
+    const e = entry as Record<string, unknown>;
+    const id = typeof e.id === "string" ? e.id.trim() : "";
+    if (id.length === 0) {
+      return { error: { detail: `${at}: "id" must be a non-empty string.` } };
+    }
+    if (seen.has(id)) {
+      return { error: { detail: `${at}: duplicate id "${id}".` } };
+    }
+    seen.add(id);
+    const transport: McpTransport = e.transport === "http" ? "http" : "stdio";
+    if (e.transport !== undefined && e.transport !== "http" && e.transport !== "stdio") {
+      return { error: { detail: `${at} ("${id}"): "transport" must be "stdio" or "http".` } };
+    }
+    if (e.args !== undefined && (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string"))) {
+      return { error: { detail: `${at} ("${id}"): "args" must be an array of strings.` } };
+    }
+    const command = typeof e.command === "string" ? e.command.trim() : "";
+    const url = typeof e.url === "string" ? e.url.trim() : "";
+    if (transport === "http") {
+      if (url.length === 0) {
+        return { error: { detail: `${at} ("${id}"): an http server needs a non-empty "url".` } };
+      }
+    } else if (command.length === 0) {
+      return { error: { detail: `${at} ("${id}"): a stdio server needs a non-empty "command".` } };
+    }
+    const authRef = typeof e.authRef === "string" && e.authRef.trim().length > 0 ? e.authRef.trim() : undefined;
+    servers.push({
+      id,
+      command,
+      args: (e.args as string[] | undefined) ?? [],
+      enabled: e.enabled === undefined ? true : e.enabled === true,
+      transport,
+      ...(transport === "http" ? { url, ...(authRef ? { authRef } : {}) } : {}),
+    });
+  }
+  return { servers };
+}

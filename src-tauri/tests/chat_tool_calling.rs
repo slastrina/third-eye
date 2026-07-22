@@ -787,7 +787,7 @@ impl RecordingFocus {
 impl AppFocus for RecordingFocus {
     async fn focus(&self, app_name: &str) -> Result<FocusedApp, AppFocusError> {
         self.focused.lock().unwrap().push(app_name.to_string());
-        Ok(FocusedApp { app: app_name.to_string() })
+        Ok(FocusedApp { app: app_name.to_string(), launched: false })
     }
     async fn running_apps(&self) -> Vec<String> {
         vec!["Google Chrome".into(), "Finder".into()]

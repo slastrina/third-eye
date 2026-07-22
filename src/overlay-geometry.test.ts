@@ -1,7 +1,7 @@
 // Pure-module unit for the overlay geometry helpers (M006/S01/T03). The live
 // proof — that dragging/resizing the nonactivating NSPanel never activates the
 // app or voids click-through — is native and manual-only (RESEARCH Open Risks,
-// MEM115); what IS automatable is the resize-direction contract and the
+// MEM115); what IS automatable is the pointer-drag resize math and the
 // size-clamp floor, locked here in the existing pure-module test idiom.
 
 import { describe, expect, it } from "vitest";
@@ -9,25 +9,19 @@ import { describe, expect, it } from "vitest";
 import {
   centeredModalRect,
   clampMinSize,
+  draggedExtent,
+  draggedModalSize,
   drawerRect,
   extentFromSize,
   isOnScreen,
   OVERLAY_MIN_HEIGHT,
   OVERLAY_MIN_WIDTH,
-  RESIZE_GRIP_DIRECTION,
-  resizeDirectionForEdge,
   type Edge,
   type MonitorBounds,
   type WorkArea,
 } from "./overlay-geometry";
 
 describe("overlay-geometry", () => {
-  it("aims the resize grip at the bottom-right corner (SouthEast)", () => {
-    // The literal must match Tauri's ResizeDirection so startResizeDragging
-    // accepts it without a cast; a widened string would break the call site.
-    expect(RESIZE_GRIP_DIRECTION).toBe("SouthEast");
-  });
-
   it("leaves a size at or above the minimum untouched", () => {
     const size = { width: 640, height: 480 };
     expect(clampMinSize(size)).toEqual({ width: 640, height: 480 });
@@ -333,31 +327,82 @@ describe("centeredModalRect", () => {
   });
 });
 
-describe("resizeDirectionForEdge", () => {
-  // The inner edge (facing the screen interior) is opposite the docked edge, so
-  // the resize direction points INWARD: a left-docked drawer grows East, etc.
-  // Getting this backwards makes the drag fight the anchor.
-  const cases: Array<[Edge, string]> = [
-    ["left", "East"],
-    ["right", "West"],
-    ["top", "South"],
-    ["bottom", "North"],
+describe("draggedExtent", () => {
+  const from = { x: 500, y: 400 };
+
+  // The drag must grow the drawer INWARD (toward the screen interior), never
+  // fight the docked anchor: each edge's growing pointer direction is the one
+  // pointing away from that edge. Getting a sign backwards makes the bar
+  // shrink the drawer as the user pulls it open.
+  const grows: Array<[Edge, { x: number; y: number }]> = [
+    ["left", { x: 560, y: 400 }], // pointer right → wider
+    ["right", { x: 440, y: 400 }], // pointer left → wider
+    ["top", { x: 500, y: 460 }], // pointer down → taller
+    ["bottom", { x: 500, y: 340 }], // pointer up → taller
   ];
 
-  it.each(cases)(
-    "resizes a %s drawer from its inner edge toward %s",
-    (edge, direction) => {
-      expect(resizeDirectionForEdge(edge)).toBe(direction);
+  it.each(grows)("grows a %s drawer as the pointer moves inward", (edge, to) => {
+    expect(draggedExtent(edge, 420, from, to, 1440)).toBe(480);
+  });
+
+  it.each(grows)(
+    "shrinks a %s drawer as the pointer moves back outward",
+    (edge, to) => {
+      // Same magnitude, opposite direction: mirror `to` around `from`.
+      const back = { x: 2 * from.x - to.x, y: 2 * from.y - to.y };
+      expect(draggedExtent(edge, 420, from, back, 1440)).toBe(360);
     },
   );
 
-  it("never returns the docked edge's own direction (grows inward, not outward)", () => {
-    // A left drawer must not resize West (into its own docked edge); every edge
-    // maps to the perpendicular-or-opposite inward direction.
-    expect(resizeDirectionForEdge("left")).not.toBe("West");
-    expect(resizeDirectionForEdge("right")).not.toBe("East");
-    expect(resizeDirectionForEdge("top")).not.toBe("North");
-    expect(resizeDirectionForEdge("bottom")).not.toBe("South");
+  it("ignores the perpendicular axis entirely", () => {
+    // A left/right drawer only tracks x; vertical wander must not change it.
+    expect(draggedExtent("left", 420, from, { x: 500, y: 900 }, 1440)).toBe(420);
+    expect(draggedExtent("top", 320, from, { x: 900, y: 400 }, 900)).toBe(320);
+  });
+
+  it("floors at the overlay minimum on the drawer's axis", () => {
+    expect(draggedExtent("left", 420, from, { x: -5000, y: 400 }, 1440)).toBe(
+      OVERLAY_MIN_WIDTH,
+    );
+    expect(draggedExtent("bottom", 320, from, { x: 500, y: 5000 }, 900)).toBe(
+      OVERLAY_MIN_HEIGHT,
+    );
+  });
+
+  it("caps at the work-area span so a drag never outgrows the screen", () => {
+    expect(draggedExtent("left", 420, from, { x: 5000, y: 400 }, 1440)).toBe(1440);
+    expect(draggedExtent("top", 320, from, { x: 500, y: 5000 }, 900)).toBe(900);
+  });
+
+  it("resolves a sub-minimum cap to the minimum — the floor wins", () => {
+    // A pathological work area smaller than the overlay minimum must not
+    // produce a chrome-clipping extent.
+    expect(draggedExtent("left", 420, from, { x: 5000, y: 400 }, 100)).toBe(
+      OVERLAY_MIN_WIDTH,
+    );
+  });
+});
+
+describe("draggedModalSize", () => {
+  const from = { x: 500, y: 400 };
+
+  it("grows both axes toward the bottom-right with the pointer", () => {
+    // Anchored top-left (the SouthEast grip): +x widens, +y talls.
+    expect(
+      draggedModalSize({ width: 720, height: 480 }, from, { x: 580, y: 450 }),
+    ).toEqual({ width: 800, height: 530 });
+  });
+
+  it("shrinks each axis independently as the pointer moves back", () => {
+    expect(
+      draggedModalSize({ width: 720, height: 480 }, from, { x: 440, y: 400 }),
+    ).toEqual({ width: 660, height: 480 });
+  });
+
+  it("floors each axis at the overlay minimum", () => {
+    expect(
+      draggedModalSize({ width: 720, height: 480 }, from, { x: -5000, y: -5000 }),
+    ).toEqual({ width: OVERLAY_MIN_WIDTH, height: OVERLAY_MIN_HEIGHT });
   });
 });
 

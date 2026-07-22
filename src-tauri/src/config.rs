@@ -1232,6 +1232,79 @@ pub fn resolve_skills_dir(app: &AppHandle) -> std::path::PathBuf {
     }
 }
 
+/// Store key holding the local LLM endpoint override (S05). Absent, null,
+/// blank, or garbage means unset — the caller falls back to the
+/// `THIRD_EYE_ENDPOINT` env var and then the project default
+/// (`llm::openai::DEFAULT_ENDPOINT`). The value is an http(s) base URL of an
+/// OpenAI-compatible server (LM Studio, Ollama, …); the endpoint is fixed per
+/// run (router, probe, and embedder all cache it at construction), so a saved
+/// change applies on the next launch.
+pub const LLM_ENDPOINT_KEY: &str = "llmEndpoint";
+
+/// Read the persisted LLM endpoint override. `None` means nothing usable is
+/// persisted (no store, no key, null, or garbage — all logged where relevant):
+/// the caller falls back to the env var / project default.
+pub fn load_llm_endpoint(app: &AppHandle) -> Option<String> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(LLM_ENDPOINT_KEY)?;
+    stored_llm_endpoint(&value)
+}
+
+/// Interpret one stored endpoint value. Only a non-blank string that parses to
+/// an http(s) URL with a host is trusted (trimmed, trailing slashes dropped —
+/// the same normalization as `env_endpoint`); anything else is logged and
+/// treated as unset so the router falls back to a reachable default rather
+/// than booting against a garbage URL the guard would then classify External
+/// and every request would fail on.
+fn stored_llm_endpoint(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                log::warn!("config: {LLM_ENDPOINT_KEY} holds a blank string; using default endpoint");
+                None
+            } else if is_http_url(trimmed) {
+                Some(trimmed.to_string())
+            } else {
+                log::warn!(
+                    "config: {LLM_ENDPOINT_KEY} holds a non-http(s) value {trimmed:?}; using default endpoint"
+                );
+                None
+            }
+        }
+        serde_json::Value::Null => None,
+        other => {
+            log::warn!(
+                "config: {LLM_ENDPOINT_KEY} holds non-string value {other}; using default endpoint"
+            );
+            None
+        }
+    }
+}
+
+/// Persist the LLM endpoint override (`None` writes an explicit JSON null —
+/// "reset to default" is a decision, stored like an unpinned lane model). The
+/// error names the failed persist path; nothing in-memory changes on save (the
+/// running router keeps its per-run endpoint), so there is no rollback to do.
+pub fn save_llm_endpoint(app: &AppHandle, endpoint: Option<&str>) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(LLM_ENDPOINT_KEY, serde_json::json!(endpoint));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {LLM_ENDPOINT_KEY}={endpoint:?} to {path}: {e}"))?;
+    log::info!("config: persisted {LLM_ENDPOINT_KEY}={endpoint:?} to {path}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1973,6 +2046,47 @@ mod tests {
             serde_json::json!({ "dir": "/skills" }),
         ] {
             assert_eq!(stored_skills_dir(&bad), None, "bad value: {bad}");
+        }
+    }
+
+    #[test]
+    fn stored_llm_endpoint_trims_and_strips_trailing_slashes() {
+        // Same normalization as env_endpoint: trim whitespace, drop trailing
+        // slashes, keep the URL otherwise verbatim.
+        assert_eq!(
+            stored_llm_endpoint(&serde_json::json!("  http://127.0.0.1:11434/  ")),
+            Some("http://127.0.0.1:11434".into())
+        );
+        assert_eq!(
+            stored_llm_endpoint(&serde_json::json!("https://llm.lan:8080")),
+            Some("https://llm.lan:8080".into())
+        );
+    }
+
+    #[test]
+    fn stored_blank_or_null_llm_endpoint_is_unset() {
+        // null is the persisted "reset to default" decision; blank is repaired
+        // to the same — the router must never boot against an empty URL.
+        assert_eq!(stored_llm_endpoint(&serde_json::Value::Null), None);
+        assert_eq!(stored_llm_endpoint(&serde_json::json!("")), None);
+        assert_eq!(stored_llm_endpoint(&serde_json::json!("   ")), None);
+    }
+
+    #[test]
+    fn stored_garbage_llm_endpoint_falls_back_to_unset() {
+        // A non-http(s) or unparseable value must never reach the router: the
+        // guard would classify it External and every request would die on it.
+        for bad in [
+            serde_json::json!("localhost:1234"),      // no scheme
+            serde_json::json!("ws://127.0.0.1:1234"), // non-web scheme
+            serde_json::json!("file:///tmp/x"),       // no host
+            serde_json::json!("/just/a/path"),        // relative
+            serde_json::json!(1234),
+            serde_json::json!(true),
+            serde_json::json!(["http://x:1"]),
+            serde_json::json!({ "url": "http://x:1" }),
+        ] {
+            assert_eq!(stored_llm_endpoint(&bad), None, "bad value: {bad}");
         }
     }
 }

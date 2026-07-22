@@ -143,7 +143,7 @@ const cloudSection = (page: Page) =>
   page.locator("section", { has: page.getByRole("heading", { name: "Cloud Providers" }) });
 
 test("cloud section degrades to a named unavailable state outside Tauri", async ({ page }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
   await expect(cloud.getByRole("heading", { name: "Cloud Providers" })).toBeVisible();
 
@@ -159,7 +159,7 @@ test("cloud section degrades to a named unavailable state outside Tauri", async 
 
 test("full opt-in flow: enable → masked key entry (never echoed) → presence → heavy-lane pick → disable reverts to local-only", async ({ page }) => {
   await installCloudIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
   const toggle = cloud.getByRole("checkbox", { name: "Use cloud providers" });
 
@@ -229,7 +229,7 @@ test("full opt-in flow: enable → masked key entry (never echoed) → presence 
 
 test("an external cloud://optin broadcast (another window's toggle) flips this section live", async ({ page }) => {
   await installCloudIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
   const toggle = cloud.getByRole("checkbox", { name: "Use cloud providers" });
   await expect(toggle).not.toBeChecked();
@@ -259,7 +259,7 @@ test("a persisted opt-in with a stored key rehydrates presence on mount", async 
     anthropicPresent: true,
     heavyProvider: "openai",
   });
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
 
   await expect(cloud.getByRole("checkbox", { name: "Use cloud providers" })).toBeChecked();
@@ -278,7 +278,7 @@ test("a persist error on the opt-in toggle surfaces as data, not a rejection", a
   // failure rides persistError on the returned/broadcast status. Emit that
   // shape directly to prove the section renders the error banner.
   await installCloudIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
   await expect(cloud.getByRole("checkbox", { name: "Use cloud providers" })).toBeEnabled();
 

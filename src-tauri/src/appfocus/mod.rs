@@ -1,18 +1,23 @@
-//! App-focus boundary: the bring-an-app-to-the-front seam behind the
-//! `focus_app` tool (M005).
+//! App-focus boundary: the open-an-app / bring-it-to-the-front seam behind
+//! the `focus_app` tool (M005).
 //!
 //! [`AppFocus`] is the object-safe abstraction the composite executor's
 //! `FocusAppTool` holds as `Arc<dyn AppFocus>`, mirroring the S01
 //! [`crate::input::commands::InputState`] and S02
-//! [`crate::screenquery::commands::ScreenQueryState`] patterns. Activation is
+//! [`crate::screenquery::commands::ScreenQueryState`] patterns. Resolution is
 //! best-effort by localized app name: `screen_query` labels each on-screen text
-//! element with its owning app, and `focus_app` brings the named app forward so
-//! the model can then aim an `input_action` at it rather than at whatever
-//! happened to be frontmost.
+//! element with its owning app, and `focus_app` brings the named app forward —
+//! launching it first when it is not running — so the model can then aim an
+//! `input_action` at it rather than at whatever happened to be frontmost.
 //!
 //! [`FocusedApp`] is the platform-neutral success shape: the localized name the
-//! backend actually matched and activated, so the model (and UI) can confirm
-//! which app it fronted when its request was fuzzy.
+//! backend actually matched and fronted (plus whether it had to launch the
+//! app), so the model (and UI) can confirm which app it opened when its
+//! request was fuzzy. A success is only reported after the backend has
+//! *verified* the app is frontmost — "the OS accepted the request" is not
+//! success, because macOS cooperative activation can accept and then silently
+//! drop it, which reads as "the model claimed it opened Chrome and nothing
+//! happened".
 //!
 //! Failure taxonomy mirrors [`crate::screenquery::ScreenQueryError`] and
 //! [`crate::input::InputError`]: every failure is a typed [`AppFocusError`]
@@ -37,12 +42,15 @@ use serde::Serialize;
 
 /// The app `focus_app` actually brought to the front — the localized name the
 /// backend matched, so a fuzzy request (`"chrome"` → `"Google Chrome"`) reports
-/// exactly which app was activated. camelCase in JSON to ride the tool-call
-/// contract.
+/// exactly which app was fronted. `launched` is true when the app was not
+/// running and the backend launched it first — the model can tell the user
+/// "opened" vs "switched to" truthfully. camelCase in JSON to ride the
+/// tool-call contract.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FocusedApp {
     pub app: String,
+    pub launched: bool,
 }
 
 /// The full app-focus failure taxonomy (R007). Serialized with a `kind` tag
@@ -52,13 +60,13 @@ pub struct FocusedApp {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum AppFocusError {
-    /// No running app matched the requested name. `candidates` lists the
-    /// currently running app names so the model can retry against a real one
-    /// rather than guess again.
+    /// No running *or installed* app matched the requested name. `candidates`
+    /// lists the currently running app names so the model can retry against a
+    /// real one rather than guess again.
     NotFound { requested: String, candidates: Vec<String> },
-    /// A matching app was found but the OS refused (or dropped) the activation
-    /// request — the app may have quit between the match and the activate, or be
-    /// of a type that cannot be activated.
+    /// A matching app was found but never made it to the front — the OS
+    /// refused or silently dropped the activation request, the launch failed,
+    /// or the app quit between the match and the activate.
     ActivationFailed { detail: String },
     /// App focus is not implemented on this platform. `platform` names the
     /// running OS so logs and status surfaces are self-explanatory.
@@ -93,7 +101,7 @@ impl std::fmt::Display for AppFocusError {
             AppFocusError::NotFound { requested, candidates } => {
                 write!(
                     f,
-                    "app-focus not-found: no running app matched {requested:?} (running: {})",
+                    "app-focus not-found: no running or installed app matched {requested:?} (running: {})",
                     candidates.join(", ")
                 )
             }
@@ -115,10 +123,10 @@ impl std::error::Error for AppFocusError {}
 /// [`crate::input::commands::InputState`].
 ///
 /// `focus` best-effort matches `app_name` against the running apps and brings
-/// the match to the front, returning the localized name it actually activated.
-/// `running_apps` lists the current running app names — the retry hint the tool
-/// surfaces on a `not-found`, and the candidate set the `not-found` error
-/// carries.
+/// the match to the front — launching an installed app when nothing running
+/// matches — returning the localized name it verified frontmost. `running_apps`
+/// lists the current running app names — the retry hint the tool surfaces on a
+/// `not-found`, and the candidate set the `not-found` error carries.
 #[async_trait]
 pub trait AppFocus: Send + Sync {
     async fn focus(&self, app_name: &str) -> Result<FocusedApp, AppFocusError>;
@@ -152,7 +160,7 @@ mod tests {
                 .find(|a| a.to_lowercase() == needle)
                 .or_else(|| self.running.iter().find(|a| a.to_lowercase().contains(&needle)))
             {
-                Some(app) => Ok(FocusedApp { app: app.clone() }),
+                Some(app) => Ok(FocusedApp { app: app.clone(), launched: false }),
                 None => Err(AppFocusError::NotFound {
                     requested: app_name.to_string(),
                     candidates: self.running.clone(),
@@ -195,9 +203,10 @@ mod tests {
 
     #[test]
     fn focused_json_shape_is_camel_case() {
-        let f = FocusedApp { app: "Google Chrome".into() };
+        let f = FocusedApp { app: "Google Chrome".into(), launched: true };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["app"], "Google Chrome");
+        assert_eq!(v["launched"], true);
     }
 
     #[test]

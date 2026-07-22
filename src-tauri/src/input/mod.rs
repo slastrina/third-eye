@@ -264,6 +264,75 @@ pub trait InputControl: Send + Sync {
     async fn perform(&self, action: InputAction) -> Result<(), InputError>;
 }
 
+/// Decorator over any [`InputControl`] that runs a `yield_focus` hook before
+/// every KEYBOARD action (`type-text` / `key-press`) reaches the backend — and
+/// only those. Mouse actions pass straight through: they are routed by screen
+/// position, not by key window, so there is no focus to yield for them.
+///
+/// Why it exists (M005 follow-up): synthesized keystrokes are delivered to the
+/// GLOBAL key window, and Third Eye's overlay is a nonactivating NSPanel that
+/// keeps key status even while another app is active — the Spotlight trait the
+/// overlay borrows for its no-focus-steal design. So after `focus_app` had
+/// verifiably fronted Chrome, a `type-text` still landed in the overlay's own
+/// prompt (the "asked it to search in Chrome and it typed into Third Eye"
+/// report). The hook — wired to `crate::overlay::yield_key_focus` in
+/// production — makes the overlay resign key first, so the keystrokes land in
+/// the app the model fronted.
+///
+/// The hook is fallible ON PURPOSE: if the yield does not complete, the
+/// keystrokes would go into the wrong window, so the action fails typed
+/// (`input-failed`) instead — R007's no-silent-wrongness applied to keyboard
+/// focus. The hook may block (a main-thread round-trip with a completion
+/// handshake), so it runs on the blocking pool, never the async worker.
+pub struct KeyboardFocusYield {
+    inner: std::sync::Arc<dyn InputControl>,
+    yield_focus: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+}
+
+impl KeyboardFocusYield {
+    pub fn new(
+        inner: std::sync::Arc<dyn InputControl>,
+        yield_focus: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        Self { inner, yield_focus }
+    }
+}
+
+#[async_trait]
+impl InputControl for KeyboardFocusYield {
+    fn permission(&self) -> InputPermission {
+        self.inner.permission()
+    }
+
+    fn request_permission(&self) -> bool {
+        self.inner.request_permission()
+    }
+
+    async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        if matches!(action, InputAction::TypeText { .. } | InputAction::KeyPress { .. }) {
+            let yield_focus = self.yield_focus.clone();
+            // The hook blocks on a main-thread handshake; keep the async worker
+            // clean. The keystrokes MUST NOT race the handoff, so the failure of
+            // either the join or the hook itself refuses the action typed.
+            let yielded = tokio::task::spawn_blocking(move || yield_focus())
+                .await
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("key-focus yield task panicked: {e}"),
+                })?;
+            if let Err(detail) = yielded {
+                let err = InputError::InputFailed {
+                    detail: format!(
+                        "keyboard focus was not yielded, refusing to type into the wrong window: {detail}"
+                    ),
+                };
+                log::error!("input: {} ({err})", err.kind());
+                return Err(err);
+            }
+        }
+        self.inner.perform(action).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +537,95 @@ mod tests {
             InputAction::TypeText { text: "hello".into() }.kind(),
             InputAction::TypeText { text: "world".into() }.kind(),
         );
+    }
+
+    /// A backend that appends to a shared journal, so hook-vs-backend ordering
+    /// is observable — the property KeyboardFocusYield exists to guarantee.
+    struct JournalingInput {
+        journal: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl InputControl for JournalingInput {
+        fn permission(&self) -> InputPermission {
+            InputPermission { granted: true, supported: true }
+        }
+
+        fn request_permission(&self) -> bool {
+            true
+        }
+
+        async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+            self.journal.lock().unwrap().push(format!("perform:{}", action.kind_str()));
+            Ok(())
+        }
+    }
+
+    fn yield_harness(
+        hook_result: Result<(), String>,
+    ) -> (KeyboardFocusYield, Arc<std::sync::Mutex<Vec<String>>>) {
+        let journal = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = Arc::new(JournalingInput { journal: journal.clone() });
+        let hook_journal = journal.clone();
+        let wrapped = KeyboardFocusYield::new(
+            inner,
+            Arc::new(move || {
+                hook_journal.lock().unwrap().push("yield".to_string());
+                hook_result.clone()
+            }),
+        );
+        (wrapped, journal)
+    }
+
+    #[tokio::test]
+    async fn keyboard_actions_yield_focus_before_the_backend_acts() {
+        // The whole point of the decorator: the overlay must have resigned key
+        // BEFORE the first keystroke posts, or the text lands in Third Eye's own
+        // prompt. Ordering in the journal is the proof.
+        let (backend, journal) = yield_harness(Ok(()));
+        backend.perform(InputAction::TypeText { text: "farts".into() }).await.unwrap();
+        backend.perform(InputAction::KeyPress { key: "return".into() }).await.unwrap();
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["yield", "perform:type-text", "yield", "perform:key-press"],
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_actions_pass_through_without_yielding() {
+        // Mouse events route by screen position, not key window — yielding for
+        // them would blink the panel ordering for nothing.
+        let (backend, journal) = yield_harness(Ok(()));
+        backend.perform(InputAction::MouseMove { x: 10, y: 20 }).await.unwrap();
+        backend.perform(InputAction::click_at(MouseButton::Left, 30, 40)).await.unwrap();
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["perform:mouse-move", "perform:mouse-click"],
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_yield_refuses_the_keystrokes_typed_and_never_reaches_backend() {
+        // If the overlay could not resign key, typing would land in the wrong
+        // window — the action must fail typed instead of "succeeding" wrong.
+        let (backend, journal) = yield_harness(Err("main thread busy".into()));
+        let err =
+            backend.perform(InputAction::TypeText { text: "hi".into() }).await.unwrap_err();
+        assert_eq!(err.kind(), "input-failed");
+        assert!(err.to_string().contains("wrong window"), "detail must say why: {err}");
+        assert_eq!(*journal.lock().unwrap(), vec!["yield"], "backend must not be reached");
+
+        // Mouse actions are unaffected by a broken yield hook.
+        backend.perform(InputAction::click(MouseButton::Left)).await.unwrap();
+        assert_eq!(*journal.lock().unwrap(), vec!["yield", "perform:mouse-click"]);
+    }
+
+    #[tokio::test]
+    async fn yield_decorator_delegates_permission_surfaces() {
+        let (backend, _journal) = yield_harness(Ok(()));
+        assert!(backend.permission().granted);
+        assert!(backend.permission().supported);
+        assert!(backend.request_permission());
     }
 
     #[test]

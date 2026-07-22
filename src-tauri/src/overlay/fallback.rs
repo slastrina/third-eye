@@ -32,6 +32,13 @@ pub fn focus(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| format!("overlay focus failed: {e}"))
 }
 
+/// No nonactivating-panel key steal exists on the plain-window path: focusing
+/// the overlay activates the app, and activating another app takes keyboard
+/// focus with it, so the OS hands typing over on its own. Nothing to yield.
+pub fn yield_key_focus(_app: &AppHandle) -> Result<(), String> {
+    Ok(())
+}
+
 /// Same click-through contract as the macOS backend: idle overlay ignores
 /// cursor events, focused overlay accepts them.
 pub fn set_click_through(app: &AppHandle, ignore: bool) -> Result<(), String> {

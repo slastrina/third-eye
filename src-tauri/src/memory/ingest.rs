@@ -60,6 +60,12 @@ pub struct IngestState {
     distilled_count: AtomicU64,
     last_distill_at_ms: Mutex<Option<i64>>,
     last_error: Mutex<Option<LlmError>>,
+    /// Fired with the stored count after a distillation stores >0 memories —
+    /// [`spawn`] installs the tray's "noted" flash here so taking a note is
+    /// visible in the menu bar. Purely cosmetic side-channel: absent in the
+    /// unit/live-test loops (which construct [`IngestState`] raw), and its
+    /// absence changes nothing about ingestion.
+    on_stored: Mutex<Option<Box<dyn Fn(u64) + Send>>>,
 }
 
 impl Default for IngestState {
@@ -69,6 +75,7 @@ impl Default for IngestState {
             distilled_count: AtomicU64::new(0),
             last_distill_at_ms: Mutex::new(None),
             last_error: Mutex::new(None),
+            on_stored: Mutex::new(None),
         }
     }
 }
@@ -93,12 +100,26 @@ impl IngestState {
         self.buffered.store(n, Ordering::SeqCst);
     }
 
+    /// Install the stored-memories notifier (setup-time, before the loop
+    /// runs) — the guard-notifier pattern: the pure loop stays free of an
+    /// AppHandle while the app wires the cosmetic side-effect in.
+    pub fn install_stored_notifier(&self, notify: impl Fn(u64) + Send + 'static) {
+        *self.on_stored.lock().unwrap() = Some(Box::new(notify));
+    }
+
     /// A distillation succeeded: count what was stored and clear any
-    /// persisted failure — the error stays visible only until success.
+    /// persisted failure — the error stays visible only until success. A
+    /// success that stored nothing (no parseable summaries) fires no
+    /// notifier: there is no note to signal.
     fn record_success(&self, stored: u64, at_ms: i64) {
         self.distilled_count.fetch_add(stored, Ordering::SeqCst);
         *self.last_distill_at_ms.lock().unwrap() = Some(at_ms);
         *self.last_error.lock().unwrap() = None;
+        if stored > 0 {
+            if let Some(notify) = self.on_stored.lock().unwrap().as_ref() {
+                notify(stored);
+            }
+        }
     }
 
     fn record_failure(&self, err: LlmError) {
@@ -309,6 +330,12 @@ pub fn spawn(app: &tauri::AppHandle) {
         return;
     }
     let ingest = state.ingest();
+    // Tray "noted" flash: a batch that stores new memories blips the
+    // menu-bar icon, so taking a note is visible without opening anything.
+    {
+        let app = app.clone();
+        ingest.install_stored_notifier(move |stored| crate::tray::flash_noted(&app, stored));
+    }
     let rx = app.state::<crate::watcher::WatcherState>().subscribe();
     let router = app.state::<crate::llm::commands::LlmState>().router();
     tauri::async_runtime::spawn(run_loop(rx, store, ingest, router));
@@ -432,6 +459,26 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::llm::router::Lane;
+
+    #[test]
+    fn stored_notifier_fires_only_when_memories_were_stored() {
+        // The tray's noted flash must not fire for a distillation that
+        // parsed nothing (stored == 0) — there is no note to signal — and
+        // must carry the stored count when it does.
+        let ingest = IngestState::new();
+        let seen = Arc::new(AtomicU64::new(0));
+        let sink = seen.clone();
+        ingest.install_stored_notifier(move |stored| {
+            sink.fetch_add(stored, Ordering::SeqCst);
+        });
+        ingest.record_success(0, 1);
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "empty success must not notify");
+        ingest.record_success(3, 2);
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        // The health surface counted both successes regardless.
+        assert_eq!(ingest.status().distilled_count, 3);
+        assert_eq!(ingest.status().last_distill_at_ms, Some(2));
+    }
     use crate::llm::{LlmClient, LlmHealth, StreamOutcome, TokenSink};
     use crate::watcher::WatcherState;
     use async_trait::async_trait;

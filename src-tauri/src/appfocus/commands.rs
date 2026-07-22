@@ -58,7 +58,7 @@ mod tests {
     #[async_trait]
     impl AppFocus for ScriptedAppFocus {
         async fn focus(&self, _app_name: &str) -> Result<FocusedApp, AppFocusError> {
-            Ok(FocusedApp { app: "TARGET".into() })
+            Ok(FocusedApp { app: "TARGET".into(), launched: false })
         }
 
         async fn running_apps(&self) -> Vec<String> {

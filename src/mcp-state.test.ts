@@ -15,6 +15,8 @@ import {
   mcpHealthLine,
   mcpModeShowsAutoRunWarning,
   mcpReducer,
+  parseServersJson,
+  serversToJson,
   type McpAuthError,
   type McpAuthStatus,
   type McpHealthStatus,
@@ -232,5 +234,84 @@ describe("MCP copy + selector helpers", () => {
       mcpHealthLine({ ...disconnected, phase: "crashed", lastError: "handshake timed out" }),
     ).toBe("Tools unavailable — handshake timed out");
     expect(mcpHealthLine({ ...disconnected, phase: "crashed" })).toBe("Tools unavailable");
+  });
+});
+
+describe("MCP servers JSON editing (serversToJson / parseServersJson)", () => {
+  const stdio: McpServerConfig = {
+    id: "weather",
+    command: "npx",
+    args: ["-y", "weather-mcp"],
+    enabled: true,
+    transport: "stdio",
+  };
+  const http: McpServerConfig = {
+    id: "search",
+    command: "",
+    args: [],
+    enabled: false,
+    transport: "http",
+    url: "https://mcp.example.com/sse",
+    authRef: "mcp:search",
+  };
+
+  it("round-trips a mixed list losslessly", () => {
+    const parsed = parseServersJson(serversToJson([stdio, http]));
+    expect(parsed).toEqual({ servers: [stdio, http] });
+  });
+
+  it("normalizes omitted optionals the way serde would (args [], enabled default)", () => {
+    const parsed = parseServersJson(
+      JSON.stringify([{ id: "w", command: "npx" }]),
+    );
+    expect(parsed).toEqual({
+      servers: [{ id: "w", command: "npx", args: [], enabled: true, transport: "stdio" }],
+    });
+  });
+
+  it("drops unknown extra keys instead of persisting them", () => {
+    const parsed = parseServersJson(
+      JSON.stringify([{ id: "w", command: "npx", token: "sk-NEVER" }]),
+    );
+    if ("error" in parsed) throw new Error("expected servers");
+    expect(JSON.stringify(parsed.servers)).not.toContain("sk-NEVER");
+  });
+
+  it("rejects malformed JSON with a typed error, never a throw", () => {
+    const parsed = parseServersJson("{nope");
+    if (!("error" in parsed)) throw new Error("expected error");
+    expect(parsed.error.detail).toContain("Not valid JSON");
+  });
+
+  it("rejects a non-array top level and non-object entries", () => {
+    expect(parseServersJson(`{"id":"w"}`)).toHaveProperty("error");
+    const parsed = parseServersJson(`[42]`);
+    if (!("error" in parsed)) throw new Error("expected error");
+    expect(parsed.error.detail).toContain("entry 1");
+  });
+
+  it("names the offending entry: blank id, duplicate id, bad transport, bad args", () => {
+    expect(parseServersJson(`[{"command":"npx"}]`)).toHaveProperty("error");
+    const dup = parseServersJson(
+      JSON.stringify([
+        { id: "w", command: "npx" },
+        { id: "w", command: "uvx" },
+      ]),
+    );
+    if (!("error" in dup)) throw new Error("expected error");
+    expect(dup.error.detail).toContain(`duplicate id "w"`);
+    expect(
+      parseServersJson(`[{"id":"w","command":"npx","transport":"carrier-pigeon"}]`),
+    ).toHaveProperty("error");
+    expect(parseServersJson(`[{"id":"w","command":"npx","args":[1]}]`)).toHaveProperty("error");
+  });
+
+  it("requires a url for http and a command for stdio", () => {
+    const noUrl = parseServersJson(`[{"id":"s","transport":"http"}]`);
+    if (!("error" in noUrl)) throw new Error("expected error");
+    expect(noUrl.error.detail).toContain(`"url"`);
+    const noCmd = parseServersJson(`[{"id":"s"}]`);
+    if (!("error" in noCmd)) throw new Error("expected error");
+    expect(noCmd.error.detail).toContain(`"command"`);
   });
 });

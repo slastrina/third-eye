@@ -77,6 +77,48 @@ pub fn focus(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| format!("main-thread dispatch for focus failed: {e}"))
 }
 
+/// Hand global keyboard focus back to the active app (M005 follow-up). A
+/// nonactivating panel that became key KEEPS key status even while another
+/// app is active — the Spotlight trait this overlay borrows — so synthesized
+/// keystrokes posted by the HID backend land in the overlay's own prompt
+/// instead of the app `focus_app` just fronted. Called (through the
+/// `KeyboardFocusYield` decorator) before every synthesized type/key action.
+///
+/// `resignKeyWindow` alone is only AppKit's notification hook — the window
+/// server keeps routing keys to the panel. The load-bearing step is the
+/// `orderOut:`: an ordered-out window cannot hold key, which forces the window
+/// server to hand keyboard focus to the active app; the immediate
+/// `orderFrontRegardless` restores visibility WITHOUT reclaiming key (it never
+/// makes key). Both run inside one main-thread closure, before the next
+/// display cycle, so the panel never visibly blinks. Click-through state is a
+/// window property and survives the reorder untouched.
+///
+/// Synchronous by contract: the caller is about to post keystrokes and MUST
+/// NOT race the handoff, so this blocks on a completion handshake with the
+/// main thread (bounded — a stalled main thread returns a typed error rather
+/// than hanging the tool loop). Callers therefore must be OFF the main thread
+/// unless dispatch executes inline (Tauri runs the closure inline when already
+/// on main, so the handshake cannot self-deadlock).
+pub fn yield_key_focus(app: &AppHandle) -> Result<(), String> {
+    let panel = panel(app)?;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    app.run_on_main_thread(move || {
+        // A hidden panel cannot hold key — nothing to yield.
+        if panel.is_visible() {
+            panel.make_first_responder(None);
+            panel.resign_key_window();
+            panel.hide();
+            panel.order_front_regardless();
+            log::debug!("overlay: yielded key focus to the active app for synthesized keyboard input");
+        }
+        let _ = done_tx.send(());
+    })
+    .map_err(|e| format!("main-thread dispatch for key-focus yield failed: {e}"))?;
+    done_rx
+        .recv_timeout(std::time::Duration::from_millis(1000))
+        .map_err(|_| "overlay key-focus yield timed out (main thread busy)".to_string())
+}
+
 /// Toggle click-through on the panel. Uses the Tauri window handle (the
 /// panel is the same NSWindow, so `setIgnoresMouseEvents:` applies) — an
 /// idle overlay must never intercept clicks meant for the app underneath.

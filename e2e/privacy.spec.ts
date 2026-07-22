@@ -78,7 +78,7 @@ async function installGuardIpcMock(page: Page): Promise<void> {
 const guardSection = (page: Page) => page.locator(".guard-subsection");
 
 test("guard sub-surface degrades to a named unavailable state outside Tauri", async ({ page }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=privacy");
   const guard = guardSection(page);
   await expect(guard.getByRole("heading", { name: "Privacy Guard" })).toBeVisible();
   // guard_status rejects → named unavailable line, not a crash.
@@ -94,7 +94,7 @@ test("guard sub-surface degrades to a named unavailable state outside Tauri", as
 
 test("guard_status renders Active with zero-filled counters, and privacy://state increments per-kind counters exactly once", async ({ page }) => {
   await installGuardIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=privacy");
   const guard = guardSection(page);
 
   // Mount-time guard_status resolves → Active, all three known kinds
@@ -152,7 +152,7 @@ test("guard_status renders Active with zero-filled counters, and privacy://state
 
 test("a guard block surfaces the fail-closed state: blocked count, last-block reason, and the guard-blocked banner", async ({ page }) => {
   await installGuardIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=privacy");
   const guard = guardSection(page);
   await expect(guard.locator("[data-guard-active]")).toHaveText("Active");
 
@@ -185,7 +185,7 @@ test("a guard block surfaces the fail-closed state: blocked count, last-block re
 
 test("an unknown future detection kind is appended verbatim with its real count, never dropped", async ({ page }) => {
   await installGuardIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=privacy");
   const guard = guardSection(page);
   await expect(guard.locator("[data-guard-active]")).toHaveText("Active");
 

@@ -402,14 +402,15 @@ impl LlmState {
         }
     }
 
-    /// State backed by the configured LM Studio endpoint with the canonical
-    /// thin/heavy lane pair. The endpoint comes from `THIRD_EYE_ENDPOINT`
-    /// (unset or blank → [`DEFAULT_ENDPOINT`], see [`env_endpoint`]); lane
-    /// model ids come from the `THIRD_EYE_THIN_MODEL` /
-    /// `THIRD_EYE_HEAVY_MODEL` env vars — the single override site until S05
-    /// ships real configurability. An unset (or blank) var leaves that lane
-    /// unpinned: requests omit the `model` key and a single-model LM Studio
-    /// serves whatever it has loaded.
+    /// State backed by the env-configured LM Studio endpoint with the
+    /// canonical thin/heavy lane pair. The endpoint comes from
+    /// `THIRD_EYE_ENDPOINT` (unset or blank → [`DEFAULT_ENDPOINT`], see
+    /// [`env_endpoint`]); lane model ids come from the `THIRD_EYE_THIN_MODEL`
+    /// / `THIRD_EYE_HEAVY_MODEL` env vars. An unset (or blank) var leaves
+    /// that lane unpinned: requests omit the `model` key and a single-model
+    /// LM Studio serves whatever it has loaded. Production boots through
+    /// [`Self::with_configured_endpoint`], which puts the persisted settings
+    /// value in front of these env reads.
     ///
     /// `guard` is the app-shared privacy-guard telemetry (M003 S02): every
     /// lane client the router builds — now and on runtime re-pins — is
@@ -421,6 +422,29 @@ impl LlmState {
             std::env::var("THIRD_EYE_HEAVY_MODEL").ok(),
             guard,
         )
+    }
+
+    /// State backed by the *configured* endpoint (S05 configurability): the
+    /// persisted settings value ([`crate::config::load_llm_endpoint`]) wins
+    /// over `THIRD_EYE_ENDPOINT`, which wins over [`DEFAULT_ENDPOINT`] — the
+    /// same store-over-env precedence as the lane pins. Constructed from the
+    /// setup hook (not builder time) because reading the settings store needs
+    /// a live app handle. The endpoint is fixed for the run: router, probe,
+    /// and the memory embedder all cache it at construction, so a later
+    /// `set_llm_endpoint` persists for the *next* launch (`restartRequired`).
+    pub fn with_configured_endpoint(app: &AppHandle, guard: Arc<GuardState>) -> Self {
+        match crate::config::load_llm_endpoint(app) {
+            Some(endpoint) => {
+                log::info!("llm: booting against persisted endpoint {endpoint}");
+                Self::from_env(
+                    Some(endpoint),
+                    std::env::var("THIRD_EYE_THIN_MODEL").ok(),
+                    std::env::var("THIRD_EYE_HEAVY_MODEL").ok(),
+                    guard,
+                )
+            }
+            None => Self::with_default_endpoint(guard),
+        }
     }
 
     /// The whole construction path of [`Self::with_default_endpoint`] minus
@@ -640,9 +664,10 @@ pub async fn chat(
 
     let task_app = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        // Tray shows "watching" for the whole stream; the guard drops on
-        // every exit path, including abort — single-flight supersede aborts
-        // this task, which drops the future and runs this destructor.
+        // Tray shows the "working" animation (Stream → ActivityClass::Working)
+        // for the whole run, tool rounds included; the guard drops on every
+        // exit path, including abort — single-flight supersede aborts this
+        // task, which drops the future and runs this destructor.
         #[cfg(desktop)]
         let _activity =
             crate::tray::begin_activity(&task_app, crate::tray::ActivityKind::Stream);
@@ -743,8 +768,21 @@ pub async fn chat(
         // across conversations.
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
+        // Synthesized keystrokes are delivered to the GLOBAL key window, and the
+        // overlay — a nonactivating key panel — keeps key status even while the
+        // app the model just fronted is active. Yield it before every
+        // type-text/key-press or the keys land back in Third Eye's own prompt
+        // (the "asked for a Chrome search, typed into the overlay" report). A
+        // failed yield refuses the action typed — never keystrokes into the
+        // wrong window.
+        let yield_app = task_app.clone();
+        let keyboard_safe_backend: Arc<dyn crate::input::InputControl> =
+            Arc::new(crate::input::KeyboardFocusYield::new(
+                input_state.backend(),
+                Arc::new(move || crate::overlay::yield_key_focus(&yield_app)),
+            ));
         executors.push(Box::new(ApprovalGate::new(
-            InputTool::new(input_state.backend(), input_state.arm_state()),
+            InputTool::new(keyboard_safe_backend, input_state.arm_state()),
             FocusAppTool::new(appfocus_state.backend()),
             mode,
             approval.whitelist(),
@@ -1021,6 +1059,110 @@ pub fn run_state(state: State<'_, LlmState>) -> RunStatePayload {
 #[tauri::command]
 pub fn model_info(state: State<'_, LlmState>) -> ModelInfo {
     state.model_info()
+}
+
+/// The endpoint-config IPC surface (S05): what this run targets, what is
+/// persisted, and what an unset override falls back to. Health-as-value like
+/// `model_info` — a snapshot at any time, never an error.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointStatus {
+    /// The endpoint this run's router actually targets (fixed per run).
+    pub active: String,
+    /// The persisted override from settings.json, if any.
+    pub configured: Option<String>,
+    /// What the app uses when no override is stored: `THIRD_EYE_ENDPOINT`
+    /// resolved through [`env_endpoint`] (so the project default when unset).
+    pub fallback: String,
+    /// True when the persisted choice differs from the running endpoint —
+    /// the change applies on the next launch.
+    pub restart_required: bool,
+}
+
+/// Assemble an [`EndpointStatus`] — pure so the restart-required contract is
+/// unit-testable without a Tauri runtime: the effective next-launch endpoint
+/// (configured, else fallback) is compared against the running one.
+fn endpoint_status_for(active: &str, configured: Option<String>, fallback: String) -> EndpointStatus {
+    let effective = configured.as_deref().unwrap_or(&fallback);
+    EndpointStatus {
+        active: active.to_string(),
+        restart_required: effective != active,
+        configured,
+        fallback,
+    }
+}
+
+/// Validate and normalize a user-entered endpoint: trimmed, trailing slashes
+/// dropped (the `env_endpoint` normalization), and required to parse as an
+/// http(s) URL with a host — the same bar `config::stored_llm_endpoint`
+/// applies on load, enforced here too so a bad value is rejected at save time
+/// with a message instead of being silently repaired away on the next boot.
+fn normalized_endpoint(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("endpoint is empty — save an http(s) URL, or Reset to use the default".into());
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some() => {
+            Ok(trimmed.to_string())
+        }
+        Ok(parsed) => Err(format!(
+            "endpoint must be an http(s) URL with a host (got \"{}\", scheme \"{}\")",
+            trimmed,
+            parsed.scheme()
+        )),
+        Err(e) => Err(format!("\"{trimmed}\" is not a valid URL: {e}")),
+    }
+}
+
+/// Current endpoint configuration (mount-time query for the Settings Models
+/// page): running endpoint, persisted override, and the env/default fallback.
+#[tauri::command]
+pub fn llm_endpoint_status(app: AppHandle, state: State<'_, LlmState>) -> EndpointStatus {
+    let status = endpoint_status_for(
+        state.router.endpoint(),
+        crate::config::load_llm_endpoint(&app),
+        env_endpoint(std::env::var("THIRD_EYE_ENDPOINT").ok()),
+    );
+    log::debug!(
+        "llm: endpoint status query active={} configured={:?} restartRequired={}",
+        status.active,
+        status.configured,
+        status.restart_required
+    );
+    status
+}
+
+/// Persist the local LLM endpoint override (S05). `None` resets to the
+/// env/default fallback. The value is validated (http(s) URL with a host)
+/// before it touches the store; rejection names the problem and leaves the
+/// persisted value unchanged. The running router keeps its per-run endpoint —
+/// the returned status carries `restartRequired` so the UI says so plainly.
+#[tauri::command]
+pub fn set_llm_endpoint(
+    app: AppHandle,
+    state: State<'_, LlmState>,
+    endpoint: Option<String>,
+) -> Result<EndpointStatus, String> {
+    let normalized = match endpoint.as_deref() {
+        Some(raw) => Some(normalized_endpoint(raw).inspect_err(|e| {
+            log::warn!("llm: set_llm_endpoint rejected: {e}");
+        })?),
+        None => None,
+    };
+    crate::config::save_llm_endpoint(&app, normalized.as_deref())?;
+    let status = endpoint_status_for(
+        state.router.endpoint(),
+        normalized,
+        env_endpoint(std::env::var("THIRD_EYE_ENDPOINT").ok()),
+    );
+    log::info!(
+        "llm: endpoint override set to {:?} (active this run: {}, restartRequired={})",
+        status.configured,
+        status.active,
+        status.restart_required
+    );
+    Ok(status)
 }
 
 /// Current privacy-guard telemetry (S03 mount-time query) — health-as-value
@@ -1816,6 +1958,61 @@ mod tests {
         assert_eq!(env_model(Some(String::new())), None);
         assert_eq!(env_model(Some("   ".into())), None);
         assert_eq!(env_model(Some(" qwen2.5-7b ".into())), Some("qwen2.5-7b".into()));
+    }
+
+    #[test]
+    fn endpoint_status_restart_required_only_when_effective_differs_from_active() {
+        // No override, fallback == active: the boring steady state.
+        let s = endpoint_status_for("http://localhost:1234", None, "http://localhost:1234".into());
+        assert!(!s.restart_required);
+        assert_eq!(s.configured, None);
+
+        // An override matching the running endpoint needs no restart.
+        let s = endpoint_status_for(
+            "http://127.0.0.1:11434",
+            Some("http://127.0.0.1:11434".into()),
+            "http://localhost:1234".into(),
+        );
+        assert!(!s.restart_required);
+
+        // An override differing from the running endpoint applies next launch.
+        let s = endpoint_status_for(
+            "http://localhost:1234",
+            Some("http://127.0.0.1:11434".into()),
+            "http://localhost:1234".into(),
+        );
+        assert!(s.restart_required);
+
+        // A *reset* while running on an old override: effective is the
+        // fallback again, which differs from the running endpoint.
+        let s = endpoint_status_for(
+            "http://127.0.0.1:11434",
+            None,
+            "http://localhost:1234".into(),
+        );
+        assert!(s.restart_required);
+    }
+
+    #[test]
+    fn normalized_endpoint_trims_and_strips_trailing_slashes() {
+        assert_eq!(
+            normalized_endpoint("  http://127.0.0.1:11434/  ").unwrap(),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            normalized_endpoint("https://llm.lan:8080").unwrap(),
+            "https://llm.lan:8080"
+        );
+    }
+
+    #[test]
+    fn normalized_endpoint_rejects_blank_and_non_http_values() {
+        // The save-time bar matches config::stored_llm_endpoint's load-time
+        // bar: a value that would be repaired away on the next boot must be
+        // rejected here with a message instead of persisting silently dead.
+        for bad in ["", "   ", "localhost:1234", "ws://127.0.0.1:1234", "file:///tmp/x", "/a/path"] {
+            assert!(normalized_endpoint(bad).is_err(), "must reject {bad:?}");
+        }
     }
 
     #[test]

@@ -1,28 +1,65 @@
-//! Live macOS app-focus backend: list the running apps via NSWorkspace,
-//! best-effort match the requested name, and bring the match to the front via
-//! `NSRunningApplication::activateWithOptions`.
+//! Live macOS app-focus backend: launch-or-focus with frontmost verification.
 //!
-//! App activation needs no TCC entitlement (unlike Screen Recording or
-//! Accessibility), so there is no permission preflight — the only failure
-//! classes are `not-found` (no running app matched) and `activation-failed`
-//! (the match quit, or the OS refused the activate request).
+//! Resolution order for a `focus` request:
+//! 1. Match the name against the *running* apps (NSWorkspace roster) and
+//!    activate the match via `NSRunningApplication::activateWithOptions`.
+//! 2. Verify the app actually became frontmost. On macOS 14+ cooperative
+//!    activation the activate call can return `true` while the system quietly
+//!    drops the request (Third Eye's panels are nonactivating, so it is never
+//!    the active app and holds no activation privilege) — and activating an
+//!    app whose windows are all closed fronts nothing visible. Both read as
+//!    "the tool said it opened Chrome and nothing happened", so acceptance is
+//!    never reported as success.
+//! 3. When activation did not verifiably front the app, or nothing running
+//!    matched, route through Launch Services (`/usr/bin/open`): for a running
+//!    app that sends the reopen event that makes a window-less app show a
+//!    window; for a not-running app it resolves an installed `*.app` bundle
+//!    by name and launches it. Success is again only the verified-frontmost
+//!    outcome.
+//!
+//! App activation and Launch Services opens need no TCC entitlement (unlike
+//! Screen Recording or Accessibility), so there is no permission preflight —
+//! the failure classes stay `not-found` (nothing running or installed
+//! matched) and `activation-failed` (matched but never fronted).
 //!
 //! objc2-app-kit is generated ObjC bindings; every message send is `unsafe` at
-//! the ABI level but the crate exposes them as safe `pub fn`s. The name-matching
-//! logic is extracted into the pure [`best_match`] free function so it is
-//! unit-tested exhaustively without activating anything; only the workspace
-//! roster read and the activate call touch the live system.
+//! the ABI level but the crate exposes them as safe `pub fn`s. All AppKit
+//! handles live inside synchronous helpers — none is held across an `await`,
+//! so the `focus` future stays `Send` for the tool loop's spawned task. The
+//! name-matching logic ([`best_match`], [`names_match`]) and the bundle scan
+//! ([`installed_apps`]) are pure/fs-only free functions, unit-tested without
+//! activating anything.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use objc2_app_kit::{NSApplicationActivationOptions, NSWorkspace};
 
 use super::{AppFocus, AppFocusError, FocusedApp};
 
-/// The live macOS backend: one NSWorkspace roster read per `focus`, matched by
-/// localized name and activated (bringing all its windows forward).
+/// How long a plain activation of a running app gets to verifiably front it
+/// before the Launch Services fallback kicks in.
+const ACTIVATE_VERIFY_MS: u64 = 1_200;
+
+/// How long a Launch Services reopen of a *running* app gets to front it.
+/// Generous because this path already means the plain activation was dropped —
+/// the system is being uncooperative or the app is rebuilding a window.
+const REOPEN_VERIFY_MS: u64 = 5_000;
+
+/// How long a fresh launch gets to front the app — cold starts of heavy apps
+/// (Chrome, Xcode) take seconds. Paid in full only on failure; success
+/// returns at the first poll that sees the app frontmost.
+const LAUNCH_VERIFY_MS: u64 = 8_000;
+
+/// Frontmost-poll cadence during verification.
+const VERIFY_POLL_MS: u64 = 150;
+
+/// The live macOS backend: launch-or-focus by name, success = verified
+/// frontmost.
 pub struct MacosAppFocus;
 
-/// Best-effort match of a requested app name against the running app names,
+/// Best-effort match of a requested app name against candidate app names,
 /// case-insensitive: an exact (whole-name) match wins first, then the first
 /// substring match. Returns the index into `candidates`, or `None` when nothing
 /// matches. Pure and total — the whole matching policy in one testable place,
@@ -41,6 +78,52 @@ pub fn best_match(requested: &str, candidates: &[String]) -> Option<usize> {
     candidates.iter().position(|c| c.to_lowercase().contains(&needle))
 }
 
+/// Loose two-way containment match (case-insensitive, trimmed) between an
+/// expected app name and the frontmost app's localized name. Loose because
+/// the two come from different namespaces — a bundle's file stem
+/// ("Google Chrome" from `Google Chrome.app`) versus the runtime localized
+/// name — and an exact-equality check would call a genuinely fronted app a
+/// failure over a cosmetic suffix.
+pub fn names_match(a: &str, b: &str) -> bool {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
+/// The standard Launch Services install roots, scanned in order. User apps
+/// first so a per-user install shadows a system copy the same way Finder's
+/// "Open" does.
+fn installed_app_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications"));
+    }
+    roots.push(PathBuf::from("/Applications"));
+    roots.push(PathBuf::from("/System/Applications"));
+    roots.push(PathBuf::from("/System/Applications/Utilities"));
+    roots
+}
+
+/// Scan `roots` (non-recursively) for `*.app` bundles: (display name = file
+/// stem, bundle path). Missing/unreadable roots are skipped — an absent
+/// `~/Applications` is normal, never an error. Takes the roots as a parameter
+/// so tests scan a temp directory instead of the live disk.
+pub fn installed_apps(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let mut apps = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("app") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    apps.push((stem.to_string(), path));
+                }
+            }
+        }
+    }
+    apps
+}
+
 /// Snapshot the localized names of the currently running apps. Apps without a
 /// localized name (rare background helpers) are skipped — they are never a
 /// user-visible target the model would name.
@@ -52,57 +135,207 @@ fn running_app_names(workspace: &NSWorkspace) -> Vec<String> {
         .collect()
 }
 
+/// The frontmost app's display name, or `None` when it cannot be determined.
+///
+/// Queried through `lsappinfo` (a direct launchservicesd client), NOT
+/// `NSWorkspace::frontmostApplication`: that AppKit property is KVO-backed
+/// state that only refreshes while a main run loop pumps, so a process
+/// without one (the cargo test harness) — and any read racing the run loop —
+/// sees a frozen snapshot and calls a genuinely fronted app a failure.
+async fn frontmost_app_name() -> Option<String> {
+    let front = tokio::process::Command::new("/usr/bin/lsappinfo")
+        .arg("front")
+        .output()
+        .await
+        .ok()?;
+    let asn = String::from_utf8_lossy(&front.stdout).trim().to_string();
+    if asn.is_empty() {
+        return None;
+    }
+    let info = tokio::process::Command::new("/usr/bin/lsappinfo")
+        .args(["info", "-only", "name", &asn])
+        .output()
+        .await
+        .ok()?;
+    parse_ls_display_name(&String::from_utf8_lossy(&info.stdout))
+}
+
+/// Extract the value from an lsappinfo `"LSDisplayName"="Finder"` line. Pure
+/// so the format assumption is pinned by a unit test.
+pub fn parse_ls_display_name(output: &str) -> Option<String> {
+    let (_, value) = output.split_once("\"LSDisplayName\"=")?;
+    let value = value.trim().strip_prefix('"')?;
+    Some(value[..value.find('"')?].to_string())
+}
+
+/// What one synchronous pass over the running roster did with the request.
+/// Plain owned data only — no AppKit handle escapes into the async caller.
+enum RunningActivation {
+    /// A running app matched; the activate request was sent. `accepted` is the
+    /// OS's claim, which verification treats as a hint, not an outcome.
+    Requested { matched: String, accepted: bool },
+    /// Nothing running matched (or the match quit mid-read); `candidates` is
+    /// the roster snapshot for the launch fallback / not-found payload.
+    NotRunning { candidates: Vec<String> },
+}
+
+/// Match `app_name` against the running apps and request activation of the
+/// match. Fully synchronous: every Retained AppKit handle drops before return.
+fn activate_running(app_name: &str) -> RunningActivation {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let apps = workspace.runningApplications();
+    // Read localized names once so the match index lines up with the roster.
+    let names: Vec<Option<String>> =
+        apps.iter().map(|app| app.localizedName().map(|n| n.to_string())).collect();
+    let candidates: Vec<String> = names.iter().flatten().cloned().collect();
+
+    let Some(matched_idx) = best_match(app_name, &candidates) else {
+        return RunningActivation::NotRunning { candidates };
+    };
+
+    // Map the candidate index (which skipped un-named apps) back to the app
+    // handle: candidates are the flattened names in roster order, so the
+    // Nth candidate is the Nth app that had a name.
+    let matched = candidates[matched_idx].clone();
+    let app = apps
+        .iter()
+        .zip(names.iter())
+        .filter_map(|(app, name)| name.as_ref().map(|_| app))
+        .nth(matched_idx);
+    match app {
+        Some(app) => {
+            let accepted =
+                app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+            RunningActivation::Requested { matched, accepted }
+        }
+        // The roster changed between the name snapshot and this lookup — the
+        // matched app is gone. Fall through to the launch path, which will
+        // find it installed and start it fresh.
+        None => RunningActivation::NotRunning { candidates },
+    }
+}
+
+/// Poll until the frontmost app matches `expected`, returning its actual
+/// localized name — the value `screen_query`'s per-app filter must be fed,
+/// since `attribute_app` labels elements with runtime localized names.
+async fn verify_fronted(expected: &str, timeout_ms: u64) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(front) = frontmost_app_name().await {
+            if names_match(&front, expected) {
+                return Some(front);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(VERIFY_POLL_MS)).await;
+    }
+}
+
+/// Open `target` through Launch Services and verify `expected` fronted.
+/// `open -a <name>` on a running app activates it *and* sends the reopen that
+/// makes a window-less app show a window; `open <bundle path>` launches a
+/// not-running app. Ok carries the verified frontmost localized name; Err a
+/// human-readable detail for `activation-failed`.
+async fn open_and_verify(
+    target: OpenTarget<'_>,
+    expected: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("/usr/bin/open");
+    match target {
+        OpenTarget::Name(name) => {
+            cmd.arg("-a").arg(name);
+        }
+        OpenTarget::Bundle(path) => {
+            cmd.arg(path);
+        }
+    }
+    let output =
+        cmd.output().await.map_err(|e| format!("could not run /usr/bin/open: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("open exited with {}: {}", output.status, stderr.trim()));
+    }
+    verify_fronted(expected, timeout_ms).await.ok_or_else(|| {
+        format!(
+            "{expected:?} was opened but never came to the front within {timeout_ms}ms — \
+             macOS may have denied the activation"
+        )
+    })
+}
+
+/// What `open_and_verify` should hand Launch Services.
+enum OpenTarget<'a> {
+    /// A running app's localized name (`open -a` — activate + reopen).
+    Name(&'a str),
+    /// An installed bundle path (`open` — launch).
+    Bundle(&'a Path),
+}
+
 #[async_trait]
 impl AppFocus for MacosAppFocus {
     async fn focus(&self, app_name: &str) -> Result<FocusedApp, AppFocusError> {
-        let workspace = NSWorkspace::sharedWorkspace();
-        let apps = workspace.runningApplications();
-        // Read localized names once so the match index lines up with the roster.
-        let names: Vec<Option<String>> =
-            apps.iter().map(|app| app.localizedName().map(|n| n.to_string())).collect();
-        let candidates: Vec<String> = names.iter().flatten().cloned().collect();
-
-        let Some(matched_idx) = best_match(app_name, &candidates) else {
-            let err = AppFocusError::NotFound {
-                requested: app_name.to_string(),
-                candidates,
-            };
-            log::warn!("focus_app: {} ({err})", err.kind());
-            return Err(err);
-        };
-
-        // Map the candidate index (which skipped un-named apps) back to the app
-        // handle: candidates are the flattened names in roster order, so the
-        // Nth candidate is the Nth app that had a name.
-        let matched_name = candidates[matched_idx].clone();
-        let app = apps
-            .iter()
-            .zip(names.iter())
-            .filter_map(|(app, name)| name.as_ref().map(|n| (app, n.clone())))
-            .nth(matched_idx)
-            .map(|(app, _)| app);
-        let Some(app) = app else {
-            // The roster changed between the name snapshot and this lookup — the
-            // matched app is gone. Typed activation-failed, never a panic.
-            let err = AppFocusError::ActivationFailed {
-                detail: format!("app {matched_name:?} left the roster before activation"),
-            };
-            log::warn!("focus_app: {} ({err})", err.kind());
-            return Err(err);
-        };
-
-        // activateWithOptions returns false if the app quit or is of a type that
-        // cannot be activated — a typed activation-failed, never a silent no-op.
-        let activated = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-        if activated {
-            log::info!("focus_app: activated {matched_name:?}");
-            Ok(FocusedApp { app: matched_name })
-        } else {
-            let err = AppFocusError::ActivationFailed {
-                detail: format!("the OS refused to activate {matched_name:?}"),
-            };
-            log::warn!("focus_app: {} ({err})", err.kind());
-            Err(err)
+        match activate_running(app_name) {
+            RunningActivation::Requested { matched, accepted } => {
+                if accepted {
+                    if let Some(front) = verify_fronted(&matched, ACTIVATE_VERIFY_MS).await {
+                        log::info!("focus_app: activated {front:?}");
+                        return Ok(FocusedApp { app: front, launched: false });
+                    }
+                }
+                // The OS refused, quietly dropped the request (cooperative
+                // activation), or the app has no window to bring forward —
+                // Launch Services activate+reopen is the recovery for all
+                // three.
+                log::info!(
+                    "focus_app: plain activation of {matched:?} did not front it \
+                     (accepted={accepted}); retrying via Launch Services reopen"
+                );
+                match open_and_verify(OpenTarget::Name(&matched), &matched, REOPEN_VERIFY_MS)
+                    .await
+                {
+                    Ok(front) => {
+                        log::info!("focus_app: fronted {front:?} via reopen");
+                        Ok(FocusedApp { app: front, launched: false })
+                    }
+                    Err(detail) => {
+                        let err = AppFocusError::ActivationFailed { detail };
+                        log::warn!("focus_app: {} ({err})", err.kind());
+                        Err(err)
+                    }
+                }
+            }
+            RunningActivation::NotRunning { candidates } => {
+                // Nothing running matched — resolve an installed bundle and
+                // launch it. The scan is per-request: installs are rare and a
+                // roster-freshness bug would be worse than the ~ms of readdir.
+                let installed = installed_apps(&installed_app_roots());
+                let names: Vec<String> =
+                    installed.iter().map(|(name, _)| name.clone()).collect();
+                let Some(idx) = best_match(app_name, &names) else {
+                    let err = AppFocusError::NotFound {
+                        requested: app_name.to_string(),
+                        candidates,
+                    };
+                    log::warn!("focus_app: {} ({err})", err.kind());
+                    return Err(err);
+                };
+                let (name, path) = installed[idx].clone();
+                log::info!("focus_app: {app_name:?} not running; launching {:?}", path);
+                match open_and_verify(OpenTarget::Bundle(&path), &name, LAUNCH_VERIFY_MS).await {
+                    Ok(front) => {
+                        log::info!("focus_app: launched and fronted {front:?}");
+                        Ok(FocusedApp { app: front, launched: true })
+                    }
+                    Err(detail) => {
+                        let err = AppFocusError::ActivationFailed { detail };
+                        log::warn!("focus_app: {} ({err})", err.kind());
+                        Err(err)
+                    }
+                }
+            }
         }
     }
 
@@ -165,9 +398,69 @@ mod tests {
         assert_eq!(best_match("  Zed  ", &apps), Some(1));
     }
 
+    #[test]
+    fn names_match_is_loose_both_ways_and_never_blank() {
+        // Same name, different case/padding.
+        assert!(names_match("Google Chrome", "google chrome "));
+        // Bundle stem vs runtime localized name, either direction.
+        assert!(names_match("Google Chrome", "Google Chrome Beta"));
+        assert!(names_match("Google Chrome Beta", "Google Chrome"));
+        // Genuinely different apps do not match.
+        assert!(!names_match("Safari", "Google Chrome"));
+        // A blank side must never match everything.
+        assert!(!names_match("", "Google Chrome"));
+        assert!(!names_match("Google Chrome", "   "));
+    }
+
+    #[test]
+    fn parse_ls_display_name_pins_the_lsappinfo_format() {
+        assert_eq!(
+            parse_ls_display_name("\"LSDisplayName\"=\"Finder\"\n"),
+            Some("Finder".to_string())
+        );
+        assert_eq!(
+            parse_ls_display_name("\"LSDisplayName\"=\"Google Chrome\""),
+            Some("Google Chrome".to_string())
+        );
+        // Unexpected shapes degrade to None, never a panic mid-verification.
+        assert_eq!(parse_ls_display_name(""), None);
+        assert_eq!(parse_ls_display_name("\"LSDisplayName\"="), None);
+        assert_eq!(parse_ls_display_name("garbage"), None);
+    }
+
+    #[test]
+    fn installed_apps_scans_only_app_bundles_and_skips_missing_roots() {
+        let root = std::env::temp_dir()
+            .join(format!("third-eye-appfocus-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Google Chrome.app")).unwrap();
+        std::fs::create_dir_all(root.join("Zed.app")).unwrap();
+        // A non-bundle directory and a plain file must both be skipped.
+        std::fs::create_dir_all(root.join("Utilities")).unwrap();
+        std::fs::write(root.join("readme.txt"), "not an app").unwrap();
+
+        let missing = root.join("no-such-dir");
+        let apps = installed_apps(&[missing, root.clone()]);
+        let mut names: Vec<&str> = apps.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Google Chrome", "Zed"]);
+        // The stem→path pairing points at the bundle itself.
+        let chrome = apps.iter().find(|(n, _)| n == "Google Chrome").unwrap();
+        assert_eq!(chrome.1, root.join("Google Chrome.app"));
+
+        // best_match composes over the scanned names — the launch path's
+        // fuzzy resolution ("chrome" → the Chrome bundle).
+        let scanned: Vec<String> = apps.iter().map(|(n, _)| n.clone()).collect();
+        let idx = best_match("chrome", &scanned).unwrap();
+        assert_eq!(scanned[idx], "Google Chrome");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Live run of the full backend against the real workspace (MEM038
     /// precedent) — activates a real app, ignored in the default suite. Focusing
-    /// a name that is not running must fail *typed* (not-found), never panic.
+    /// a name that is neither running nor installed must fail *typed*
+    /// (not-found), never panic.
     #[tokio::test]
     #[ignore = "activates a real app and reads the live workspace (slice UAT)"]
     async fn real_app_focus_smoke() {
@@ -175,21 +468,47 @@ mod tests {
         let running = backend.running_apps().await;
         println!("focus_app: {} running app(s): {running:?}", running.len());
 
-        // A guaranteed-absent name must be typed not-found carrying the roster.
+        // A guaranteed-absent name must be typed not-found carrying a roster.
+        // Not compared element-wise against `running`: background helpers
+        // (npm/MCP children) churn between the two roster reads.
         match backend.focus("no-such-app-zzz").await {
             Ok(f) => panic!("unexpected activation of {:?}", f.app),
             Err(err) => {
                 assert_eq!(err.kind(), "not-found");
                 if let AppFocusError::NotFound { candidates, .. } = err {
-                    assert_eq!(candidates, running);
+                    assert!(!candidates.is_empty(), "candidates must carry the roster");
                 }
             }
         }
 
-        // If Finder is running (it always is), fronting it must succeed.
+        // If Finder is running (it always is), fronting it must succeed and
+        // report focused-not-launched.
         if running.iter().any(|a| a == "Finder") {
             let focused = backend.focus("Finder").await.unwrap();
             assert_eq!(focused.app, "Finder");
+            assert!(!focused.launched, "Finder was already running");
         }
+    }
+
+    /// Live launch-path proof: focusing an app that is NOT running must launch
+    /// it, verify it fronted, and report `launched: true`. Uses Calculator
+    /// (small, instant, stateless) and quits it afterwards so the UAT leaves
+    /// no app behind. Skips silently when Calculator is already running —
+    /// then it cannot prove the launch path.
+    #[tokio::test]
+    #[ignore = "launches and quits a real app (slice UAT)"]
+    async fn real_app_launch_smoke() {
+        let backend: Arc<dyn AppFocus> = Arc::new(MacosAppFocus);
+        if backend.running_apps().await.iter().any(|a| a == "Calculator") {
+            println!("focus_app launch smoke: Calculator already running — skipping");
+            return;
+        }
+        let focused = backend.focus("Calculator").await.unwrap();
+        assert_eq!(focused.app, "Calculator");
+        assert!(focused.launched, "Calculator was not running — this must be a launch");
+        // Clean up: quit the app the test started.
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", "quit app \"Calculator\""])
+            .status();
     }
 }

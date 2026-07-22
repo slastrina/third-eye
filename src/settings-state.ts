@@ -29,6 +29,31 @@ export interface AutostartStatus {
   error: string | null;
 }
 
+/** Endpoint-config snapshot `{ active, configured, fallback, restartRequired }`
+ *  — the serde camelCase serialization of Rust's EndpointStatus. `active` is
+ *  what this run targets (fixed per run); `configured` the persisted override
+ *  (null = none); `fallback` what an unset override resolves to;
+ *  `restartRequired` true when the persisted choice differs from `active`. */
+export interface EndpointStatus {
+  active: string;
+  configured: string | null;
+  fallback: string;
+  restartRequired: boolean;
+}
+
+/** Read the current endpoint configuration (mount-time query). */
+export function llmEndpointStatus(): Promise<EndpointStatus> {
+  return invoke<EndpointStatus>("llm_endpoint_status");
+}
+
+/** Persist the local model endpoint override; `null` resets to the fallback.
+ *  Resolves to the updated status (the change applies on next launch —
+ *  `restartRequired` says so); rejects with a string naming an invalid URL
+ *  or the failed persist path, leaving the stored value unchanged. */
+export function setLlmEndpoint(endpoint: string | null): Promise<EndpointStatus> {
+  return invoke<EndpointStatus>("set_llm_endpoint", { endpoint });
+}
+
 /** List the model ids the LM Studio endpoint actually serves. Rejects with
  *  the kind-tagged LlmError (`offline`) on any transport/protocol failure —
  *  for the pickers, can't-list and endpoint-down are the same state. */
@@ -98,6 +123,12 @@ export interface SettingsState {
   /** Last rejected lane pin, naming the lane (routing stays unchanged
    *  backend-side, so the pickers keep showing the real state). */
   laneError: string | null;
+  /** Endpoint configuration snapshot; null until the mount-time
+   *  `llm_endpoint_status` resolves (or forever, outside Tauri). */
+  endpoint: EndpointStatus | null;
+  /** Why the last endpoint save was rejected (invalid URL / persist failure);
+   *  the stored value is unchanged backend-side. */
+  endpointError: string | null;
   /** Privacy toggle state; `error` carries a persist failure. Null until
    *  the mount-time query resolves (toggle renders unavailable). */
   privacy: PrivacyStatus | null;
@@ -117,6 +148,8 @@ export const initialSettingsState: SettingsState = {
   modelsLoading: false,
   modelsError: null,
   laneError: null,
+  endpoint: null,
+  endpointError: null,
   privacy: null,
   hid: null,
   hotkey: null,
@@ -129,6 +162,8 @@ export type SettingsAction =
   | { type: "models-error"; error: ModelsError }
   | { type: "model-info"; info: ModelInfo }
   | { type: "lane-error"; lane: string; detail: string }
+  | { type: "endpoint"; status: EndpointStatus }
+  | { type: "endpoint-error"; detail: string }
   | { type: "privacy"; status: PrivacyStatus }
   | { type: "hid"; status: HidArmedStatus }
   | { type: "hotkey"; status: HotkeyStatus }
@@ -151,6 +186,13 @@ export function settingsReducer(state: SettingsState, action: SettingsAction): S
       return { ...state, modelInfo: action.info, laneError: null };
     case "lane-error":
       return { ...state, laneError: `${action.lane}: ${action.detail}` };
+    case "endpoint":
+      // Mount-time query and set_llm_endpoint responses land here — the
+      // backend snapshot is authoritative. A successful update supersedes
+      // any stale save rejection.
+      return { ...state, endpoint: action.status, endpointError: null };
+    case "endpoint-error":
+      return { ...state, endpointError: action.detail };
     case "privacy":
       // Mount-time query, set_privacy_mode responses, and the
       // capture://privacy broadcast (tray toggles included) land here.
@@ -170,6 +212,32 @@ export function settingsReducer(state: SettingsState, action: SettingsAction): S
 // ---------------------------------------------------------------------------
 // Picker + copy helpers (pure)
 // ---------------------------------------------------------------------------
+
+/** The value the endpoint input should show for a status: the persisted
+ *  override when one is set, else the fallback the next launch would use.
+ *  Null status (outside Tauri) seeds an empty input. */
+export function endpointDraftFor(status: EndpointStatus | null): string {
+  if (status === null) return "";
+  return status.configured ?? status.fallback;
+}
+
+/** Whether an endpoint URL targets this machine — mirrors the Rust guard's
+ *  EndpointTrust::classify (literal localhost, 127.0.0.0/8, or ::1). The
+ *  Models page shows the external-endpoint privacy note when this is false:
+ *  the guard redacts text and blocks screenshots on non-loopback endpoints.
+ *  Unparseable URLs count as non-loopback, same fail-closed direction. */
+export function isLoopbackEndpoint(endpoint: string): boolean {
+  let host: string;
+  try {
+    host = new URL(endpoint).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost") return true;
+  if (/^127(\.\d{1,3}){3}$/.test(host)) return true;
+  // Browsers keep IPv6 brackets in `hostname` inconsistently — accept both.
+  return host === "::1" || host === "[::1]";
+}
 
 /** Options for a lane picker: the fetched model list, with the lane's
  *  current pin prepended when the endpoint no longer lists it — the select

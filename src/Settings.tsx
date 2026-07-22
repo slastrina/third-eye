@@ -62,14 +62,23 @@ import {
   mcpServers,
   mcpStatus,
   onMcpStateChanged,
+  parseServersJson,
+  serversToJson,
   setMcpAuth,
   setMcpRunMode,
   setMcpServers,
   type McpAuthError,
+  type McpJsonError,
   type McpRunMode,
   type McpServerConfig,
   type McpTransport,
 } from "./mcp-state";
+import {
+  SECTION_GROUPS,
+  filterGroups,
+  sectionFromSearch,
+  type SectionId,
+} from "./settings-nav";
 import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geometry";
 import {
   drawerEdgeOf,
@@ -111,19 +120,24 @@ import {
 } from "./privacy-state";
 import {
   autostartStatus,
+  endpointDraftFor,
   HID_RUN_MODE_OPTIONS,
   hidModeShowsAutoRunWarning,
   hideSettingsWindow,
   hotkeyStatus,
   initialSettingsState,
+  isLoopbackEndpoint,
   laneOptions,
   listModels,
+  llmEndpointStatus,
   modelsErrorDetail,
   modelsErrorTitle,
   setLaneModel,
+  setLlmEndpoint,
   setPrivacyMode,
   settingsReducer,
   toModelsError,
+  type EndpointStatus,
 } from "./settings-state";
 import {
   capturedAtLabel,
@@ -182,6 +196,26 @@ function Settings() {
   const [memory, dispatchMemory] = useReducer(memoryReducer, initialMemoryViewState);
   const [cloud, dispatchCloud] = useReducer(cloudReducer, initialCloudViewState);
   const [mcp, dispatchMcp] = useReducer(mcpReducer, initialMcpViewState);
+  // PyCharm-style navigation: one page shown at a time, picked from the
+  // grouped sidebar. The initial page honors the ?section= deep link (used by
+  // Playwright and any future "open settings at X" caller); an unknown value
+  // falls back to the default page. Pure view state — all backend snapshots
+  // and subscriptions live above this in the component, so switching pages
+  // never drops live state.
+  const [active, setActive] = useState<SectionId>(() =>
+    sectionFromSearch(window.location.search),
+  );
+  const [navFilter, setNavFilter] = useState("");
+  // The MCP "Edit as JSON" mode: the draft is seeded from the authoritative
+  // persisted list on entry and exists only while the editor is open — the
+  // structured list view always renders backend truth. A refused draft rides
+  // `error` in the banner (never a silent no-op); bearer tokens are keychain
+  // refs in this JSON, never token material (R018).
+  const [mcpJson, setMcpJson] = useState<{
+    open: boolean;
+    draft: string;
+    error: McpJsonError | null;
+  }>({ open: false, draft: "", error: null });
   // The add-server draft lives in local component state — never in the reducer,
   // which only ever holds the backend-authoritative persisted list. Cleared the
   // instant a server is handed to set_mcp_servers.
@@ -234,11 +268,31 @@ function Settings() {
   // never optimistically mutating (MEM082/MEM027), so the two windows can't drift.
   const [presentation, setPresentation] = useState<PresentationStatus | null>(null);
 
+  // The endpoint input draft lives in local state (typing must not round-trip
+  // through the backend); the authoritative EndpointStatus lives in the
+  // reducer. Seeded from every status that arrives (mount query and save
+  // responses) so the input always restarts from the persisted truth.
+  const [endpointDraft, setEndpointDraft] = useState("");
+  const applyEndpointStatus = (status: EndpointStatus) => {
+    dispatch({ type: "endpoint", status });
+    setEndpointDraft(endpointDraftFor(status));
+  };
+
   const refreshModels = () => {
     dispatch({ type: "models-loading" });
     listModels().then(
       (models) => dispatch({ type: "models-loaded", models }),
       (err) => dispatch({ type: "models-error", error: toModelsError(err) }),
+    );
+  };
+
+  // Persist the endpoint draft; a blank input is an explicit reset (null),
+  // same as the Reset button. The backend validates and returns the updated
+  // status — restartRequired then drives the "restart to apply" hint.
+  const saveEndpoint = (draft: string | null) => {
+    const trimmed = draft?.trim() ?? "";
+    setLlmEndpoint(trimmed === "" ? null : trimmed).then(applyEndpointStatus, (err) =>
+      dispatch({ type: "endpoint-error", detail: String(err) }),
     );
   };
 
@@ -249,6 +303,9 @@ function Settings() {
     modelInfo().then(
       (info) => dispatch({ type: "model-info", info }),
       (err) => console.debug("settings: model_info unavailable:", err),
+    );
+    llmEndpointStatus().then(applyEndpointStatus, (err) =>
+      console.debug("settings: llm_endpoint_status unavailable:", err),
     );
     privacyStatus().then(
       (status) => dispatch({ type: "privacy", status }),
@@ -518,6 +575,38 @@ function Settings() {
     );
   };
 
+  const openMcpJson = () => {
+    setMcpJson({ open: true, draft: serversToJson(mcp.servers ?? []), error: null });
+  };
+
+  const closeMcpJson = () => {
+    setMcpJson({ open: false, draft: "", error: null });
+  };
+
+  // Apply the JSON draft: validate, clear keychain tokens for any remote
+  // server the edit removed (a dangling secret for a deleted server is a leak
+  // — the same R018 property removeServer holds), then persist the whole list
+  // through the single write path.
+  const applyMcpJson = () => {
+    const result = parseServersJson(mcpJson.draft);
+    if ("error" in result) {
+      setMcpJson((prev) => ({ ...prev, error: result.error }));
+      return;
+    }
+    const nextIds = new Set(result.servers.map((s) => s.id));
+    for (const server of mcp.servers ?? []) {
+      if (server.transport === "http" && server.authRef && !nextIds.has(server.id)) {
+        const authRef = server.authRef;
+        deleteMcpAuth(authRef).then(
+          (status) => setMcpAuthPresent((prev) => ({ ...prev, [authRef]: status.present })),
+          (err) => console.debug("settings: delete_mcp_auth unavailable:", err),
+        );
+      }
+    }
+    persistServers(result.servers);
+    closeMcpJson();
+  };
+
   // Whether the current add-server draft is complete enough to persist: a stdio
   // server needs an id + command; an http server needs an id + url (the token is
   // optional — an unauthenticated remote server is valid).
@@ -727,6 +816,37 @@ function Settings() {
           </button>
         </header>
 
+        <div className="settings-body">
+        <nav className="settings-nav" aria-label="Settings sections">
+          <input
+            type="search"
+            className="settings-nav-search"
+            aria-label="Search settings"
+            placeholder="Search settings"
+            value={navFilter}
+            onChange={(event) => setNavFilter(event.target.value)}
+          />
+          {filterGroups(SECTION_GROUPS, navFilter).map((group) => (
+            <div key={group.title} className="settings-nav-group">
+              <span className="settings-nav-group-title">{group.title}</span>
+              {group.entries.map((entry) => (
+                <button
+                  key={entry.id}
+                  type="button"
+                  className="settings-nav-item"
+                  data-section={entry.id}
+                  aria-current={active === entry.id ? "page" : undefined}
+                  onClick={() => setActive(entry.id)}
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+        <main className="settings-page">
+
+        {active === "models" && (
         <section className="settings-section" aria-labelledby="settings-models-heading">
           <div className="settings-section-header">
             <h2 id="settings-models-heading" className="settings-section-title">
@@ -745,6 +865,67 @@ function Settings() {
             <div className="settings-error" role="alert">
               <strong>{modelsErrorTitle(state.modelsError)}</strong>
               <span>{modelsErrorDetail(state.modelsError)}</span>
+            </div>
+          )}
+          {state.endpoint ? (
+            <>
+              <div className="settings-row">
+                <span className="settings-row-label">Endpoint</span>
+                <input
+                  type="text"
+                  className="settings-key-input"
+                  aria-label="Local model endpoint"
+                  data-endpoint-input
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={state.endpoint.fallback}
+                  value={endpointDraft}
+                  onChange={(event) => setEndpointDraft(event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="settings-refresh"
+                  data-endpoint-save
+                  onClick={() => saveEndpoint(endpointDraft)}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="settings-refresh"
+                  data-endpoint-reset
+                  disabled={state.endpoint.configured === null}
+                  onClick={() => saveEndpoint(null)}
+                >
+                  Reset
+                </button>
+              </div>
+              <p className="settings-hint">
+                URL of an OpenAI-compatible server (LM Studio, Ollama, …). Save a blank
+                field or press Reset to return to the default.
+              </p>
+              {state.endpoint.restartRequired && (
+                <p className="settings-hint" data-endpoint-restart role="status">
+                  Saved — restart Third Eye to apply. This run is still using{" "}
+                  {state.endpoint.active}.
+                </p>
+              )}
+              {!isLoopbackEndpoint(state.endpoint.configured ?? state.endpoint.fallback) && (
+                <p className="settings-hint" data-endpoint-external>
+                  This endpoint is not on this machine: the privacy guard treats it as
+                  external — text is redacted and screenshots are never sent.
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="settings-unavailable">
+              Endpoint configuration is unavailable outside the app.
+            </p>
+          )}
+          {state.endpointError && (
+            <div className="settings-error" role="alert" data-endpoint-error>
+              <strong>Endpoint change rejected</strong>
+              <span>{state.endpointError}</span>
             </div>
           )}
           {lanes ? (
@@ -778,7 +959,9 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
 
+        {active === "privacy" && (
         <section className="settings-section" aria-labelledby="settings-privacy-heading">
           <h2 id="settings-privacy-heading" className="settings-section-title">
             Privacy
@@ -860,7 +1043,9 @@ function Settings() {
             )}
           </div>
         </section>
+        )}
 
+        {active === "input" && (
         <section className="settings-section" aria-labelledby="settings-hid-heading">
           <h2 id="settings-hid-heading" className="settings-section-title">
             Input Control
@@ -946,7 +1131,9 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
 
+        {active === "watcher" && (
         <section className="settings-section" aria-labelledby="settings-watcher-heading">
           <h2 id="settings-watcher-heading" className="settings-section-title">
             Watch Screen
@@ -1012,7 +1199,9 @@ function Settings() {
             )
           )}
         </section>
+        )}
 
+        {active === "overlay" && (
         <section className="settings-section" aria-labelledby="settings-overlay-heading">
           <h2 id="settings-overlay-heading" className="settings-section-title">
             Overlay
@@ -1089,7 +1278,9 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
 
+        {active === "nudges" && (
         <section className="settings-section" aria-labelledby="settings-nudges-heading">
           <h2 id="settings-nudges-heading" className="settings-section-title">
             Nudges
@@ -1128,7 +1319,9 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
 
+        {active === "cloud" && (
         <section className="settings-section" aria-labelledby="settings-cloud-heading">
           <h2 id="settings-cloud-heading" className="settings-section-title">
             Cloud Providers
@@ -1251,11 +1444,26 @@ function Settings() {
             </>
           )}
         </section>
+        )}
 
+        {active === "mcp" && (
         <section className="settings-section" aria-labelledby="settings-mcp-heading">
-          <h2 id="settings-mcp-heading" className="settings-section-title">
-            MCP Servers
-          </h2>
+          <div className="settings-section-header">
+            <h2 id="settings-mcp-heading" className="settings-section-title">
+              MCP Servers
+            </h2>
+            <button
+              type="button"
+              className="settings-refresh"
+              data-mcp-json-edit
+              // No authoritative list to edit outside the app — the button
+              // stays inert rather than seeding an editor from a null list.
+              disabled={mcp.servers === null}
+              onClick={mcpJson.open ? closeMcpJson : openMcpJson}
+            >
+              {mcpJson.open ? "Back to list" : "Edit as JSON"}
+            </button>
+          </div>
           <label className="settings-row">
             <span className="settings-row-label">External tools mode</span>
             <select
@@ -1305,6 +1513,51 @@ function Settings() {
               MCP state is unavailable outside the app.
             </p>
           )}
+          {mcpJson.open ? (
+            <>
+              <textarea
+                className="settings-json-input"
+                aria-label="MCP servers JSON"
+                data-mcp-json-input
+                spellCheck={false}
+                value={mcpJson.draft}
+                onChange={(event) =>
+                  setMcpJson((prev) => ({ ...prev, draft: event.target.value }))
+                }
+              />
+              {mcpJson.error && (
+                <div className="settings-error" role="alert" data-mcp-json-error>
+                  <strong>JSON rejected</strong>
+                  <span>{mcpJson.error.detail}</span>
+                </div>
+              )}
+              <div className="settings-row settings-json-actions">
+                <button
+                  type="button"
+                  className="settings-refresh"
+                  data-mcp-json-apply
+                  onClick={applyMcpJson}
+                >
+                  Apply
+                </button>
+                <button
+                  type="button"
+                  className="settings-refresh"
+                  data-mcp-json-cancel
+                  onClick={closeMcpJson}
+                >
+                  Cancel
+                </button>
+              </div>
+              <p className="settings-hint">
+                This is the exact list persisted in settings.json. Bearer tokens
+                never appear here — a remote server carries only its keychain
+                reference (authRef). Apply validates before saving; removing a
+                remote server also clears its stored token.
+              </p>
+            </>
+          ) : (
+            <>
           {mcp.servers?.map((server) => (
             <div
               key={server.id}
@@ -1491,6 +1744,8 @@ function Settings() {
             Remote (HTTP/SSE) servers connect to a URL with an optional bearer
             token stored in your OS keychain — never in settings.json.
           </p>
+            </>
+          )}
           {mcp.persistError && (
             <div className="settings-error" role="alert">
               <strong>Server list couldn't be saved</strong>
@@ -1498,7 +1753,9 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
 
+        {active === "memory" && (
         <section className="settings-section" aria-labelledby="settings-memory-heading">
           <h2 id="settings-memory-heading" className="settings-section-title">
             Memory
@@ -1735,7 +1992,9 @@ function Settings() {
             </>
           )}
         </section>
+        )}
 
+        {active === "status" && (
         <section className="settings-section" aria-labelledby="settings-status-heading">
           <h2 id="settings-status-heading" className="settings-section-title">
             Status
@@ -1765,6 +2024,10 @@ function Settings() {
             </div>
           )}
         </section>
+        )}
+
+        </main>
+        </div>
       </div>
     </div>
   );

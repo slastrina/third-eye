@@ -10,7 +10,7 @@ import { test, expect } from "@playwright/test";
 test("HID section renders off-by-default and degrades to a named unavailable state", async ({
   page,
 }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=input");
   await expect(page).toHaveTitle("Third Eye");
 
   // The Input Control section mounts with its heading.
@@ -37,7 +37,7 @@ test("HID section renders off-by-default and degrades to a named unavailable sta
 test("HID mode select offers Off / Ask / Auto-run and never mounts the overlay", async ({
   page,
 }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=input");
 
   // All three run modes are advertised as options, Off first (the default).
   const options = page.getByLabel("Input Control mode").locator("option");
@@ -53,7 +53,7 @@ test("HID mode select offers Off / Ask / Auto-run and never mounts the overlay",
 test("the auto-run danger warning is absent while HID is off by default", async ({
   page,
 }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=input");
 
   // The "dangerously allows all input" warning renders only for the auto-run
   // mode with loaded state. Off by default (state.hid === null here), so the

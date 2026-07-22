@@ -15,6 +15,15 @@
 //! status transition bumps the epoch, and a task exits as soon as its epoch
 //! goes stale — no handles to join, no task ever left animating a stale
 //! status.
+//!
+//! Activity classes: each [`ActivityKind`] maps to an [`ActivityClass`]
+//! selecting which frame family the animation renders — passive observation
+//! (watcher/capture) keeps the scanning eye, an in-flight chat/tool run shows
+//! the orbiting "working" pupil, and a freshly stored memory flashes the
+//! spark-marked "noted" eye via [`flash_noted`]. The animation re-reads the
+//! dominant (highest-priority live) class every tick, so overlapping
+//! activities switch the family within one frame interval with no epoch
+//! churn; the overall watching/sleeping counter contract is unchanged.
 
 use std::sync::Mutex;
 
@@ -204,6 +213,74 @@ pub fn watching_frame_rgba(tick: usize) -> Vec<u8> {
     buf
 }
 
+/// Pupil orbit for the working frames — a diagonal spin through the lens
+/// corners, one step per tick. Deliberately never on the horizontal axis, so
+/// no working frame can collide pixel-for-pixel with the watching scan
+/// (whose pupil always sits at fy = 0).
+const WORK_ORBIT: [(f64, f64); 4] = [(0.18, -0.18), (0.18, 0.18), (-0.18, 0.18), (-0.18, -0.18)];
+
+/// Procedural working frame (the "actioning" state): the open eye with the
+/// pupil orbiting the lens instead of scanning — a visibly busier motion
+/// while a chat/tool run is in flight. Same template-safe palette.
+pub fn working_frame_rgba(tick: usize) -> Vec<u8> {
+    let (px, py) = WORK_ORBIT[tick % WORK_ORBIT.len()];
+    let n = ICON_SIZE as i32;
+    let mut buf = vec![0u8; (n * n * 4) as usize];
+    for y in 0..n {
+        for x in 0..n {
+            let fx = (x as f64 + 0.5) / n as f64 * 2.0 - 1.0;
+            let fy = (y as f64 + 0.5) / n as f64 * 2.0 - 1.0;
+            // Same eye outline as the watching frame — only the pupil moves
+            // differently, so the two families read as the same eye.
+            let lid = 0.62 * (1.0 - (fx / 0.82) * (fx / 0.82));
+            let in_outer = fx.abs() <= 0.82 && fy.abs() <= lid;
+            let in_inner = fx.abs() <= 0.70 && fy.abs() <= lid - 0.16;
+            let (dx, dy) = (fx - px, fy - py);
+            let pupil = in_inner && dx * dx + dy * dy <= 0.20 * 0.20;
+            if (in_outer && !in_inner) || pupil {
+                let i = ((y * n + x) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    buf
+}
+
+/// Pupil radii the noted frames pulse between, alternating per tick — the
+/// dilation is the animation. Neither radius equals the watching/working
+/// pupil's 0.20, and the spark below marks the family besides.
+const NOTED_PUPIL_RADII: [f64; 2] = [0.13, 0.21];
+
+/// Procedural noted frame ("just took a note"): the open eye with a
+/// centered, pulsing pupil and a small "+" spark at the top-right corner,
+/// clear of the eye outline — the transient flash [`flash_noted`] shows when
+/// ingestion stores new memories. Same template-safe palette.
+pub fn noted_frame_rgba(tick: usize) -> Vec<u8> {
+    let r = NOTED_PUPIL_RADII[tick % NOTED_PUPIL_RADII.len()];
+    let n = ICON_SIZE as i32;
+    let mut buf = vec![0u8; (n * n * 4) as usize];
+    for y in 0..n {
+        for x in 0..n {
+            let fx = (x as f64 + 0.5) / n as f64 * 2.0 - 1.0;
+            let fy = (y as f64 + 0.5) / n as f64 * 2.0 - 1.0;
+            let lid = 0.62 * (1.0 - (fx / 0.82) * (fx / 0.82));
+            let in_outer = fx.abs() <= 0.82 && fy.abs() <= lid;
+            let in_inner = fx.abs() <= 0.70 && fy.abs() <= lid - 0.16;
+            let pupil = in_inner && fx * fx + fy * fy <= r * r;
+            // The "+" spark sits at (0.60, -0.60): the eye outline at that
+            // fx only spans |fy| ≤ ~0.29, so the mark never touches it.
+            let (sx, sy) = (fx - 0.60, fy + 0.60);
+            let spark = (sx.abs() <= 0.07 && sy.abs() <= 0.20)
+                || (sy.abs() <= 0.07 && sx.abs() <= 0.20);
+            if (in_outer && !in_inner) || pupil || spark {
+                let i = ((y * n + x) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    buf
+}
+
 /// Tray status: watching while any LLM stream or screen capture is active,
 /// sleeping otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,6 +308,9 @@ pub enum ActivityKind {
     /// S01 T04) — one guard held across ticks, so the eye animates for the
     /// whole watching span, not per capture.
     Watcher,
+    /// A transient "just stored new memories" flash held by [`flash_noted`]'s
+    /// timed guard — never begun directly by a long-lived work site.
+    Noted,
 }
 
 impl ActivityKind {
@@ -239,6 +319,53 @@ impl ActivityKind {
             ActivityKind::Stream => "stream",
             ActivityKind::Capture => "capture",
             ActivityKind::Watcher => "watcher",
+            ActivityKind::Noted => "noted",
+        }
+    }
+
+    /// The frame family this kind drives while active. A chat/tool run is
+    /// active work (the model is doing something on the user's behalf), so it
+    /// outranks the passive observation frames; the noted flash outranks both
+    /// so a stored memory is visible even mid-run.
+    pub fn class(self) -> ActivityClass {
+        match self {
+            ActivityKind::Stream => ActivityClass::Working,
+            ActivityKind::Capture | ActivityKind::Watcher => ActivityClass::Watching,
+            ActivityKind::Noted => ActivityClass::Noted,
+        }
+    }
+}
+
+/// Number of activity classes — sizes [`ActivityCounter`]'s per-class counts.
+const CLASS_COUNT: usize = 3;
+
+/// Visual class of an activity: which frame family the animation renders.
+/// Declared (and `Ord`-derived) in ascending priority — when activities of
+/// several classes overlap, the highest live class owns the icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActivityClass {
+    /// Passive observation (watcher span, screen capture): the scanning eye.
+    Watching,
+    /// Active work — an in-flight chat/tool run: the orbiting pupil.
+    Working,
+    /// New memories were just stored (transient flash): the spark-marked eye.
+    Noted,
+}
+
+impl ActivityClass {
+    /// Every class in ascending priority — indexes the per-class counts.
+    const ALL: [ActivityClass; CLASS_COUNT] =
+        [ActivityClass::Watching, ActivityClass::Working, ActivityClass::Noted];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActivityClass::Watching => "watching",
+            ActivityClass::Working => "working",
+            ActivityClass::Noted => "noted",
         }
     }
 }
@@ -253,43 +380,53 @@ pub enum StatusChange {
     Underflow,
 }
 
-/// Pure activity counter: 0→1 wakes the eye, 1→0 puts it to sleep, and
-/// overlapping activities keep it watching. Pure so every transition —
-/// including overlap and underflow — is testable without a tray.
+/// Pure activity counter: 0→1 overall wakes the eye, 1→0 overall puts it to
+/// sleep, and overlapping activities keep it awake. Counts are kept per
+/// [`ActivityClass`] so the animation can ask which frame family the live
+/// activities warrant ([`dominant_class`](Self::dominant_class)) without
+/// changing the overall wake/sleep contract. Pure so every transition —
+/// including overlap, cross-class overlap, and underflow — is testable
+/// without a tray.
 #[derive(Debug, Default)]
 pub struct ActivityCounter {
-    count: usize,
+    counts: [usize; CLASS_COUNT],
 }
 
 impl ActivityCounter {
     pub const fn new() -> Self {
-        Self { count: 0 }
+        Self { counts: [0; CLASS_COUNT] }
     }
 
     pub fn count(&self) -> usize {
-        self.count
+        self.counts.iter().sum()
     }
 
-    pub fn begin(&mut self) -> StatusChange {
-        self.count += 1;
-        if self.count == 1 {
+    /// The highest-priority class with a live activity — the frame family
+    /// the animation should render right now. `None` when idle.
+    pub fn dominant_class(&self) -> Option<ActivityClass> {
+        ActivityClass::ALL.into_iter().rev().find(|c| self.counts[c.index()] > 0)
+    }
+
+    pub fn begin(&mut self, class: ActivityClass) -> StatusChange {
+        self.counts[class.index()] += 1;
+        if self.count() == 1 {
             StatusChange::To(TrayStatus::Watching)
         } else {
             StatusChange::NoChange
         }
     }
 
-    pub fn end(&mut self) -> StatusChange {
-        match self.count {
-            0 => StatusChange::Underflow,
-            1 => {
-                self.count = 0;
-                StatusChange::To(TrayStatus::Sleeping)
-            }
-            _ => {
-                self.count -= 1;
-                StatusChange::NoChange
-            }
+    pub fn end(&mut self, class: ActivityClass) -> StatusChange {
+        // Underflow is guarded per class: an end for a class with no live
+        // begin must not steal a different class's count (Q7).
+        if self.counts[class.index()] == 0 {
+            return StatusChange::Underflow;
+        }
+        self.counts[class.index()] -= 1;
+        if self.count() == 0 {
+            StatusChange::To(TrayStatus::Sleeping)
+        } else {
+            StatusChange::NoChange
         }
     }
 }
@@ -313,9 +450,9 @@ impl TrayActivity {
 
     /// Returns the transition, the activity count after it, and the epoch
     /// after it (bumped when the status changed).
-    pub fn begin(&self) -> (StatusChange, usize, u64) {
+    pub fn begin(&self, class: ActivityClass) -> (StatusChange, usize, u64) {
         let mut inner = self.inner.lock().unwrap();
-        let change = inner.counter.begin();
+        let change = inner.counter.begin(class);
         if change == StatusChange::To(TrayStatus::Watching) {
             inner.epoch += 1;
         }
@@ -323,13 +460,20 @@ impl TrayActivity {
     }
 
     /// Returns the transition and the activity count after it.
-    pub fn end(&self) -> (StatusChange, usize) {
+    pub fn end(&self, class: ActivityClass) -> (StatusChange, usize) {
         let mut inner = self.inner.lock().unwrap();
-        let change = inner.counter.end();
+        let change = inner.counter.end(class);
         if change == StatusChange::To(TrayStatus::Sleeping) {
             inner.epoch += 1;
         }
         (change, inner.counter.count())
+    }
+
+    /// The frame family the live activities warrant right now — read by the
+    /// animation task every tick, so a class change mid-span (a run joining
+    /// a watch, a noted flash) switches frames within one interval.
+    pub fn dominant_class(&self) -> Option<ActivityClass> {
+        self.inner.lock().unwrap().counter.dominant_class()
     }
 
     pub fn epoch(&self) -> u64 {
@@ -361,17 +505,19 @@ impl Drop for ActivityGuard {
 pub fn begin_activity(app: &AppHandle, kind: ActivityKind) -> ActivityGuard {
     match app.try_state::<TrayActivity>() {
         Some(state) => {
-            let (change, activities, epoch) = state.begin();
+            let (change, activities, epoch) = state.begin(kind.class());
             if change == StatusChange::To(TrayStatus::Watching) {
                 log::info!(
-                    "tray status: watching (activities={activities}, kind={})",
-                    kind.as_str()
+                    "tray status: awake (activities={activities}, kind={}, class={})",
+                    kind.as_str(),
+                    kind.class().as_str()
                 );
                 spawn_animation(app.clone(), epoch);
             } else {
                 log::debug!(
-                    "tray: activity joined (activities={activities}, kind={})",
-                    kind.as_str()
+                    "tray: activity joined (activities={activities}, kind={}, class={})",
+                    kind.as_str(),
+                    kind.class().as_str()
                 );
             }
         }
@@ -386,7 +532,7 @@ fn end_activity(app: &AppHandle, kind: ActivityKind) {
     let Some(state) = app.try_state::<TrayActivity>() else {
         return;
     };
-    let (change, activities) = state.end();
+    let (change, activities) = state.end(kind.class());
     match change {
         StatusChange::To(TrayStatus::Sleeping) => {
             // The epoch bump already stopped the animation task; rest the
@@ -439,22 +585,64 @@ pub fn refresh_resting_frame(app: &AppHandle) {
     }
 }
 
-/// Cycle watching frames every [`FRAME_INTERVAL_MS`] until the epoch goes
-/// stale (the next status transition) or there is no tray to draw on.
+/// The frame family for `class` at animation `tick`.
+fn class_frame(class: ActivityClass, tick: usize) -> Vec<u8> {
+    match class {
+        ActivityClass::Watching => watching_frame_rgba(tick),
+        ActivityClass::Working => working_frame_rgba(tick),
+        ActivityClass::Noted => noted_frame_rgba(tick),
+    }
+}
+
+/// Cycle status frames every [`FRAME_INTERVAL_MS`] until the epoch goes
+/// stale (the next status transition) or there is no tray to draw on. The
+/// dominant class is re-read every tick, so an overlapping higher-priority
+/// activity (a run joining a watch span, a noted flash) switches the frame
+/// family within one interval — no epoch churn for class changes while the
+/// overall count stays above zero.
 fn spawn_animation(app: AppHandle, epoch: u64) {
     tauri::async_runtime::spawn(async move {
         let mut tick: usize = 0;
         loop {
-            if app.try_state::<TrayActivity>().map(|s| s.epoch()) != Some(epoch) {
+            let Some(state) = app.try_state::<TrayActivity>() else {
+                break;
+            };
+            if state.epoch() != epoch {
                 break;
             }
-            if !set_tray_frame(&app, watching_frame_rgba(tick)) {
+            // Idle with a live epoch cannot normally happen (the sleep
+            // transition bumps the epoch), but break rather than draw a
+            // stale active frame if it ever does.
+            let Some(class) = state.dominant_class() else {
+                break;
+            };
+            if !set_tray_frame(&app, class_frame(class, tick)) {
                 break;
             }
             tick = tick.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_millis(FRAME_INTERVAL_MS)).await;
         }
-        log::debug!("tray: watching animation stopped (epoch={epoch}, frames={tick})");
+        log::debug!("tray: status animation stopped (epoch={epoch}, frames={tick})");
+    });
+}
+
+/// How long one noted flash holds the spark frames — long enough for a few
+/// frames at the [`FRAME_INTERVAL_MS`] cadence, short enough to read as a
+/// blip rather than a state.
+pub const NOTED_FLASH_MS: u64 = 2_000;
+
+/// Flash the "noted" frames for [`NOTED_FLASH_MS`] — called when ingestion
+/// stores new memories. Rides the ordinary activity machinery (a timed
+/// [`ActivityGuard`] of the Noted class), so a flash mid-watch or mid-run
+/// overrides the frame family for its span and hands back cleanly, a flash
+/// while idle wakes the icon and rests it after, and overlapping flashes
+/// just extend the span through the counter.
+pub fn flash_noted(app: &AppHandle, stored: u64) {
+    log::debug!("tray: noted flash ({stored} new memories)");
+    let guard = begin_activity(app, ActivityKind::Noted);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(NOTED_FLASH_MS)).await;
+        drop(guard);
     });
 }
 
@@ -896,27 +1084,62 @@ mod tests {
         assert_eq!(ActivityKind::Stream.as_str(), "stream");
         assert_eq!(ActivityKind::Capture.as_str(), "capture");
         assert_eq!(ActivityKind::Watcher.as_str(), "watcher");
+        assert_eq!(ActivityKind::Noted.as_str(), "noted");
+        assert_eq!(ActivityClass::Watching.as_str(), "watching");
+        assert_eq!(ActivityClass::Working.as_str(), "working");
+        assert_eq!(ActivityClass::Noted.as_str(), "noted");
+    }
+
+    #[test]
+    fn every_kind_maps_to_its_frame_class() {
+        // A chat/tool run is active work; captures and the watcher span are
+        // passive observation; the flash is its own transient class.
+        assert_eq!(ActivityKind::Stream.class(), ActivityClass::Working);
+        assert_eq!(ActivityKind::Capture.class(), ActivityClass::Watching);
+        assert_eq!(ActivityKind::Watcher.class(), ActivityClass::Watching);
+        assert_eq!(ActivityKind::Noted.class(), ActivityClass::Noted);
     }
 
     #[test]
     fn counter_wakes_on_first_activity_and_sleeps_on_last() {
         let mut c = ActivityCounter::new();
-        assert_eq!(c.begin(), StatusChange::To(TrayStatus::Watching));
+        assert_eq!(c.begin(ActivityClass::Watching), StatusChange::To(TrayStatus::Watching));
         assert_eq!(c.count(), 1);
-        assert_eq!(c.end(), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(c.end(ActivityClass::Watching), StatusChange::To(TrayStatus::Sleeping));
         assert_eq!(c.count(), 0);
     }
 
     #[test]
     fn overlapping_activities_keep_watching_until_the_last_ends() {
         // A capture during a stream must not flip the icon to sleeping when
-        // it finishes first.
+        // it finishes first — cross-class overlap counts as one wake span.
         let mut c = ActivityCounter::new();
-        assert_eq!(c.begin(), StatusChange::To(TrayStatus::Watching));
-        assert_eq!(c.begin(), StatusChange::NoChange);
-        assert_eq!(c.end(), StatusChange::NoChange);
+        assert_eq!(c.begin(ActivityClass::Working), StatusChange::To(TrayStatus::Watching));
+        assert_eq!(c.begin(ActivityClass::Watching), StatusChange::NoChange);
+        assert_eq!(c.end(ActivityClass::Watching), StatusChange::NoChange);
         assert_eq!(c.count(), 1);
-        assert_eq!(c.end(), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(c.end(ActivityClass::Working), StatusChange::To(TrayStatus::Sleeping));
+    }
+
+    #[test]
+    fn dominant_class_follows_priority_across_overlaps() {
+        // The frame family tracks the highest live class: a run outranks the
+        // watch span it joined, a noted flash outranks both, and each hands
+        // back to the next-highest as it ends.
+        let mut c = ActivityCounter::new();
+        assert_eq!(c.dominant_class(), None);
+        c.begin(ActivityClass::Watching);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Watching));
+        c.begin(ActivityClass::Working);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Working));
+        c.begin(ActivityClass::Noted);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Noted));
+        c.end(ActivityClass::Noted);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Working));
+        c.end(ActivityClass::Working);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Watching));
+        c.end(ActivityClass::Watching);
+        assert_eq!(c.dominant_class(), None);
     }
 
     #[test]
@@ -924,34 +1147,49 @@ mod tests {
         // Q7: an end without a begin must not wrap to usize::MAX (which
         // would pin the icon on watching forever).
         let mut c = ActivityCounter::new();
-        assert_eq!(c.end(), StatusChange::Underflow);
+        assert_eq!(c.end(ActivityClass::Watching), StatusChange::Underflow);
         assert_eq!(c.count(), 0);
         // The counter still works normally afterwards.
-        assert_eq!(c.begin(), StatusChange::To(TrayStatus::Watching));
-        assert_eq!(c.end(), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(c.begin(ActivityClass::Watching), StatusChange::To(TrayStatus::Watching));
+        assert_eq!(c.end(ActivityClass::Watching), StatusChange::To(TrayStatus::Sleeping));
+    }
+
+    #[test]
+    fn underflow_is_guarded_per_class_and_never_steals_a_sibling_count() {
+        // An end for a class with no live begin must not decrement a
+        // different class's count — the watch span must survive a stray
+        // Working end.
+        let mut c = ActivityCounter::new();
+        c.begin(ActivityClass::Watching);
+        assert_eq!(c.end(ActivityClass::Working), StatusChange::Underflow);
+        assert_eq!(c.count(), 1);
+        assert_eq!(c.dominant_class(), Some(ActivityClass::Watching));
     }
 
     #[test]
     fn activity_epoch_advances_on_every_status_transition() {
         let a = TrayActivity::new();
-        let (change, count, e1) = a.begin();
+        let (change, count, e1) = a.begin(ActivityClass::Watching);
         assert_eq!(change, StatusChange::To(TrayStatus::Watching));
         assert_eq!(count, 1);
 
-        // Joining does not bump the epoch — the running animation stays valid.
-        let (change, count, e2) = a.begin();
+        // Joining does not bump the epoch — the running animation stays
+        // valid even when the joiner is a different class (it changes the
+        // frame family via dominant_class, not via a restart).
+        let (change, count, e2) = a.begin(ActivityClass::Working);
         assert_eq!(change, StatusChange::NoChange);
         assert_eq!((count, e2), (2, e1));
-        assert_eq!(a.end(), (StatusChange::NoChange, 1));
+        assert_eq!(a.dominant_class(), Some(ActivityClass::Working));
+        assert_eq!(a.end(ActivityClass::Working), (StatusChange::NoChange, 1));
         assert_eq!(a.epoch(), e1);
 
         // The sleep transition bumps it: an animation task spawned with e1
         // sees a stale epoch and exits.
-        assert_eq!(a.end(), (StatusChange::To(TrayStatus::Sleeping), 0));
+        assert_eq!(a.end(ActivityClass::Watching), (StatusChange::To(TrayStatus::Sleeping), 0));
         assert_ne!(a.epoch(), e1, "sleep must invalidate the watching animation");
 
         // The next watch cycle gets a fresh epoch, distinct from both.
-        let (_, _, e3) = a.begin();
+        let (_, _, e3) = a.begin(ActivityClass::Watching);
         assert_ne!(e3, e1);
         assert!(a.count() == 1 && a.epoch() == e3);
     }
@@ -960,8 +1198,74 @@ mod tests {
     fn activity_underflow_leaves_epoch_and_count_untouched() {
         let a = TrayActivity::new();
         let before = a.epoch();
-        assert_eq!(a.end(), (StatusChange::Underflow, 0));
+        assert_eq!(a.end(ActivityClass::Watching), (StatusChange::Underflow, 0));
         assert_eq!(a.epoch(), before, "underflow must not invalidate anything");
         assert_eq!(a.count(), 0);
+    }
+
+    #[test]
+    fn working_frames_are_template_safe_and_animate() {
+        // Template-safe at every orbit position, consecutive ticks differ
+        // (the icon visibly spins), and the cycle repeats.
+        for tick in 0..WORK_ORBIT.len() {
+            assert_template_safe(&working_frame_rgba(tick));
+            assert_ne!(
+                working_frame_rgba(tick),
+                working_frame_rgba(tick + 1),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(working_frame_rgba(0), working_frame_rgba(WORK_ORBIT.len()));
+    }
+
+    #[test]
+    fn working_frames_differ_from_every_watching_and_resting_frame() {
+        // "Actioning" must be distinguishable at a glance: the diagonal
+        // orbit never lands on the watching scan's horizontal axis, so no
+        // frame pair across the two families collides; nor do the resting
+        // frames.
+        for w in 0..WORK_ORBIT.len() {
+            let working = working_frame_rgba(w);
+            for s in 0..PUPIL_CYCLE.len() {
+                assert_ne!(working, watching_frame_rgba(s), "working {w} vs watching {s}");
+            }
+            assert_ne!(working, sleeping_frame_rgba(), "working {w} vs sleeping");
+            assert_ne!(working, privacy_frame_rgba(), "working {w} vs privacy");
+        }
+    }
+
+    #[test]
+    fn noted_frames_are_template_safe_and_pulse() {
+        for tick in 0..NOTED_PUPIL_RADII.len() {
+            assert_template_safe(&noted_frame_rgba(tick));
+        }
+        // The pulse is the animation: consecutive ticks differ, the cycle
+        // repeats.
+        assert_ne!(noted_frame_rgba(0), noted_frame_rgba(1));
+        assert_eq!(noted_frame_rgba(0), noted_frame_rgba(NOTED_PUPIL_RADII.len()));
+    }
+
+    #[test]
+    fn noted_frames_differ_from_every_other_family() {
+        // The spark marks the family: no noted frame collides with any
+        // watching, working, or resting frame.
+        for t in 0..NOTED_PUPIL_RADII.len() {
+            let noted = noted_frame_rgba(t);
+            for s in 0..PUPIL_CYCLE.len() {
+                assert_ne!(noted, watching_frame_rgba(s), "noted {t} vs watching {s}");
+            }
+            for w in 0..WORK_ORBIT.len() {
+                assert_ne!(noted, working_frame_rgba(w), "noted {t} vs working {w}");
+            }
+            assert_ne!(noted, sleeping_frame_rgba(), "noted {t} vs sleeping");
+            assert_ne!(noted, privacy_frame_rgba(), "noted {t} vs privacy");
+        }
+    }
+
+    #[test]
+    fn noted_flash_spans_multiple_animation_frames() {
+        // The flash must outlive at least two frame intervals or it could
+        // come and go between ticks without ever being drawn.
+        assert!(NOTED_FLASH_MS >= 2 * FRAME_INTERVAL_MS);
     }
 }

@@ -78,23 +78,29 @@ pub const FOCUS_APP_TOOL: &str = "focus_app";
 /// list, so it is spelled out. It is guidance; the structural [`ScreenSeen`] gate
 /// enforces the coordinate rule even when the model ignores the prose.
 pub const HID_SYSTEM_PROMPT: &str = "You can control this computer for the user with tools: \
-focus_app (bring an app to the front), screen_query (read the text on screen with each item's \
+focus_app (open an app or bring it to the front — it launches the app if it is not running), \
+screen_query (read the text on screen with each item's \
 exact pixel coordinates), and input_action (move/click the mouse, type text, press a key).\n\n\
 To operate any app, follow this order every time:\n\
-1. Call focus_app with the app name (e.g. \"Google Chrome\") to bring it to the front.\n\
+1. Call focus_app with the app name (e.g. \"Google Chrome\") to open it / bring it to the front.\n\
 2. Call screen_query to see what is on screen and get the real pixel coordinates of the element \
 you want. Each element gives x,y for its top-left corner plus width and height; aim at its centre \
 (x + width/2, y + height/2).\n\
 3. To click a target, call input_action with action \"mouse-click\" and pass the x,y you computed \
 from that screen_query result — the click moves to that point and clicks it in one step.\n\
-4. Use action \"type-text\" or \"key-press\" to enter text after clicking.\n\n\
+4. Use action \"type-text\" or \"key-press\" to enter text. Typing goes into whatever you last \
+clicked, so ALWAYS mouse-click the exact field you want to fill before you type. To search the \
+web: focus_app the browser, screen_query, mouse-click its address bar, type-text the search \
+words, then key-press \"return\".\n\n\
 Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click \
 or move to a coordinate you did not read from screen_query will be refused. After you focus_app the \
 screen changes, so call screen_query again before you click.\n\n\
 Always focus_app FIRST, before screen_query. Once you have focused an app, screen_query returns only \
 that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a \
 coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it \
-hides the user's windows instead of doing what they asked.";
+hides the user's windows instead of doing what they asked.\n\n\
+Report tool results honestly. If a tool call returns an error, tell the user it failed and why — \
+never claim an action succeeded when the tool reported a failure.";
 
 /// The typed failure kind the [`ApprovalGate`] returns when the model tries to
 /// aim the mouse at coordinates it never obtained from [`SCREEN_QUERY_TOOL`].
@@ -714,8 +720,9 @@ impl ToolExecutor for ScreenQueryTool {
 
 /// The app-focus tool over the [`AppFocus`] backend (M005). Advertises one
 /// `focus_app` tool with a single required `app` string; each call best-effort
-/// matches a running app by name and brings it to the front, returning the
-/// localized name it actually activated. Every failure — a typed
+/// matches an app by name and brings it to the front — launching it first
+/// when it is not running — returning the localized name it verifiably
+/// fronted and whether a launch was needed. Every failure — a typed
 /// [`crate::appfocus::AppFocusError`] (not-found / activation-failed /
 /// unsupported) — rides back as a typed [`ToolOutcome`], never a silent no-op
 /// (R007). A `not-found` payload lists the running-app candidates so the model
@@ -739,11 +746,12 @@ impl FocusAppTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: FOCUS_APP_TOOL.into(),
-            description: "Bring a running application to the front by name (e.g. \"Chrome\", \
-                          \"Safari\", \"Finder\"). Call this before operating an app with \
-                          input_action so your clicks and keystrokes land in the app you mean, \
-                          not whatever was frontmost. The match is best-effort; the result names \
-                          the app actually activated."
+            description: "Open an application by name (e.g. \"Chrome\", \"Safari\", \
+                          \"Finder\"): brings it to the front, launching it first if it is not \
+                          running. Call this before operating an app with input_action so your \
+                          clicks and keystrokes land in the app you mean, not whatever was \
+                          frontmost. The match is best-effort; the result names the app actually \
+                          brought to the front and whether it had to be launched."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -788,7 +796,14 @@ impl ToolExecutor for FocusAppTool {
         };
         match self.backend.focus(&args.app).await {
             Ok(focused) => ToolOutcome {
-                content: serde_json::json!({ "ok": true, "focused": focused.app }).to_string(),
+                // `launched` lets the model say "opened" vs "switched to"
+                // truthfully; the gate reads only `focused`, so it is additive.
+                content: serde_json::json!({
+                    "ok": true,
+                    "focused": focused.app,
+                    "launched": focused.launched,
+                })
+                .to_string(),
                 ok: true,
                 result_count: None,
                 mode: None,
@@ -799,7 +814,7 @@ impl ToolExecutor for FocusAppTool {
             // kind back unchanged (R007).
             Err(AppFocusError::NotFound { requested, candidates }) => ToolOutcome {
                 content: serde_json::json!({
-                    "error": format!("no running app matched {requested:?}"),
+                    "error": format!("no running or installed app matched {requested:?}"),
                     "candidates": candidates,
                 })
                 .to_string(),
@@ -1060,7 +1075,7 @@ impl ToolExecutor for ApprovalGate {
                     )
                 }
             };
-            let summary = format!("Bring {} to the front", quote_preview(&app));
+            let summary = format!("Open {} (bring to front, launching if needed)", quote_preview(&app));
             let outcome = self
                 .gate_and_run(FOCUS_APP_TOOL, ActionKind::FocusApp, summary, || {
                     self.focus.execute(call)
@@ -2436,7 +2451,7 @@ mod tests {
     impl AppFocus for RecordingFocus {
         async fn focus(&self, app_name: &str) -> Result<crate::appfocus::FocusedApp, AppFocusError> {
             *self.last.lock().unwrap() = Some(app_name.to_string());
-            Ok(crate::appfocus::FocusedApp { app: app_name.to_string() })
+            Ok(crate::appfocus::FocusedApp { app: app_name.to_string(), launched: false })
         }
 
         async fn running_apps(&self) -> Vec<String> {
@@ -3042,6 +3057,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["focused"], "Google Chrome");
+        assert_eq!(v["launched"], false);
     }
 
     #[tokio::test]

@@ -296,7 +296,7 @@ test("a non-summon dismiss stages no preload", async ({ page }) => {
 // ---------------------------------------------------------------------------
 
 test("nudges section degrades to a named unavailable state outside Tauri", async ({ page }) => {
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=nudges");
   const nudges = nudgesSection(page);
   await expect(nudges.getByRole("heading", { name: "Nudges" })).toBeVisible();
   // nudge_status rejects (no runtime) → toggle disabled with the named note.
@@ -309,7 +309,7 @@ test("nudges section degrades to a named unavailable state outside Tauri", async
 
 test("the toggle drives set_nudges_enabled and renders the authoritative snapshot", async ({ page }) => {
   await installNudgeIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=nudges");
   const toggle = page.getByRole("checkbox", { name: "Nudges" });
 
   // Mount-time nudge_status resolves → live toggle, default-on.
@@ -325,7 +325,7 @@ test("the toggle drives set_nudges_enabled and renders the authoritative snapsho
 
 test("a persist failure rolls the toggle back with a named alert", async ({ page }) => {
   await installNudgeIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=nudges");
   const toggle = page.getByRole("checkbox", { name: "Nudges" });
   await expect(toggle).toBeChecked();
 
@@ -344,7 +344,7 @@ test("a persist failure rolls the toggle back with a named alert", async ({ page
 
 test("nudge://state broadcasts sync the toggle and surface classifier errors", async ({ page }) => {
   await installNudgeIpcMock(page);
-  await page.goto("/?view=settings");
+  await page.goto("/?view=settings&section=nudges");
   const toggle = page.getByRole("checkbox", { name: "Nudges" });
   await expect(toggle).toBeChecked();
   await waitForListener(page, "nudge://state");

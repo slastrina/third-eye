@@ -7,14 +7,17 @@
 import { describe, expect, it } from "vitest";
 import type { HidArmedStatus, ModelInfo, PrivacyStatus } from "./chat";
 import {
+  endpointDraftFor,
   HID_RUN_MODE_OPTIONS,
   hidModeShowsAutoRunWarning,
   initialSettingsState,
+  isLoopbackEndpoint,
   laneOptions,
   modelsErrorDetail,
   modelsErrorTitle,
   settingsReducer,
   toModelsError,
+  type EndpointStatus,
   type ModelsError,
   type SettingsState,
 } from "./settings-state";
@@ -86,6 +89,82 @@ describe("settingsReducer routing and lane pins", () => {
     expect(s.laneError).toContain("heavy");
     expect(s.laneError).toContain("settings.json");
     expect(s.modelInfo).toEqual(routing);
+  });
+});
+
+describe("settingsReducer endpoint config", () => {
+  const status: EndpointStatus = {
+    active: "http://localhost:1234",
+    configured: "http://127.0.0.1:11434",
+    fallback: "http://localhost:1234",
+    restartRequired: true,
+  };
+
+  it("stores the status and supersedes a stale save rejection", () => {
+    let s = settingsReducer(initialSettingsState, {
+      type: "endpoint-error",
+      detail: "not a valid URL",
+    });
+    s = settingsReducer(s, { type: "endpoint", status });
+    expect(s.endpoint).toEqual(status);
+    expect(s.endpointError).toBeNull();
+  });
+
+  it("a rejected save keeps the last authoritative status", () => {
+    let s = settingsReducer(initialSettingsState, { type: "endpoint", status });
+    s = settingsReducer(s, {
+      type: "endpoint-error",
+      detail: 'endpoint must be an http(s) URL with a host (got "localhost:1234")',
+    });
+    expect(s.endpointError).toContain("http(s)");
+    expect(s.endpoint).toEqual(status);
+  });
+});
+
+describe("endpoint helpers", () => {
+  it("endpointDraftFor seeds the override when set, else the fallback", () => {
+    expect(endpointDraftFor(null)).toBe("");
+    expect(
+      endpointDraftFor({
+        active: "http://localhost:1234",
+        configured: null,
+        fallback: "http://localhost:1234",
+        restartRequired: false,
+      }),
+    ).toBe("http://localhost:1234");
+    expect(
+      endpointDraftFor({
+        active: "http://localhost:1234",
+        configured: "http://127.0.0.1:11434",
+        fallback: "http://localhost:1234",
+        restartRequired: true,
+      }),
+    ).toBe("http://127.0.0.1:11434");
+  });
+
+  it("isLoopbackEndpoint mirrors the Rust guard's classify", () => {
+    // The Loopback set: literal localhost, 127.0.0.0/8, ::1.
+    for (const local of [
+      "http://localhost:1234",
+      "http://LOCALHOST:1234",
+      "http://127.0.0.1:11434",
+      "http://127.90.0.9:80",
+      "http://[::1]:1234",
+    ]) {
+      expect(isLoopbackEndpoint(local), local).toBe(true);
+    }
+    // Everything else — LAN IPs, real domains, lookalikes, garbage — is
+    // external, the fail-closed direction the privacy note keys on.
+    for (const external of [
+      "http://192.168.1.50:1234",
+      "https://api.openai.com/v1",
+      "http://127.0.0.1.evil.com",
+      "http://llm.lan:8080",
+      "not a url",
+      "",
+    ]) {
+      expect(isLoopbackEndpoint(external), external).toBe(false);
+    }
   });
 });
 

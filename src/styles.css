@@ -678,7 +678,99 @@ body,
   border: 1px solid rgba(255, 255, 255, 0.1);
   padding: 16px;
   color: rgba(255, 255, 255, 0.92);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* PyCharm-style two-pane body: grouped nav tree on the left, one page on the
+   right. Each pane scrolls independently; min-height: 0 lets them shrink
+   inside the flex column instead of overflowing the rounded panel. */
+.settings-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.settings-nav {
+  width: 170px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   overflow-y: auto;
+  padding-right: 12px;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settings-nav-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+}
+
+.settings-nav-search::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.settings-nav-group-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.4);
+  padding: 2px 8px 4px;
+}
+
+.settings-nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 13px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.settings-nav-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.settings-nav-item[aria-current="page"] {
+  background: rgba(122, 162, 255, 0.28);
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.settings-page {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* One section per page — the page heading replaces the stacked-scroll
+   dividers the old single-column layout needed. */
+.settings-page > .settings-section {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
 }
 
 .settings-header {
@@ -725,20 +817,48 @@ body,
 
 .settings-section-title {
   margin: 0 0 8px;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: rgba(255, 255, 255, 0.6);
+  color: rgba(255, 255, 255, 0.92);
 }
 
 .settings-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   margin: 8px 0;
   font-size: 13px;
+}
+
+/* Free-text entry fields (API keys, tokens, MCP draft fields): themed like
+   .settings-select and flexible so multi-input rows wrap instead of
+   overflowing the pane. */
+.settings-key-input {
+  flex: 1 1 150px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+}
+
+.settings-key-input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* One configured cloud provider / MCP server, rendered as a card so list
+   entries read as units instead of a run-on column of rows. */
+.cloud-provider {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .settings-row-label {
@@ -833,6 +953,28 @@ body,
 .settings-status-value {
   color: rgba(255, 255, 255, 0.55);
   font-size: 12px;
+}
+
+/* The MCP "Edit as JSON" editor: the raw persisted mcpServers array in a
+   monospace draft area. Secrets never render here (authRef only, R018). */
+.settings-json-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 240px;
+  resize: vertical;
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-json-actions {
+  justify-content: flex-start;
 }
 
 /* Privacy Guard sub-surface (S03): active state, per-kind redaction

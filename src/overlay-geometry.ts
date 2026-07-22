@@ -1,17 +1,12 @@
 // Pure geometry helpers for the movable/resizable overlay panel (M006/S01).
 // Geometry is a platform side-effect, not an OverlayState transition (RESEARCH
-// point 3), so this module holds no state — just the resize-grip direction
-// constant and a size-clamp helper the panel wires to Tauri's native window
-// drag/resize (startDragging / startResizeDragging). Kebab-case module name
-// per MEM051 (a Geometry.tsx companion would collide on the case-insensitive
-// filesystem).
-
-/**
- * The corner the resize grip drags from. Typed as the literal (not widened to
- * string) so it satisfies Tauri's ResizeDirection union at the call site. The
- * grip sits bottom-right, so the window grows toward the SouthEast.
- */
-export const RESIZE_GRIP_DIRECTION = "SouthEast" as const;
+// point 3), so this module holds no state — just the rect/size math App.tsx
+// wires to Tauri window calls. Moving uses native startDragging; RESIZING is
+// pointer-driven here (draggedExtent / draggedModalSize) because tao's
+// drag_resize_window is NotSupported on macOS — native startResizeDragging
+// silently no-ops there, so the overlay computes its own resize on every
+// platform. Kebab-case module name per MEM051 (a Geometry.tsx companion would
+// collide on the case-insensitive filesystem).
 
 /** The smallest the overlay may shrink to — below this the chat chrome clips. */
 export const OVERLAY_MIN_WIDTH = 360;
@@ -110,41 +105,62 @@ export function drawerRect(
 }
 
 /**
- * The window edge Tauri's native startResizeDragging drags from. Typed as this
- * literal union (not widened to string) so a value flows into
- * `startResizeDragging` without a cast — matching RESIZE_GRIP_DIRECTION.
- */
-export type ResizeDirection =
-  | "North"
-  | "South"
-  | "East"
-  | "West"
-  | "NorthEast"
-  | "NorthWest"
-  | "SouthEast"
-  | "SouthWest";
-
-/**
- * Map a drawer's docked `edge` to the resize direction of its INNER edge — the
- * one facing the screen interior, which is the draggable affordance.
+ * The new extent of a drawer implied by dragging its inner-edge bar from
+ * `from` to `to` — both in LOGICAL screen points (MouseEvent.screenX/Y, which
+ * stay stable while the window itself moves and resizes under the cursor;
+ * clientX/Y would drift as the window origin shifts).
  *
- * A left drawer is docked flush on the left, so its inner edge is on the RIGHT
- * and grows toward the East; a right drawer's inner edge is on the left (West);
- * a top drawer's inner edge is the bottom (South); a bottom drawer's is the top
- * (North). Getting this backwards makes the drag fight the anchor — the window
- * jumps or shrinks from the docked side instead of growing inward.
+ * The sign folds in which way the drawer's free edge faces — the drag must
+ * grow the drawer INWARD, never fight the docked anchor: a left drawer grows
+ * as the pointer moves right (+x), a right drawer as it moves left (−x), a
+ * top drawer as it moves down (+y), a bottom drawer as it moves up (−y).
+ * Clamped between the overlay minimum on the drawer's variable axis (the
+ * chrome never clips) and `maxExtent` — the work-area span on that axis — so
+ * a drag can never grow the drawer past its screen. A `maxExtent` below the
+ * minimum (a pathological work area) resolves to the minimum: the floor wins.
  */
-export function resizeDirectionForEdge(edge: Edge): ResizeDirection {
+export function draggedExtent(
+  edge: Edge,
+  startExtent: number,
+  from: OverlayPoint,
+  to: OverlayPoint,
+  maxExtent: number,
+): number {
+  let delta: number;
   switch (edge) {
     case "left":
-      return "East";
+      delta = to.x - from.x;
+      break;
     case "right":
-      return "West";
+      delta = from.x - to.x;
+      break;
     case "top":
-      return "South";
+      delta = to.y - from.y;
+      break;
     case "bottom":
-      return "North";
+      delta = from.y - to.y;
+      break;
   }
+  const min =
+    edge === "left" || edge === "right" ? OVERLAY_MIN_WIDTH : OVERLAY_MIN_HEIGHT;
+  return Math.max(Math.min(startExtent + delta, maxExtent), min);
+}
+
+/**
+ * The new modal (floating) size implied by dragging the bottom-right corner
+ * grip from `from` to `to`: the window stays anchored at its top-left, so both
+ * axes grow with the pointer. Same LOGICAL screen-point contract as
+ * `draggedExtent`, floored per axis by `clampMinSize`.
+ */
+export function draggedModalSize(
+  start: OverlaySize,
+  from: OverlayPoint,
+  to: OverlayPoint,
+): OverlaySize {
+  return clampMinSize({
+    width: start.width + (to.x - from.x),
+    height: start.height + (to.y - from.y),
+  });
 }
 
 /**
@@ -250,8 +266,8 @@ export function centeredModalRect(
 
 /**
  * Clamp a proposed size up to the overlay minimum on each axis independently.
- * Native startResizeDragging already honours the window's min-size constraint,
- * but this keeps any JS-driven sizing (and the unit tests) on the same floor.
+ * Resizing is JS-driven (see draggedExtent/draggedModalSize), so this floor IS
+ * the min-size constraint — there is no native one backing it up.
  */
 export function clampMinSize(
   size: OverlaySize,
