@@ -243,6 +243,67 @@ pub struct InputPermission {
     pub supported: bool,
 }
 
+/// Post-action evidence a backend reads back from the OS AFTER the synthesized
+/// event was posted — the model's proof that the action actually did what was
+/// commanded, not just that the event-post call returned. Every prior HID bug
+/// in this project (silently-dropped posts, clicks at a stale cursor,
+/// keystrokes swallowed by the overlay's own key window) reported `ok` while
+/// doing the wrong thing; this report is how the tool loop detects that class
+/// of wrongness instead of claiming success blind (R007).
+///
+/// All fields are best-effort observations: a failed readback leaves its field
+/// `None` and never fails the action itself. Serialized camelCase into the
+/// `input_action` tool result's `verified` block, so its contents reach the
+/// model's context — values are truncated and secure fields skipped at the
+/// observation site.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionReport {
+    /// Where the system cursor ACTUALLY is after the action (read back from the
+    /// OS, not echoed from the command) — present for mouse actions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<CursorPosition>,
+    /// The UI element holding keyboard focus after the action — present for
+    /// clicks (a click on a field should focus it) and keyboard actions (the
+    /// element the keystrokes went into).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<FocusReport>,
+    /// `type-text` only: whether the focused element's value was observed to
+    /// contain the typed text afterwards. `Some(false)` is not proof of failure
+    /// (some targets never echo text), but `Some(true)` is proof of success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_entered: Option<bool>,
+}
+
+/// An absolute cursor position in logical screen points (top-left origin) —
+/// the same space `screen_query` coordinates and aimed actions use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CursorPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// The system-wide keyboard-focused UI element, as the OS reports it: which
+/// app owns it, what kind of element it is, and (for text-bearing elements)
+/// an excerpt of its current value. Secure fields never carry a value.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusReport {
+    /// Localized name of the app owning the focused element — the same
+    /// namespace `focus_app` and `screen_query` attribution use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// The element's accessibility role (e.g. `AXTextField`, `AXButton`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The element's title or description, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Excerpt (tail) of the element's current value, for text elements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
 /// The HID input seam. Object-safe (`Arc<dyn InputControl>`) so managed state,
 /// the composite executor, and tests can hold any backend without knowing its
 /// transport. `Send + Sync` so it can live in Tauri managed state like
@@ -259,9 +320,13 @@ pub trait InputControl: Send + Sync {
     /// user previously denied). Returns the resulting granted state.
     fn request_permission(&self) -> bool;
 
-    /// Synthesize one HID action into the foreground application. Never hangs
-    /// silently: every failure path resolves to an [`InputError`].
-    async fn perform(&self, action: InputAction) -> Result<(), InputError>;
+    /// Synthesize one HID action into the foreground application and read back
+    /// what the OS observed afterwards. Never hangs silently: every failure
+    /// path resolves to an [`InputError`]. The [`ActionReport`] carries
+    /// best-effort post-action evidence (cursor readback, focused element) so
+    /// the caller can verify the action's EFFECT, not just its dispatch;
+    /// backends without a readback return [`ActionReport::default`].
+    async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError>;
 }
 
 /// Decorator over any [`InputControl`] that runs a `yield_focus` hook before
@@ -308,7 +373,7 @@ impl InputControl for KeyboardFocusYield {
         self.inner.request_permission()
     }
 
-    async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+    async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
         if matches!(action, InputAction::TypeText { .. } | InputAction::KeyPress { .. }) {
             let yield_focus = self.yield_focus.clone();
             // The hook blocks on a main-thread handshake; keep the async worker
@@ -366,12 +431,12 @@ mod tests {
             self.fail_with.is_none()
         }
 
-        async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
             if let Some(err) = &self.fail_with {
                 return Err(err.clone());
             }
             *self.last.lock().unwrap() = Some(action);
-            Ok(())
+            Ok(ActionReport::default())
         }
     }
 
@@ -458,6 +523,34 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("permission-denied"), "kind missing: {msg}");
         assert!(msg.contains("AX denied"), "detail missing: {msg}");
+    }
+
+    #[test]
+    fn action_report_serializes_camel_case_and_omits_unobserved_fields() {
+        // The `verified` block in the input_action tool result is model-facing
+        // wire contract: camelCase keys, and unobserved fields are ABSENT (not
+        // null) so a small model never has to reason about nulls.
+        let empty = serde_json::to_value(ActionReport::default()).unwrap();
+        assert_eq!(empty, serde_json::json!({}), "a no-evidence report must be empty");
+
+        let full = ActionReport {
+            cursor: Some(CursorPosition { x: 640, y: 220 }),
+            focus: Some(FocusReport {
+                app: Some("Google Chrome".into()),
+                role: Some("AXTextField".into()),
+                title: Some("Address and search bar".into()),
+                value: Some("farts".into()),
+            }),
+            text_entered: Some(true),
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["cursor"]["x"], 640);
+        assert_eq!(v["cursor"]["y"], 220);
+        assert_eq!(v["focus"]["app"], "Google Chrome");
+        assert_eq!(v["focus"]["role"], "AXTextField");
+        assert_eq!(v["focus"]["title"], "Address and search bar");
+        assert_eq!(v["focus"]["value"], "farts");
+        assert_eq!(v["textEntered"], true, "camelCase is the wire contract");
     }
 
     #[test]
@@ -555,9 +648,9 @@ mod tests {
             true
         }
 
-        async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
             self.journal.lock().unwrap().push(format!("perform:{}", action.kind_str()));
-            Ok(())
+            Ok(ActionReport::default())
         }
     }
 

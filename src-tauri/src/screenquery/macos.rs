@@ -85,7 +85,10 @@ mod tests {
             Ok(elements) => {
                 println!("screen_query: {} element(s) from the live screen:", elements.len());
                 for el in &elements {
-                    println!("  {:?} @ ({},{}) {}x{}", el.text, el.x, el.y, el.width, el.height);
+                    println!(
+                        "  {:?} @ ({},{}) {}x{} app={:?}",
+                        el.text, el.x, el.y, el.width, el.height, el.app
+                    );
                 }
             }
             Err(err) => {

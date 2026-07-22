@@ -39,8 +39,12 @@ use async_trait::async_trait;
 use enigo::{
     Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
 };
+use objc2_core_foundation::CFString;
 
-use super::{InputAction, InputControl, InputError, InputPermission, MouseButton};
+use super::{
+    ActionReport, CursorPosition, FocusReport, InputAction, InputControl, InputError,
+    InputPermission, MouseButton,
+};
 
 // Raw FFI instead of a binding crate: `AXIsProcessTrusted` is a stable,
 // ABI-simple Accessibility (HIServices) call, and the pinned-dependency policy
@@ -141,7 +145,7 @@ impl InputControl for MacosInput {
         request_permission()
     }
 
-    async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+    async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
         // Read-only preflight (never prompts): give the typed permission error
         // the walkthrough keys on instead of enigo prompting mid-action (R007).
         // Both grants must hold — post-event access is the one that silently
@@ -184,23 +188,261 @@ impl InputControl for MacosInput {
     }
 }
 
+// Read the live system cursor in the SAME top-left-origin point space
+// `CGEventPost` writes to: a nil-source CGEvent's location is the current
+// cursor. This is the ground truth enigo's `button()` implicitly clicks at —
+// see [`wait_for_cursor_commit`] for why we must read it ourselves.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPointRaw;
+    fn CFRelease(cf: *mut std::ffi::c_void);
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPointRaw {
+    x: f64,
+    y: f64,
+}
+
+/// Current cursor position in top-left-origin logical points.
+fn cursor_location() -> Result<(f64, f64), InputError> {
+    // Safety: CGEventCreate(nil) returns a retained event whose location is the
+    // live cursor; released immediately. No arguments beyond the null source.
+    unsafe {
+        let ev = CGEventCreate(std::ptr::null());
+        if ev.is_null() {
+            return Err(InputError::InputFailed {
+                detail: "CGEventCreate(nil) returned null reading the cursor".into(),
+            });
+        }
+        let p = CGEventGetLocation(ev);
+        CFRelease(ev);
+        Ok((p.x, p.y))
+    }
+}
+
+// Post-action focus readback (HIServices AX C API): the system-wide focused
+// element is the OS's own answer to "which app and which field has keyboard
+// focus right now" — the ground truth every silent HID failure so far lied
+// about (keystrokes into the overlay's own prompt, clicks that never focused
+// the target field). Raw FFI like `AXIsProcessTrusted` above: stable C ABI,
+// no binding crate carries it. Reading these attributes needs the AX trust
+// this backend already requires.
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *mut std::ffi::c_void,
+        attribute: *const CFString,
+        value: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn AXUIElementGetPid(element: *mut std::ffi::c_void, pid: *mut i32) -> i32;
+}
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFGetTypeID(cf: *mut std::ffi::c_void) -> usize;
+    fn CFStringGetTypeID() -> usize;
+}
+
+/// Copy one AX attribute of `element` as a Rust string, or `None` when the
+/// attribute is absent, unreadable, or not a CFString. Never errors: the
+/// readback is evidence-gathering, and a target app without AX support just
+/// yields an emptier report.
+unsafe fn copy_string_attr(element: *mut std::ffi::c_void, name: &str) -> Option<String> {
+    let attr = CFString::from_str(name);
+    let mut value: *mut std::ffi::c_void = std::ptr::null_mut();
+    if AXUIElementCopyAttributeValue(element, &*attr, &mut value) != 0 || value.is_null() {
+        return None;
+    }
+    let out = if CFGetTypeID(value) == CFStringGetTypeID() {
+        Some((*(value as *const CFString)).to_string())
+    } else {
+        None
+    };
+    CFRelease(value);
+    out
+}
+
+/// Localized name of the app owning `pid` — the SAME namespace `focus_app`
+/// verification and `screen_query` attribution report, so the model can compare
+/// them directly.
+fn app_name_for_pid(pid: i32) -> Option<String> {
+    let app =
+        objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+    app.localizedName().map(|n| n.to_string())
+}
+
+/// One snapshot of the system-wide keyboard-focused element: owning app, role,
+/// title/description, and its CURRENT full value (truncated later by
+/// [`redact_focus`] — matching against typed text needs the full value first).
+/// `None` when nothing holds focus or the AX read fails. Secure text fields
+/// never yield a value — their content must not enter model context.
+fn read_focused_element() -> Option<FocusReport> {
+    unsafe {
+        let system_wide = AXUIElementCreateSystemWide();
+        if system_wide.is_null() {
+            return None;
+        }
+        let attr = CFString::from_str("AXFocusedUIElement");
+        let mut el: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = AXUIElementCopyAttributeValue(system_wide, &*attr, &mut el);
+        CFRelease(system_wide);
+        if err != 0 || el.is_null() {
+            return None;
+        }
+        let mut pid: i32 = 0;
+        let app = (AXUIElementGetPid(el, &mut pid) == 0)
+            .then(|| app_name_for_pid(pid))
+            .flatten();
+        let role = copy_string_attr(el, "AXRole");
+        let title = copy_string_attr(el, "AXTitle")
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| copy_string_attr(el, "AXDescription"));
+        let value = if role.as_deref() == Some("AXSecureTextField") {
+            None
+        } else {
+            copy_string_attr(el, "AXValue")
+        };
+        CFRelease(el);
+        Some(FocusReport { app, role, title, value })
+    }
+}
+
+/// Max characters of a focused element's value that may enter the report (and
+/// thus model context). The TAIL is kept — that is where just-typed text lands.
+const VALUE_EXCERPT_CHARS: usize = 160;
+
+/// Char-boundary-safe tail excerpt, prefixed with `…` when truncated.
+fn tail_excerpt(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(count - max_chars).collect();
+    format!("…{tail}")
+}
+
+/// Bound a focus snapshot for the model-facing report: the value excerpt only.
+fn redact_focus(f: FocusReport) -> FocusReport {
+    FocusReport { value: f.value.map(|v| tail_excerpt(&v, VALUE_EXCERPT_CHARS)), ..f }
+}
+
+/// How long a click/key-press gets for the OS to settle keyboard focus before
+/// the single post-action focus read. Fixed (not a poll): with no expected
+/// value there is nothing to poll FOR, and reading too early would report the
+/// pre-action focus as if it were the outcome.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Post-action focus snapshot for actions with no expected text: settle, read
+/// once, redact.
+fn observe_focus_settled() -> Option<FocusReport> {
+    std::thread::sleep(FOCUS_SETTLE);
+    read_focused_element().map(redact_focus)
+}
+
+/// Post-`type-text` observation: poll (bounded) until the focused element's
+/// value contains the typed text's tail, then report the snapshot and whether
+/// it matched. AX value propagation lags the keystrokes by tens of
+/// milliseconds, so a single immediate read would under-report success.
+/// `matched == Some(false)` after the bound is honest uncertainty — some
+/// targets (canvases, games, password fields) never echo — and the model is
+/// told to treat it as "not confirmed", not as proof of failure.
+fn observe_text_entry(text: &str) -> (Option<FocusReport>, Option<bool>) {
+    // Compare on the typed text's tail: long runs may scroll out of AXValue's
+    // head, but the most recent keystrokes are at the end.
+    let chars: Vec<char> = text.chars().collect();
+    let needle: String = if chars.len() > 64 {
+        chars[chars.len() - 64..].iter().collect()
+    } else {
+        text.to_string()
+    };
+    if needle.trim().is_empty() {
+        // Whitespace-only input is unverifiable by containment; report the
+        // settled focus without claiming either way.
+        return (observe_focus_settled(), None);
+    }
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    const TRIES: u32 = 14; // ≤ ~700ms
+    let mut last: Option<FocusReport> = None;
+    for _ in 0..TRIES {
+        if let Some(snap) = read_focused_element() {
+            let hit = snap.value.as_deref().is_some_and(|v| v.contains(&needle));
+            last = Some(snap);
+            if hit {
+                return (last.map(redact_focus), Some(true));
+            }
+        }
+        std::thread::sleep(POLL);
+    }
+    (last.map(redact_focus), Some(false))
+}
+
+/// Block (bounded) until the system cursor actually reads the commanded point.
+///
+/// Why this exists (M008 follow-up — the "search in Chrome did nothing" bug):
+/// enigo's `button()` does NOT click at the point we just moved to. It reads
+/// the CURRENT system cursor (`NSEvent::mouseLocation`) and posts the
+/// mouse-down there — and a synthetic move posted through the HID tap takes a
+/// few milliseconds to commit in the window server. So `move_mouse(x, y)`
+/// followed immediately by `button()` fires the click at the STALE pre-move
+/// cursor position (wherever the user's cursor happened to sit), while the
+/// visible cursor lands on the target. Every call reports ok; the click lands
+/// somewhere else entirely. Waiting for the readback to match the command
+/// closes the race deterministically, and a timeout surfaces a genuinely
+/// dropped move as a typed `input-failed` instead of a silent misclick (R007).
+fn wait_for_cursor_commit(x: i32, y: i32) -> Result<CursorPosition, InputError> {
+    // 5ms × 60 = 300ms bound: commit latency is single-digit ms in practice;
+    // the bound only trips when the move never landed (e.g. posting silently
+    // denied) or something else is fighting for the cursor. Ok carries the
+    // READ-BACK position (not the command echoed) — the report's evidence.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    const TRIES: u32 = 60;
+    const TOLERANCE: f64 = 3.0;
+    let mut last = (f64::NAN, f64::NAN);
+    for _ in 0..TRIES {
+        last = cursor_location()?;
+        if (last.0 - x as f64).abs() <= TOLERANCE && (last.1 - y as f64).abs() <= TOLERANCE {
+            return Ok(CursorPosition { x: last.0.round() as i32, y: last.1.round() as i32 });
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(InputError::InputFailed {
+        detail: format!(
+            "cursor never committed to the commanded point ({x},{y}) — it reads \
+             ({:.0},{:.0}); the synthesized move was likely dropped by the OS",
+            last.0, last.1
+        ),
+    })
+}
+
 /// The per-action blocking stage: build a throwaway `Enigo`, synthesize the one
-/// action, drop the handle. Runs on a `spawn_blocking` thread. Every enigo
-/// failure (construction or event post) collapses onto `InputFailed` — the
-/// permission-denied case is already handled by the caller's preflight, and a
-/// construction failure here after a passing preflight is a genuine synthesis
-/// fault, not a permission one.
-fn perform_blocking(action: InputAction) -> Result<(), InputError> {
+/// action, drop the handle — then read back what the OS observed (cursor
+/// position, focused element) into the [`ActionReport`]. Runs on a
+/// `spawn_blocking` thread. Every enigo failure (construction or event post)
+/// collapses onto `InputFailed` — the permission-denied case is already handled
+/// by the caller's preflight, and a construction failure here after a passing
+/// preflight is a genuine synthesis fault, not a permission one. Observation
+/// failures never fail a performed action: they just leave report fields empty.
+fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
     // Don't prompt on the action path — permission was already verified, and a
     // prompt here would violate health-as-value.
     let settings = Settings { open_prompt_to_get_permissions: false, ..Settings::default() };
     let mut enigo = Enigo::new(&settings)
         .map_err(|e| InputError::InputFailed { detail: format!("enigo init failed: {e}") })?;
 
-    match action {
-        InputAction::MouseMove { x, y } => enigo
-            .move_mouse(x, y, Coordinate::Abs)
-            .map_err(|e| InputError::InputFailed { detail: format!("move_mouse failed: {e}") }),
+    let report = match action {
+        InputAction::MouseMove { x, y } => {
+            enigo
+                .move_mouse(x, y, Coordinate::Abs)
+                .map_err(|e| InputError::InputFailed { detail: format!("move_mouse failed: {e}") })?;
+            // Completing only once the cursor readback matches means a
+            // follow-up coordless click (the model's move-then-click pattern,
+            // milliseconds apart in one tool turn) fires at the committed
+            // point, never a stale one.
+            let cursor = wait_for_cursor_commit(x, y)?;
+            ActionReport { cursor: Some(cursor), ..ActionReport::default() }
+        }
         InputAction::MouseClick { button, x, y } => {
             // A coordinate-bearing click moves to the target first (the model's
             // "click at (x,y)"); a coordless click fires at the cursor. Both
@@ -210,21 +452,45 @@ fn perform_blocking(action: InputAction) -> Result<(), InputError> {
                 enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| InputError::InputFailed {
                     detail: format!("move before click failed: {e}"),
                 })?;
+                // enigo's button() clicks at the SYSTEM cursor, not at (x,y) —
+                // without this wait the click fires at the stale pre-move
+                // position (see wait_for_cursor_commit docs).
+                wait_for_cursor_commit(x, y)?;
             }
-            enigo
-                .button(map_button(button), Direction::Click)
-                .map_err(|e| InputError::InputFailed { detail: format!("button click failed: {e}") })
+            enigo.button(map_button(button), Direction::Click).map_err(|e| {
+                InputError::InputFailed { detail: format!("button click failed: {e}") }
+            })?;
+            // Evidence: where the click really landed, and what took keyboard
+            // focus — a click on a text field should read back that field.
+            let cursor = cursor_location()
+                .ok()
+                .map(|(px, py)| CursorPosition { x: px.round() as i32, y: py.round() as i32 });
+            ActionReport { cursor, focus: observe_focus_settled(), text_entered: None }
         }
-        InputAction::TypeText { text } => enigo
-            .text(&text)
-            .map_err(|e| InputError::InputFailed { detail: format!("text entry failed: {e}") }),
+        InputAction::TypeText { text } => {
+            enigo
+                .text(&text)
+                .map_err(|e| InputError::InputFailed { detail: format!("text entry failed: {e}") })?;
+            let (focus, text_entered) = observe_text_entry(&text);
+            ActionReport { cursor: None, focus, text_entered }
+        }
         InputAction::KeyPress { key } => {
             let k = key_from_str(&key)?;
             enigo
                 .key(k, Direction::Click)
-                .map_err(|e| InputError::InputFailed { detail: format!("key press failed: {e}") })
+                .map_err(|e| InputError::InputFailed { detail: format!("key press failed: {e}") })?;
+            ActionReport { cursor: None, focus: observe_focus_settled(), text_entered: None }
         }
-    }
+    };
+    // Diagnostic trail without content: the value excerpt stays out of logs.
+    log::debug!(
+        "input: verified — cursor={:?} focus.app={:?} focus.role={:?} textEntered={:?}",
+        report.cursor,
+        report.focus.as_ref().and_then(|f| f.app.as_deref()),
+        report.focus.as_ref().and_then(|f| f.role.as_deref()),
+        report.text_entered,
+    );
+    Ok(report)
 }
 
 /// Map the crate's wire button onto enigo's.
@@ -358,6 +624,40 @@ mod tests {
         assert_eq!(map_button(MouseButton::Middle), Button::Middle);
     }
 
+    #[test]
+    fn tail_excerpt_keeps_the_tail_and_respects_char_boundaries() {
+        assert_eq!(tail_excerpt("short", 160), "short");
+        assert_eq!(tail_excerpt("", 160), "");
+        // Truncation keeps the END (where just-typed text lands) and marks it.
+        let long: String = "a".repeat(200) + "farts";
+        let cut = tail_excerpt(&long, 10);
+        assert_eq!(cut, "…aaaaafarts");
+        // Multi-byte chars must never split — count in chars, not bytes.
+        let uni = "é".repeat(20);
+        assert_eq!(tail_excerpt(&uni, 5), format!("…{}", "é".repeat(5)));
+    }
+
+    #[test]
+    fn redact_focus_truncates_only_the_value() {
+        let report = FocusReport {
+            app: Some("Google Chrome".into()),
+            role: Some("AXTextField".into()),
+            title: Some("Address and search bar".into()),
+            value: Some("x".repeat(500)),
+        };
+        let redacted = redact_focus(report);
+        assert_eq!(redacted.app.as_deref(), Some("Google Chrome"));
+        assert_eq!(redacted.role.as_deref(), Some("AXTextField"));
+        let value = redacted.value.unwrap();
+        assert_eq!(
+            value.chars().count(),
+            VALUE_EXCERPT_CHARS + 1, // the … marker
+            "the value excerpt must be bounded before it reaches model context"
+        );
+        // No value stays no value.
+        assert_eq!(redact_focus(FocusReport::default()).value, None);
+    }
+
     /// Live event synthesis through the full trait surface. Needs Accessibility
     /// permission (and moves the real cursor), so it is ignored in the default
     /// suite (slice UAT runs it): `cargo test -- --ignored real_input_smoke`.
@@ -369,8 +669,12 @@ mod tests {
         // A mouse move is the least disruptive proof that the spawn_blocking →
         // enigo path round-trips without a !Send compile error or a runtime hang.
         match backend.perform(InputAction::MouseMove { x: 200, y: 200 }).await {
-            Ok(()) => {
+            Ok(report) => {
                 assert!(backend.permission().granted, "input succeeded but permission reads false");
+                // The move's report must carry the read-back cursor — the
+                // verification evidence, not an echo of the command.
+                let cursor = report.cursor.expect("a mouse-move report carries the cursor");
+                assert!((cursor.x - 200).abs() <= 3 && (cursor.y - 200).abs() <= 3);
             }
             Err(err) => {
                 // In an unpermitted environment the only acceptable outcome is
@@ -381,31 +685,13 @@ mod tests {
         }
     }
 
-    // Read the CURRENT cursor position in the SAME global coordinate space
-    // `CGEventPost` writes to (CoreGraphics points, top-left origin). A nil
-    // event's location is the live cursor. This is the ground truth for "where
-    // did the move actually land" — NOT enigo's pixel-flipped `location()`.
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-        fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPointRaw;
-        fn CFRelease(cf: *mut std::ffi::c_void);
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CGPointRaw {
-        x: f64,
-        y: f64,
-    }
+    // The CURRENT cursor position in the SAME global coordinate space
+    // `CGEventPost` writes to (CoreGraphics points, top-left origin) — the
+    // ground truth for "where did the move actually land", NOT enigo's
+    // pixel-flipped `location()`. Thin infallible wrapper over the production
+    // readback the click path itself uses.
     fn cursor_point() -> (f64, f64) {
-        // Safety: CGEventCreate(nil) returns a retained event whose location is
-        // the current cursor; we release it. No arguments beyond the null source.
-        unsafe {
-            let ev = CGEventCreate(std::ptr::null());
-            let p = CGEventGetLocation(ev);
-            CFRelease(ev);
-            (p.x, p.y)
-        }
+        cursor_location().expect("cursor readback")
     }
 
     /// THE decisive targeting probe: does a move to a commanded point actually
@@ -485,6 +771,120 @@ mod tests {
             "cursor landed OUTSIDE the element box — coordinate space still wrong: \
              centre ({cx},{cy}) landed ({rx:.0},{ry:.0}), box ({},{})..({},{})",
             t.x, t.y, t.x + t.width, t.y + t.height,
+        );
+    }
+
+    fn osascript(script: &str) -> String {
+        let out = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .expect("osascript spawn");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Reproduces the in-app "search in Chrome" action chain exactly as the
+    /// tool loop delivers it: click the address bar, type the query, press
+    /// Return — three separate `perform` calls, back-to-back. The tool loop
+    /// runs same-turn tool calls in a plain `for` loop with no inter-action
+    /// delay (toolloop.rs run_tool_loop), so `TE_SETTLE_MS=0` mimics the live
+    /// failure mode and a generous value (e.g. 400) isolates whether Chrome's
+    /// click→omnibox-focus handoff is the race. Ground truth is the tab's URL
+    /// read back over AppleScript: an omnibox search navigates, keystrokes
+    /// swallowed by the page body leave the URL untouched. Uses a fresh tab on
+    /// a neutral page so the user's tabs are never clobbered. Ignored: drives
+    /// live Chrome and synthesizes real input (targeting UAT).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "drives live Google Chrome and synthesizes real input (targeting UAT)"]
+    async fn chrome_address_bar_click_type_return_executes_a_search() {
+        if !has_permission() {
+            eprintln!("skipping: HID not permitted");
+            return;
+        }
+        let settle: u64 = std::env::var("TE_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // A neutral page that swallows stray typing without side effects: if the
+        // omnibox never got focus, the keystrokes vanish into the page and the
+        // URL stays example.com — the exact silent no-op under investigation.
+        osascript(
+            "tell application \"Google Chrome\"\n\
+             activate\n\
+             make new tab at end of tabs of front window with properties {URL:\"https://example.com\"}\n\
+             end tell",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let bounds = osascript("tell application \"Google Chrome\" to get bounds of front window");
+        let nums: Vec<i32> =
+            bounds.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        assert_eq!(nums.len(), 4, "unexpected bounds reply: {bounds:?}");
+        // Omnibox: past the nav buttons horizontally, tab-strip + half the
+        // toolbar down — the same row OCR located "google.com" text on (+64).
+        let (ax, ay) = (nums[0] + 320, nums[1] + 64);
+        eprintln!("TE probe: settle={settle}ms, window bounds={bounds}, clicking omnibox at ({ax},{ay})");
+
+        let backend: Arc<dyn InputControl> = Arc::new(MacosInput);
+        let click_report = backend
+            .perform(InputAction::MouseClick { button: MouseButton::Left, x: Some(ax), y: Some(ay) })
+            .await
+            .expect("click");
+        eprintln!("TE probe click report: {click_report:?}");
+        // The report is the in-process verification surface the tool loop now
+        // returns to the model — it must independently agree with the
+        // AppleScript ground truth below: the click focused Chrome's omnibox.
+        let focus = click_report.focus.as_ref().expect("click report carries focus");
+        assert!(
+            focus.app.as_deref().is_some_and(|a| a.contains("Chrome")),
+            "click report must attribute focus to Chrome: {focus:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
+        // Bisect diagnostics: where did the cursor actually land, which app is
+        // frontmost, and what does Chrome think has keyboard focus?
+        let (rx, ry) = cursor_point();
+        let front = osascript(
+            "tell application \"System Events\" to get name of first process whose frontmost is true",
+        );
+        let focused = osascript(
+            "tell application \"System Events\" to tell process \"Google Chrome\"\n\
+             set el to value of attribute \"AXFocusedUIElement\"\n\
+             get {role of el, description of el}\n\
+             end tell",
+        );
+        eprintln!(
+            "TE probe post-click: cursor=({rx:.0},{ry:.0}) commanded=({ax},{ay}) frontmost={front:?} chrome-focused={focused:?}"
+        );
+        let type_report = backend
+            .perform(InputAction::TypeText { text: "farts".into() })
+            .await
+            .expect("type");
+        eprintln!("TE probe type report: {type_report:?}");
+        assert_eq!(
+            type_report.text_entered,
+            Some(true),
+            "the type-text report must confirm the text was observed in the focused field: \
+             {type_report:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
+        let focused = osascript(
+            "tell application \"System Events\" to tell process \"Google Chrome\"\n\
+             set el to value of attribute \"AXFocusedUIElement\"\n\
+             get {role of el, description of el, value of el}\n\
+             end tell",
+        );
+        eprintln!("TE probe post-type: chrome-focused={focused:?}");
+        let return_report = backend
+            .perform(InputAction::KeyPress { key: "return".into() })
+            .await
+            .expect("return");
+        eprintln!("TE probe return report: {return_report:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+
+        let url = osascript("tell application \"Google Chrome\" to get URL of active tab of front window");
+        eprintln!("TE probe: final URL = {url}");
+        assert!(
+            url.contains("farts"),
+            "the search never executed (URL is {url:?}) — keystrokes did not reach the omnibox at settle={settle}ms",
         );
     }
 }

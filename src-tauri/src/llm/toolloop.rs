@@ -25,7 +25,7 @@ use crate::appfocus::{AppFocus, AppFocusError};
 use crate::input::commands::{
     resolve_approval, ApprovalDecision, HidArmState, HidRunMode, SessionWhitelist,
 };
-use crate::input::{ActionKind, InputAction, InputControl, InputError, MouseButton};
+use crate::input::{ActionKind, ActionReport, InputAction, InputControl, InputError, MouseButton};
 use crate::memory::commands::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 use crate::memory::{search, Embedder, MemoryStore, SearchMode};
 use crate::screenquery::{ScreenElement, ScreenQuery};
@@ -99,7 +99,20 @@ Always focus_app FIRST, before screen_query. Once you have focused an app, scree
 that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a \
 coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it \
 hides the user's windows instead of doing what they asked.\n\n\
-Report tool results honestly. If a tool call returns an error, tell the user it failed and why — \
+Every input_action result carries a `verified` block — what ACTUALLY happened, measured from the \
+OS after the action: `cursor` is where the mouse really ended up, `focus` names the app and UI \
+element that now holds keyboard focus (its role, title, and current value), and for type-text \
+`textEntered` reports whether your text was really observed in the focused field. VALIDATE every \
+action against it before moving on: after clicking a text field, verified.focus should name that \
+field in the app you focused; after type-text, verified.textEntered should be true and \
+verified.focus.value should contain what you typed. If verified contradicts your intent — the \
+focused app is wrong, textEntered is false, the value is missing your text — the action landed in \
+the wrong place: call screen_query again, re-aim, and retry instead of continuing the sequence. \
+When the evidence shows your action landed in a DIFFERENT app than the one you focused, the tool \
+fails it for you (kind verification-failed) — treat that like any failed step: screen_query, \
+re-aim, retry.\n\n\
+Report tool results honestly, using the `verified` evidence: only claim an action worked when its \
+verified block confirms it. If a tool call returns an error, tell the user it failed and why — \
 never claim an action succeeded when the tool reported a failure.";
 
 /// The typed failure kind the [`ApprovalGate`] returns when the model tries to
@@ -118,6 +131,39 @@ pub const NO_SCREEN_QUERY_KIND: &str = "no-screen-query";
 /// what actually stops the "click wallpaper → reveal desktop → windows hide"
 /// failure (M005), rather than merely telling the model not to.
 pub const OFF_TARGET_KIND: &str = "off-target";
+
+/// The typed failure an `input_action` gets when the event was synthesized but
+/// its post-action `verified` evidence CONTRADICTS the intent: keyboard focus
+/// ended up in a different app than the one the model `focus_app`'d. This is
+/// the structural half of the verification surface (the reinforcement loop):
+/// the `verified` block alone relies on the model reading it, and a small model
+/// happily sails past `focus.app = "Third Eye"` while narrating success.
+/// Flipping the result to a typed failure forces the observe → re-aim → retry
+/// cycle the same way [`NO_SCREEN_QUERY_KIND`]/[`OFF_TARGET_KIND`] force
+/// grounded aiming (M005/M008 pattern: structure over prose).
+pub const VERIFICATION_FAILED_KIND: &str = "verification-failed";
+
+/// Compare an action's post-hoc [`ActionReport`] against the run's focused-app
+/// intent and return the contradiction, if any. Pure and deliberately narrow:
+/// it fires ONLY on positive evidence of wrongness — a focus readback naming a
+/// DIFFERENT app than `focused`. Absent evidence (`focus`/`app` = `None`, no
+/// app focused yet) passes: the report's fields are best-effort observations,
+/// and refusing on missing data would fail honest actions on targets the OS
+/// cannot attribute. Cursor mismatch needs no rule here — the backend already
+/// fails a move that never committed — and `textEntered: false` stays soft
+/// (some targets never echo text; the model sees it in `verified`).
+pub fn verify_against_intent(report: &ActionReport, focused: Option<&str>) -> Option<String> {
+    let focused = focused?;
+    let observed = report.focus.as_ref()?.app.as_deref()?;
+    if observed.eq_ignore_ascii_case(focused) {
+        return None;
+    }
+    Some(format!(
+        "the action was synthesized, but keyboard focus now sits in {observed:?}, not the focused \
+         app {focused:?} — it landed in the wrong app. Call screen_query to re-read the screen, \
+         then re-aim; do not assume this step worked."
+    ))
+}
 
 /// A per-run flag recording whether the model has *seen the screen* — i.e.
 /// called [`SCREEN_QUERY_TOOL`] and gotten real pixel coordinates — since the
@@ -466,11 +512,22 @@ impl ToolExecutor for MemorySearchTool {
 pub struct InputTool {
     backend: Arc<dyn InputControl>,
     arm: Arc<HidArmState>,
+    /// The app the model last `focus_app`'d this run — the INTENT the
+    /// post-action `verified` evidence is checked against. When the readback
+    /// shows focus in a different app, the result flips to a typed
+    /// [`VERIFICATION_FAILED_KIND`] failure so the model must re-aim instead
+    /// of narrating success (the reinforcement loop, M008). Same shared holder
+    /// the `ScreenQueryTool` filter and `ApprovalGate` use.
+    focused_app: Arc<FocusedApp>,
 }
 
 impl InputTool {
-    pub fn new(backend: Arc<dyn InputControl>, arm: Arc<HidArmState>) -> Self {
-        Self { backend, arm }
+    pub fn new(
+        backend: Arc<dyn InputControl>,
+        arm: Arc<HidArmState>,
+        focused_app: Arc<FocusedApp>,
+    ) -> Self {
+        Self { backend, arm, focused_app }
     }
 
     /// The model-facing definition. `action` is required and discriminates the
@@ -486,7 +543,14 @@ impl InputTool {
                           focus_app to bring the app to the front, then screen_query to read its \
                           on-screen elements and their exact coordinates, then mouse-click with the \
                           x,y of the target (the click moves there and clicks in one step). A click \
-                          or move to a guessed coordinate is refused."
+                          or move to a guessed coordinate is refused. Every result includes a \
+                          `verified` block measured from the OS AFTER the action: `cursor` (where \
+                          the mouse really is), `focus` (the app and UI element that now holds \
+                          keyboard focus), and for type-text `textEntered` (whether the typed text \
+                          was observed in the focused field). ALWAYS check `verified` before your \
+                          next step: if it does not match what you intended (wrong app in focus, \
+                          textEntered false), the action landed somewhere else — re-run \
+                          screen_query and correct instead of continuing."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -572,13 +636,48 @@ impl ToolExecutor for InputTool {
         // backend — the model sees exactly what was synthesized.
         let performed = serde_json::to_value(&action).unwrap_or(serde_json::Value::Null);
         match self.backend.perform(action).await {
-            Ok(()) => ToolOutcome {
-                content: serde_json::json!({ "ok": true, "performed": performed }).to_string(),
-                ok: true,
-                result_count: None,
-                mode: None,
-                failure: None,
-            },
+            // `verified` is the backend's post-action readback (cursor, focused
+            // element, text-entry confirmation) — evidence of the action's
+            // EFFECT, so the model can validate instead of assuming (R007).
+            Ok(report) => {
+                // The reinforcement loop's structural half: when the evidence
+                // positively contradicts the intent (focus landed in a
+                // different app than the one the model focused), the result
+                // itself becomes a typed failure — the model cannot sail past
+                // it, it must observe → re-aim → retry. The event DID fire;
+                // `verified` rides along so the model sees what really
+                // happened.
+                if let Some(contradiction) =
+                    verify_against_intent(&report, self.focused_app.current().as_deref())
+                {
+                    log::warn!("llm: input_action {VERIFICATION_FAILED_KIND}: {contradiction}");
+                    return ToolOutcome {
+                        content: serde_json::json!({
+                            "ok": false,
+                            "error": contradiction,
+                            "performed": performed,
+                            "verified": report,
+                        })
+                        .to_string(),
+                        ok: false,
+                        result_count: None,
+                        mode: None,
+                        failure: Some(VERIFICATION_FAILED_KIND.to_string()),
+                    };
+                }
+                ToolOutcome {
+                    content: serde_json::json!({
+                        "ok": true,
+                        "performed": performed,
+                        "verified": report,
+                    })
+                    .to_string(),
+                    ok: true,
+                    result_count: None,
+                    mode: None,
+                    failure: None,
+                }
+            }
             // Typed InputError → same kind tag the UI matches on; the model sees
             // the detail and can recover (e.g. ask the user to grant access).
             Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
@@ -1932,10 +2031,14 @@ mod tests {
 
     use crate::input::commands::HidArmState;
     use crate::input::fallback::FallbackInput;
-    use crate::input::{InputAction, InputControl, InputError, InputPermission, MouseButton};
+    use crate::input::{
+        ActionReport, FocusReport, InputAction, InputControl, InputError, InputPermission,
+        MouseButton,
+    };
 
     /// Records the last performed action so delegation through the tool +
-    /// composite can be asserted without touching real HID.
+    /// composite can be asserted without touching real HID. Returns a
+    /// distinctive [`ActionReport`] so the `verified` passthrough is pinnable.
     struct RecordingInput {
         last: Mutex<Option<InputAction>>,
     }
@@ -1956,9 +2059,18 @@ mod tests {
             true
         }
 
-        async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
             *self.last.lock().unwrap() = Some(action);
-            Ok(())
+            Ok(ActionReport {
+                cursor: None,
+                focus: Some(FocusReport {
+                    app: Some("Mock App".into()),
+                    role: Some("AXTextField".into()),
+                    title: None,
+                    value: None,
+                }),
+                text_entered: None,
+            })
         }
     }
 
@@ -1970,6 +2082,13 @@ mod tests {
     /// The structural-gate tests build their own disarmed holder.
     fn armed_arm() -> Arc<HidArmState> {
         Arc::new(HidArmState::new(true))
+    }
+
+    /// A never-focused FocusedApp — post-action verification is inert until a
+    /// focus_app stores an intent, so this is the delegation tests' default.
+    /// The verification tests build their own focused holder.
+    fn unfocused() -> Arc<FocusedApp> {
+        Arc::new(FocusedApp::new())
     }
 
     #[test]
@@ -1985,7 +2104,7 @@ mod tests {
     #[tokio::test]
     async fn input_tool_performs_a_valid_action_and_reports_ok() {
         let backend = Arc::new(RecordingInput::new());
-        let tool = InputTool::new(backend.clone(), armed_arm());
+        let tool = InputTool::new(backend.clone(), armed_arm(), unfocused());
         let outcome = tool
             .execute(&input_call("c1", r#"{"action":"mouse-click","button":"right"}"#))
             .await;
@@ -1996,16 +2115,94 @@ mod tests {
             *backend.last.lock().unwrap(),
             Some(InputAction::click(MouseButton::Right)),
         );
-        // The model sees a structured confirmation echoing what was synthesized.
+        // The model sees a structured confirmation echoing what was synthesized
+        // PLUS the backend's post-action verification evidence.
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["performed"]["action"], "mouse-click");
         assert_eq!(v["performed"]["button"], "right");
+        assert_eq!(
+            v["verified"]["focus"]["app"], "Mock App",
+            "the backend's ActionReport must ride the result as `verified`"
+        );
+        assert_eq!(v["verified"]["focus"]["role"], "AXTextField");
+    }
+
+    #[tokio::test]
+    async fn input_tool_focus_in_another_app_is_a_typed_verification_failure() {
+        // The reinforcement loop's structural half: RecordingInput reports
+        // post-action focus in "Mock App"; with Chrome as the focused intent,
+        // the contradiction must flip the result to a typed failure carrying
+        // the evidence — the model cannot narrate past it.
+        let backend = Arc::new(RecordingInput::new());
+        let focused = Arc::new(FocusedApp::new());
+        focused.set("Google Chrome");
+        let tool = InputTool::new(backend.clone(), armed_arm(), focused);
+        let outcome = tool
+            .execute(&input_call("c1", r#"{"action":"type-text","text":"farts"}"#))
+            .await;
+        assert!(!outcome.ok, "a wrong-app focus readback must fail the action");
+        assert_eq!(outcome.failure.as_deref(), Some(VERIFICATION_FAILED_KIND));
+        // The action DID reach the backend — the failure is about its EFFECT,
+        // after the fact, not a refusal to act.
+        assert!(backend.last.lock().unwrap().is_some(), "the action itself was performed");
+        let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(
+            v["verified"]["focus"]["app"], "Mock App",
+            "the evidence must ride the failure so the model sees what happened"
+        );
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.contains("Mock App") && error.contains("Google Chrome"),
+            "the detail must name both the observed and intended app: {error}"
+        );
+        assert!(error.contains("screen_query"), "the detail must teach the recovery: {error}");
+    }
+
+    #[tokio::test]
+    async fn input_tool_matching_focus_passes_verification_case_insensitively() {
+        // Same app in a different casing is the SAME intent — localized names
+        // match case-insensitively everywhere else (FocusedApp::filter).
+        let focused = Arc::new(FocusedApp::new());
+        focused.set("mock APP");
+        let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), focused);
+        let outcome = tool
+            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .await;
+        assert!(outcome.ok, "focus inside the focused app must pass: {}", outcome.content);
+        assert_eq!(outcome.failure, None);
+    }
+
+    #[test]
+    fn verify_against_intent_fires_only_on_positive_contradiction() {
+        let observed = |app: &str| ActionReport {
+            focus: Some(FocusReport { app: Some(app.into()), ..FocusReport::default() }),
+            ..ActionReport::default()
+        };
+        // No focused app yet (pre-focus actions) → inert.
+        assert_eq!(verify_against_intent(&observed("Other"), None), None);
+        // No readback at all (fallback backends, mouse-move) → inert.
+        assert_eq!(verify_against_intent(&ActionReport::default(), Some("Chrome")), None);
+        // Readback present but the app unattributed → inert: absence of
+        // evidence is not evidence of wrongness.
+        let no_app =
+            ActionReport { focus: Some(FocusReport::default()), ..ActionReport::default() };
+        assert_eq!(verify_against_intent(&no_app, Some("Chrome")), None);
+        // Same app, any casing → pass.
+        assert_eq!(
+            verify_against_intent(&observed("google chrome"), Some("Google Chrome")),
+            None
+        );
+        // A DIFFERENT app is the one positive contradiction — named on both ends.
+        let detail = verify_against_intent(&observed("Third Eye"), Some("Google Chrome"))
+            .expect("a wrong-app readback must contradict");
+        assert!(detail.contains("Third Eye") && detail.contains("Google Chrome"));
     }
 
     #[tokio::test]
     async fn input_tool_malformed_arguments_are_typed_invalid_arguments() {
-        let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm());
+        let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused());
         // Unknown action tag: serde rejects it before any HID is touched.
         let outcome = tool.execute(&input_call("c1", r#"{"action":"self-destruct"}"#)).await;
         assert!(!outcome.ok);
@@ -2016,7 +2213,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_tool_wrong_name_is_unknown_tool() {
-        let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm());
+        let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused());
         let outcome = tool
             .execute(&ToolCall {
                 id: "c1".into(),
@@ -2032,7 +2229,7 @@ mod tests {
     async fn input_tool_propagates_typed_backend_error_kind() {
         // FallbackInput returns the typed `unsupported` error on every platform;
         // its kind must ride back to the model/UI unchanged (R007).
-        let tool = InputTool::new(Arc::new(FallbackInput), armed_arm());
+        let tool = InputTool::new(Arc::new(FallbackInput), armed_arm(), unfocused());
         let outcome =
             tool.execute(&input_call("c1", r#"{"action":"type-text","text":"hi"}"#)).await;
         assert!(!outcome.ok);
@@ -2048,7 +2245,7 @@ mod tests {
         // Structural gate (D038): a disarmed tool contributes zero definitions,
         // so the CompositeExecutor never offers input_action to the model.
         let arm = Arc::new(HidArmState::disarmed());
-        let tool = InputTool::new(Arc::new(RecordingInput::new()), arm.clone());
+        let tool = InputTool::new(Arc::new(RecordingInput::new()), arm.clone(), unfocused());
         assert!(tool.definitions().is_empty(), "disarmed tool must advertise nothing");
         // Arming the shared holder flips the advertised set live — no re-mount.
         arm.set_armed(true);
@@ -2064,7 +2261,8 @@ mod tests {
         // The core safety requirement: a disarmed execute() is refused with the
         // typed `disabled` error and the InputControl backend is never touched.
         let backend = Arc::new(RecordingInput::new());
-        let tool = InputTool::new(backend.clone(), Arc::new(HidArmState::disarmed()));
+        let tool =
+            InputTool::new(backend.clone(), Arc::new(HidArmState::disarmed()), unfocused());
         let outcome = tool
             .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
             .await;
@@ -2089,6 +2287,7 @@ mod tests {
             Box::new(InputTool::new(
                 Arc::new(RecordingInput::new()),
                 Arc::new(HidArmState::disarmed()),
+                unfocused(),
             )),
             Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
         ]);
@@ -2110,6 +2309,7 @@ mod tests {
         let composite = CompositeExecutor::new(vec![Box::new(InputTool::new(
             backend.clone(),
             Arc::new(HidArmState::disarmed()),
+            unfocused(),
         ))]);
         let outcome = composite
             .execute(&input_call("c1", r#"{"action":"mouse-move","x":1,"y":2}"#))
@@ -2123,7 +2323,7 @@ mod tests {
     fn composite_concatenates_every_sub_executor_definition() {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm())),
+            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
         ]);
         let names: Vec<String> = composite.definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec![MEMORY_SEARCH_TOOL, INPUT_ACTION_TOOL]);
@@ -2134,7 +2334,7 @@ mod tests {
         let backend = Arc::new(RecordingInput::new());
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(backend.clone(), armed_arm())),
+            Box::new(InputTool::new(backend.clone(), armed_arm(), unfocused())),
         ]);
 
         // memory_search dispatches to the memory tool, unchanged.
@@ -2157,7 +2357,7 @@ mod tests {
     async fn composite_unknown_tool_is_typed_and_lists_available_tools() {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm())),
+            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
         ]);
         let outcome = composite
             .execute(&ToolCall {
@@ -2382,7 +2582,7 @@ mod tests {
         // screen_query, dispatched by name.
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm())),
+            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
             Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
         ]);
         let names: Vec<String> =
@@ -2474,7 +2674,7 @@ mod tests {
         approver: Arc<ScriptedApprover>,
     ) -> (ApprovalGate, Arc<std::sync::Mutex<SessionWhitelist>>) {
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
-        let inner = InputTool::new(backend, armed_arm());
+        let inner = InputTool::new(backend, armed_arm(), unfocused());
         let focus = FocusAppTool::new(Arc::new(RecordingFocus::new()));
         // Mark the screen already seen — with a screen-spanning box so any aimed
         // coordinate these approval-path tests use lands on-target — so they
@@ -2632,7 +2832,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::Ask,
             whitelist,
@@ -2679,7 +2879,7 @@ mod tests {
         // mouse-click carries no coordinate, so it is not gated on the targeting
         // flag; a fresh (unseen) gate still performs the click.
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::Ask,
             whitelist,
@@ -2719,7 +2919,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2768,7 +2968,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2818,7 +3018,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2877,7 +3077,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         screen_seen.mark_seen(vec![SeenBox { x: 0, y: 0, width: 100_000, height: 100_000 }]); // even with the screen grounded, half-aim is invalid.
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2902,7 +3102,7 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2935,7 +3135,7 @@ mod tests {
         let screen_seen = Arc::new(ScreenSeen::new());
         let focused_app = Arc::new(FocusedApp::new());
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -2992,7 +3192,7 @@ mod tests {
         let focused_app = Arc::new(FocusedApp::new());
         // RecordingFocus echoes the requested name back as the resolved app.
         let gate = ApprovalGate::new(
-            InputTool::new(backend.clone(), armed_arm()),
+            InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
             HidRunMode::AutoRun,
             whitelist,
@@ -3033,6 +3233,13 @@ mod tests {
         // It teaches the model's natural one-action aim: click with the x,y.
         assert!(HID_SYSTEM_PROMPT.contains("mouse-click"));
         assert!(HID_SYSTEM_PROMPT.to_lowercase().contains("never guess"));
+        // And the post-action validation discipline: the `verified` block is
+        // what the model must check before claiming an action worked.
+        assert!(HID_SYSTEM_PROMPT.contains("verified"));
+        // ...and names the structural enforcement so the model treats the
+        // auto-failed action as a re-aim signal, not a dead end.
+        assert!(HID_SYSTEM_PROMPT.contains(VERIFICATION_FAILED_KIND));
+        assert!(HID_SYSTEM_PROMPT.contains("textEntered"));
     }
 
     // --- FocusAppTool (M005) ---------------------------------------------
@@ -3118,7 +3325,7 @@ mod tests {
         approver: Arc<ScriptedApprover>,
     ) -> (ApprovalGate, Arc<std::sync::Mutex<SessionWhitelist>>) {
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
-        let inner = InputTool::new(Arc::new(RecordingInput::new()), armed_arm());
+        let inner = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused());
         (
             ApprovalGate::new(
                 inner,

@@ -152,7 +152,8 @@ pub struct TextElement {
 
 /// The topmost app owning a window that covers `(center_x, center_y)`, or `None`
 /// when no window does (the desktop, an unattributed menu-bar region). Pure:
-/// `windows` is expected already sorted topmost-first (ascending `layer`, as
+/// `windows` is expected already sorted topmost-first (descending `layer` —
+/// higher CGWindowLevel is closer to the viewer — as
 /// [`crate::capture::macos::WindowAppRect`]s arrive), so the first covering rect
 /// wins — the frontmost window at that point. Point-in-rect is half-open on the
 /// far edges so adjacent windows never both claim a shared boundary pixel.
@@ -493,16 +494,17 @@ mod tests {
 
     #[test]
     fn attribute_app_overlapping_rects_picks_topmost() {
-        // Two overlapping windows; the slice is topmost-first (ascending layer),
-        // exactly as WindowAppRects arrive, so the first covering rect wins.
+        // Two overlapping windows; the slice is topmost-first (descending layer
+        // — higher CGWindowLevel is closer to the viewer), exactly as
+        // WindowAppRects arrive, so the first covering rect wins.
         let windows = vec![
-            win("Google Chrome", 0, 0, 500, 500, 0), // frontmost
-            win("Zed", 0, 0, 500, 500, 5),           // behind
+            win("Google Chrome", 0, 0, 500, 500, 5), // frontmost
+            win("Zed", 0, 0, 500, 500, 0),           // behind
         ];
         assert_eq!(
             attribute_app(250, 250, &windows).as_deref(),
             Some("Google Chrome"),
-            "the topmost (lowest layer) window must win the overlap"
+            "the topmost (highest layer) window must win the overlap"
         );
     }
 

@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 
-use super::{InputAction, InputControl, InputError, InputPermission};
+use super::{ActionReport, InputAction, InputControl, InputError, InputPermission};
 
 /// Trait binding for platforms without a HID input backend.
 pub struct FallbackInput;
@@ -24,7 +24,7 @@ impl InputControl for FallbackInput {
         false
     }
 
-    async fn perform(&self, _action: InputAction) -> Result<(), InputError> {
+    async fn perform(&self, _action: InputAction) -> Result<ActionReport, InputError> {
         let err = InputError::unsupported_here();
         log::error!("input: {} ({err})", err.kind());
         Err(err)

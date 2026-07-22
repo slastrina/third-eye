@@ -52,7 +52,7 @@ use third_eye_lib::memory::{
 use async_trait::async_trait;
 use third_eye_lib::appfocus::{AppFocus, AppFocusError, FocusedApp};
 use third_eye_lib::input::{
-    ActionKind, InputAction, InputControl, InputError, InputPermission,
+    ActionKind, ActionReport, InputAction, InputControl, InputError, InputPermission,
 };
 use third_eye_lib::llm::toolloop::{
     ApprovalGate, ApprovalPrompt, ApprovalVerdict, FocusAppTool, FocusedApp as FocusedAppGate,
@@ -418,7 +418,11 @@ async fn composite_routes_input_action_through_the_loop() {
     // by name. FallbackInput compiles and returns typed unsupported everywhere.
     let executor = CompositeExecutor::new(vec![
         Box::new(MemorySearchTool::new(store, embedder)),
-        Box::new(InputTool::new(Arc::new(FallbackInput), Arc::new(HidArmState::new(true)))),
+        Box::new(InputTool::new(
+            Arc::new(FallbackInput),
+            Arc::new(HidArmState::new(true)),
+            Arc::new(FocusedAppGate::new()),
+        )),
     ]);
 
     let client = OpenAiClient::new(&endpoint);
@@ -508,6 +512,7 @@ async fn live_input_tool_drives_real_backend() {
     let executor: CompositeExecutor = CompositeExecutor::new(vec![Box::new(InputTool::new(
         InputState::with_platform_backend().backend(),
         Arc::new(HidArmState::new(true)),
+        Arc::new(FocusedAppGate::new()),
     ))]);
 
     let client = OpenAiClient::new(&endpoint);
@@ -691,6 +696,7 @@ async fn live_screen_query_then_aim() {
         Box::new(InputTool::new(
             InputState::with_platform_backend().backend(),
             Arc::new(HidArmState::new(true)),
+            Arc::new(FocusedAppGate::new()),
         )),
     ]);
 
@@ -769,9 +775,9 @@ impl InputControl for RecordingInput {
     fn request_permission(&self) -> bool {
         true
     }
-    async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+    async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
         self.actions.lock().unwrap().push(action);
-        Ok(())
+        Ok(ActionReport::default())
     }
 }
 
@@ -860,7 +866,9 @@ async fn live_small_model_follows_targeting_discipline() {
     let screen_seen = Arc::new(ScreenSeen::new());
     let focused_app = Arc::new(FocusedAppGate::new());
     let gate = ApprovalGate::new(
-        InputTool::new(input.clone(), Arc::new(HidArmState::new(true))),
+        // The tool shares the run's FocusedApp intent, the production shape —
+        // RecordingInput reports no focus readback, so verification stays inert.
+        InputTool::new(input.clone(), Arc::new(HidArmState::new(true)), focused_app.clone()),
         FocusAppTool::new(focus.clone()),
         HidRunMode::AutoRun,
         Arc::new(std::sync::Mutex::new(SessionWhitelist::new())),

@@ -113,9 +113,11 @@ fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
 /// One on-screen window's owning-app name and its bounding rect, converted into
 /// the SAME absolute top-left screen-PIXEL space the OCR boxes land in — so the
 /// screen_query path can attribute each recognized text element to the app whose
-/// window covers it (M005). `layer` is the window's `SCWindow::window_layer` so a
-/// caller can pick the TOPMOST window (lowest layer number is frontmost) when
-/// rects overlap. Own-process windows are excluded exactly like the capture
+/// window covers it (M005). `layer` is the window's `SCWindow::window_layer`
+/// (CGWindowLevel: HIGHER is closer to the viewer — normal app windows sit at 0,
+/// the menu bar at 24/25, the Dock-owned wallpaper backstop deep negative) so a
+/// caller can pick the TOPMOST window when rects overlap. Own-process windows
+/// are excluded exactly like the capture
 /// filter's PID exclusion (R008), so the overlay never attributes text to itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowAppRect {
@@ -282,8 +284,8 @@ fn capture_inner(
 /// relative to the display's top-left; `sx/sy` are the per-axis point→pixel
 /// scales. Kept as a free function over the collected `(app, frame, layer,
 /// on_screen, pid)` tuples so the scaling and filtering are testable without a
-/// live capture. Sorted topmost-first (ascending layer) so the first covering
-/// window wins attribution.
+/// live capture. Sorted topmost-first (DESCENDING layer — higher CGWindowLevel
+/// is closer to the viewer) so the first covering window wins attribution.
 fn window_app_rects(
     windows: &[SCWindow],
     own_pid: i32,
@@ -299,6 +301,15 @@ fn window_app_rects(
             let app = w.owning_application()?;
             // Skip our own windows (R008 parity with the capture filter).
             if app.process_id() == own_pid {
+                return None;
+            }
+            // Desktop-class windows live at deep-negative CGWindowLevels: the
+            // Dock-owned wallpaper backstop and Finder's desktop-icon layer both
+            // cover the whole display. Attributing text to them would hand the
+            // model a "clickable" app that is really the wallpaper — the exact
+            // reveal-desktop hazard M005 exists to prevent — so those regions
+            // must read as unattributed (app=None) instead.
+            if w.window_layer() < 0 {
                 return None;
             }
             // WindowServer/menu-bar owners and some system windows report an
@@ -322,9 +333,11 @@ fn window_app_rects(
             })
         })
         .collect();
-    // Topmost first: macOS layers ascend away from the user, so the lowest layer
-    // is frontmost and wins when rects overlap.
-    rects.sort_by_key(|r| r.layer);
+    // Topmost first: CGWindowLevel ascends TOWARD the viewer (menu bar 24/25
+    // above normal windows at 0), so the highest layer is frontmost and wins
+    // when rects overlap. The sort is stable, so windows sharing a layer keep
+    // ScreenCaptureKit's front-to-back enumeration order.
+    rects.sort_by_key(|r| std::cmp::Reverse(r.layer));
     rects
 }
 

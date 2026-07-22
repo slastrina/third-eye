@@ -565,7 +565,9 @@ fn open_input_settings_impl() -> Result<(), InputError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{InputAction, InputControl, InputError, InputPermission, MouseButton};
+    use crate::input::{
+        ActionReport, InputAction, InputControl, InputError, InputPermission, MouseButton,
+    };
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -589,9 +591,9 @@ mod tests {
             self.permission.granted
         }
 
-        async fn perform(&self, action: InputAction) -> Result<(), InputError> {
+        async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
             *self.last.lock().unwrap() = Some(action);
-            Ok(())
+            Ok(ActionReport::default())
         }
     }
 

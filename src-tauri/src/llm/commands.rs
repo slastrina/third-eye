@@ -804,7 +804,10 @@ pub async fn chat(
                 Arc::new(move || crate::overlay::yield_key_focus(&yield_app)),
             ));
         executors.push(Box::new(ApprovalGate::new(
-            InputTool::new(keyboard_safe_backend, input_state.arm_state()),
+            // The tool holds the same per-run FocusedApp intent the gate and
+            // screen_query share: its post-action verification fails an action
+            // whose focus readback lands outside the focused app (M008).
+            InputTool::new(keyboard_safe_backend, input_state.arm_state(), focused_app.clone()),
             FocusAppTool::new(appfocus_state.backend()),
             mode,
             approval.whitelist(),
