@@ -321,6 +321,7 @@ mod tests {
             span_start_ms: 1_000,
             span_end_ms: 2_000,
             embedding,
+            source: crate::memory::store::MemorySource::Watcher,
         }
     }
 

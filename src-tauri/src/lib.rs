@@ -209,6 +209,7 @@ pub fn run() {
             memory::commands::memory_delete,
             memory::commands::memory_wipe,
             memory::commands::memory_status,
+            memory::commands::set_chat_memory_enabled,
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
             settings_window::show_settings_window,
@@ -372,6 +373,17 @@ pub fn run() {
             // loop; any observation published before the subscription is
             // live is missed by design (worthless to replay) and every
             // failure path disables ingestion visibly, never fatally.
+            // Chat-memory toggle (M008 S03): restore the persisted value onto
+            // the ChatIngestState atomic before any chat can complete, so the
+            // structurally-inert pre-capture gate in llm::commands sees the
+            // user's choice from the first exchange. Absent or garbage
+            // defaults to ON (opt-out — the deliberate inversion of the
+            // capture toggles; chat distillation is local-only).
+            #[cfg(desktop)]
+            app.state::<memory::MemoryState>()
+                .chat_ingest()
+                .set_enabled(config::load_chat_memory_enabled(app.handle()).unwrap_or(true));
+
             #[cfg(desktop)]
             memory::ingest::spawn(app.handle());
 

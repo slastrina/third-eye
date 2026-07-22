@@ -14,7 +14,7 @@
 //! payload *does* carry x/y — the contrast is the point: coordinates live on the
 //! tool side of the boundary and die there.
 
-use third_eye_lib::memory::{MemoryStore, NewMemory};
+use third_eye_lib::memory::{MemorySource, MemoryStore, NewMemory};
 use third_eye_lib::screenquery::ScreenElement;
 use third_eye_lib::watcher::TextObservation;
 
@@ -54,6 +54,7 @@ fn memory_store_schema_has_no_coordinate_column() {
             "embedding",
             "created_at_ms",
             "updated_at_ms",
+            "source",
         ],
         "the pinned column set must never grow a coordinate column",
     );
@@ -88,6 +89,7 @@ fn inserting_screen_derived_text_persists_no_coordinates() {
             span_start_ms: 1_000,
             span_end_ms: 2_000,
             embedding: None,
+            source: MemorySource::Watcher,
         })
         .expect("insert screen-derived memory");
 

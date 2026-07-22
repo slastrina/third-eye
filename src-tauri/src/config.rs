@@ -1305,6 +1305,63 @@ pub fn save_llm_endpoint(app: &AppHandle, endpoint: Option<&str>) -> Result<(), 
     Ok(())
 }
 
+/// Store key holding the chat-memory toggle (M008 S03, R032). Mirrors the
+/// watcher trio with ONE deliberate inversion: the default is ON (opt-out) —
+/// chat recall is the milestone's core promise, and the gate governs only
+/// locally-stored chat distillation — so an absent key AND a non-boolean
+/// (garbage) stored value both default to TRUE, warn-logging the garbage,
+/// instead of the capture toggles' fail-safe-to-off.
+pub const CHAT_MEMORY_ENABLED_KEY: &str = "chatMemoryEnabled";
+
+/// Read the persisted chat-memory toggle. `None` means nothing usable is
+/// persisted (no store, no key — both logged where relevant): the caller
+/// keeps the default (ON — the deliberate opt-out inversion of the watcher
+/// trio, see [`CHAT_MEMORY_ENABLED_KEY`]).
+pub fn load_chat_memory_enabled(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            return None;
+        }
+    };
+    let value = store.get(CHAT_MEMORY_ENABLED_KEY)?;
+    Some(stored_chat_memory_enabled(&value))
+}
+
+/// Interpret one stored chat-memory value. Only a JSON boolean is trusted;
+/// anything else is logged and treated as ON — the deliberate inversion of
+/// the watcher/privacy interpreters: this toggle gates local-only chat
+/// distillation (no capture, no egress), so garbage must not silently turn
+/// off the milestone's core promise.
+fn stored_chat_memory_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        other => {
+            log::warn!(
+                "config: {CHAT_MEMORY_ENABLED_KEY} holds non-boolean value {other}; treating as on"
+            );
+            true
+        }
+    }
+}
+
+/// Persist the chat-memory toggle. The error names the failed persist path;
+/// the caller (the chat-memory applier, T02) rolls the in-memory toggle back
+/// so an unpersisted chat-memory state can never silently revert on restart.
+pub fn save_chat_memory_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(CHAT_MEMORY_ENABLED_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {CHAT_MEMORY_ENABLED_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {CHAT_MEMORY_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,6 +1840,24 @@ mod tests {
         assert!(!stored_first_run_complete(&serde_json::json!(1)));
         assert!(!stored_first_run_complete(&serde_json::Value::Null));
         assert!(!stored_first_run_complete(&serde_json::json!({"complete": true})));
+    }
+
+    #[test]
+    fn stored_chat_memory_booleans_round_trip() {
+        // false must survive the round trip — the user's opt-out is honored.
+        assert!(stored_chat_memory_enabled(&serde_json::json!(true)));
+        assert!(!stored_chat_memory_enabled(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn stored_non_boolean_chat_memory_value_defaults_to_on() {
+        // Q7: the deliberate inversion — a corrupted settings.json value loads
+        // as TRUE (opt-out default), unlike the capture toggles. Chat memory is
+        // local-only distillation, so "on" is the safe direction here.
+        assert!(stored_chat_memory_enabled(&serde_json::json!("false")));
+        assert!(stored_chat_memory_enabled(&serde_json::json!(0)));
+        assert!(stored_chat_memory_enabled(&serde_json::Value::Null));
+        assert!(stored_chat_memory_enabled(&serde_json::json!({"enabled": false})));
     }
 
     #[test]

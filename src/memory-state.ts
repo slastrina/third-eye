@@ -21,6 +21,11 @@ import type { LlmError } from "./chat";
 export interface MemoryRecord {
   id: number;
   summary: string;
+  /** Where the memory came from — the lowercase closed vocabulary "watcher"
+   *  / "chat" on the wire (Rust's MemorySource, store.rs). Render through
+   *  `sourceLabel`, which is lenient by contract: unknown or absent values
+   *  degrade to Watcher, mirroring MemorySource::from_str_lenient. */
+  source: string;
   /** App names active during the observed span. */
   apps: string[];
   spanStartMs: number;
@@ -45,6 +50,17 @@ export interface IngestStatus {
   lastError: LlmError | null;
 }
 
+/** The chat-ingest half of `memory_status` — Rust's ChatIngestStatus
+ *  (chat_ingest.rs). Same health-as-value posture as IngestStatus: a stuck
+ *  pipeline shows up as `buffered` > 0 plus a kind-tagged `lastError`.
+ *  `enabled` mirrors the persisted chatMemoryEnabled toggle (S03). */
+export interface ChatIngestStatus {
+  buffered: number;
+  ingestedCount: number;
+  lastError: LlmError | null;
+  enabled: boolean;
+}
+
 /** `memory_status` payload — health-as-value, never rejects backend-side
  *  (R006). `available: false` means the store never opened this run;
  *  `storeError` carries a count failure on an otherwise open store (the
@@ -55,6 +71,7 @@ export interface MemoryStatus {
   dbPath: string | null;
   storeError?: MemoryError;
   ingest: IngestStatus;
+  chatIngest: ChatIngestStatus;
 }
 
 /** Narrow an invoke rejection to the kind-tagged MemoryError contract.
@@ -89,6 +106,23 @@ export function memoryWipe(): Promise<number> {
 /** Memory health snapshot — never rejects inside a Tauri runtime. */
 export function memoryStatus(): Promise<MemoryStatus> {
   return invoke<MemoryStatus>("memory_status");
+}
+
+/** `set_chat_memory_enabled` result — the serde camelCase serialization of
+ *  Rust's ChatMemoryStatus (memory/commands.rs). Health-as-value like
+ *  PrivacyStatus: a persist failure comes back as `error` with `enabled`
+ *  reporting the value actually in effect (rolled back). `error` is always
+ *  present on the wire (`string | null`, no serde skip). */
+export interface ChatMemoryStatus {
+  enabled: boolean;
+  error: string | null;
+}
+
+/** Toggle chat memory capture. Never rejects backend-side: a persist
+ *  failure comes back as data on the resulting status (same contract as
+ *  `setPrivacyMode`). */
+export function setChatMemoryEnabled(enable: boolean): Promise<ChatMemoryStatus> {
+  return invoke<ChatMemoryStatus>("set_chat_memory_enabled", { enable });
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +163,10 @@ export interface MemoryViewState {
   availability: MemoryAvailability;
   /** Latest `memory_status` snapshot; null until the first poll lands. */
   status: MemoryStatus | null;
+  /** Latest `set_chat_memory_enabled` response; null until the user first
+   *  flips the toggle. Backend snapshots are authoritative — the UI never
+   *  locally flips (MEM027); set responses win over the mount snapshot. */
+  chatMemory: ChatMemoryStatus | null;
   /** Current page of records, newest first. */
   records: MemoryRecord[];
   /** Offset of the current page (multiple of MEMORY_PAGE_SIZE). */
@@ -152,6 +190,7 @@ export interface MemoryViewState {
 export const initialMemoryViewState: MemoryViewState = {
   availability: "unknown",
   status: null,
+  chatMemory: null,
   records: [],
   offset: 0,
   loading: true,
@@ -167,6 +206,7 @@ export type MemoryViewAction =
   | { type: "list"; records: MemoryRecord[]; offset: number }
   | { type: "list-failed"; error: MemoryError }
   | { type: "status"; status: MemoryStatus }
+  | { type: "chat-memory"; status: ChatMemoryStatus }
   | { type: "unavailable" }
   | { type: "next-page" }
   | { type: "prev-page" }
@@ -256,6 +296,8 @@ export function memoryReducer(
       };
     case "status":
       return { ...state, availability: "ready", status: action.status };
+    case "chat-memory":
+      return { ...state, chatMemory: action.status };
     case "unavailable":
       return {
         ...initialMemoryViewState,
@@ -390,6 +432,15 @@ export function memoryReducer(
 // ---------------------------------------------------------------------------
 // Copy helpers (pure)
 // ---------------------------------------------------------------------------
+
+/** Human label for a memory's source. Lenient by contract, mirroring
+ *  MemorySource::from_str_lenient (store.rs): "chat" → "Chat", "watcher" →
+ *  "Watcher", and anything else — including undefined from pre-S03 cached
+ *  rows or a future source this build doesn't know — degrades to "Watcher"
+ *  rather than throwing or rendering raw wire strings. */
+export function sourceLabel(source: string | undefined): string {
+  return source === "chat" ? "Chat" : "Watcher";
+}
 
 /** "Safari, Zed" or a placeholder when the span had no known frontmost app. */
 export function appsLabel(apps: string[]): string {

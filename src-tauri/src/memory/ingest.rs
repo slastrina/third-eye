@@ -27,7 +27,7 @@ use crate::llm::router::{ModelRouter, THIN_LANE};
 use crate::llm::{ChatMessage, ChatRequest, LlmError};
 use crate::watcher::TextObservation;
 
-use super::store::{MemoryStore, NewMemory};
+use super::store::{MemorySource, MemoryStore, NewMemory};
 use super::{MemoryState, DB_FILE_NAME};
 
 /// Buffered observations that trigger a distillation. At the watcher's ~5s
@@ -300,6 +300,7 @@ pub fn batch_memories(batch: &[TextObservation], summaries: &[String]) -> Vec<Ne
             span_start_ms,
             span_end_ms,
             embedding: None,
+            source: MemorySource::Watcher,
         })
         .collect()
 }
@@ -335,6 +336,17 @@ pub fn spawn(app: &tauri::AppHandle) {
     {
         let app = app.clone();
         ingest.install_stored_notifier(move |stored| crate::tray::flash_noted(&app, stored));
+    }
+    // Chat ingest (M008 S01) shares the same ambient signal: a stored
+    // chat memory blips the tray exactly like a watcher batch. Mounted
+    // here — the one place that already holds both MemoryState and the
+    // app handle — so tray code stays out of chat_ingest and this stays
+    // the single installation site.
+    {
+        let app = app.clone();
+        state
+            .chat_ingest()
+            .install_stored_notifier(move |stored| crate::tray::flash_noted(&app, stored));
     }
     let rx = app.state::<crate::watcher::WatcherState>().subscribe();
     let router = app.state::<crate::llm::commands::LlmState>().router();

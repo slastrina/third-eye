@@ -14,14 +14,14 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::llm::commands::LlmState;
 use crate::llm::LlmClient;
 
 use super::embed::{search, Embedder, SearchOutcome};
 use super::store::{MemoryRecord, MemoryStore};
-use super::{IngestStatus, MemoryError, MemoryState};
+use super::{ChatIngestStatus, IngestStatus, MemoryError, MemoryState};
 
 /// Search returns a short ranked shortlist by default — recall quality
 /// drops off fast past the top handful and S03 feeds these to a small
@@ -48,6 +48,7 @@ pub struct MemoryStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_error: Option<MemoryError>,
     pub ingest: IngestStatus,
+    pub chat_ingest: ChatIngestStatus,
 }
 
 /// The one rejection every fallible command shares when the store never
@@ -76,7 +77,11 @@ fn clamp_limit(requested: Option<usize>, default: usize, max: usize) -> usize {
 
 /// Assemble the status snapshot. Pure over its inputs so the never-rejects
 /// contract is unit-testable without a Tauri app.
-pub fn build_status(store: Option<Arc<MemoryStore>>, ingest: IngestStatus) -> MemoryStatus {
+pub fn build_status(
+    store: Option<Arc<MemoryStore>>,
+    ingest: IngestStatus,
+    chat_ingest: ChatIngestStatus,
+) -> MemoryStatus {
     match store {
         None => MemoryStatus {
             available: false,
@@ -84,6 +89,7 @@ pub fn build_status(store: Option<Arc<MemoryStore>>, ingest: IngestStatus) -> Me
             db_path: None,
             store_error: None,
             ingest,
+            chat_ingest,
         },
         Some(store) => {
             let db_path = store.db_path().map(|p| p.display().to_string());
@@ -94,6 +100,7 @@ pub fn build_status(store: Option<Arc<MemoryStore>>, ingest: IngestStatus) -> Me
                     db_path,
                     store_error: None,
                     ingest,
+                    chat_ingest,
                 },
                 Err(err) => {
                     log::error!("memory: status count failed ({}): {err}", err.kind());
@@ -103,6 +110,7 @@ pub fn build_status(store: Option<Arc<MemoryStore>>, ingest: IngestStatus) -> Me
                         db_path,
                         store_error: Some(err),
                         ingest,
+                        chat_ingest,
                     }
                 }
             }
@@ -163,11 +171,59 @@ pub fn memory_wipe(memory: State<'_, MemoryState>) -> Result<usize, MemoryError>
     require_store(&memory)?.wipe()
 }
 
+/// Result of a chat-memory toggle — the same health-as-value shape as
+/// `capture::PrivacyStatus`: a persist failure is data the caller renders,
+/// not a rejection. `error` serializes as an explicit `null` when absent so
+/// the TS contract is `error: string | null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMemoryStatus {
+    pub enabled: bool,
+    pub error: Option<String>,
+}
+
+/// The one shared chat-memory applier (S03 T02): every entry point —
+/// `set_chat_memory_enabled` IPC (`via = "ipc"`) now, tray later — funnels
+/// through here so the enabled atomic has exactly one mutation site outside
+/// tests (MEM053/MEM049, privacy-mode precedent). Persists to
+/// settings.json; on persist failure the atomic is rolled back (an
+/// unpersisted flip must never silently revert on restart) and the error
+/// naming the persist path returns as data.
+pub fn apply_chat_memory_enabled(
+    app: &tauri::AppHandle,
+    desired: bool,
+    via: &str,
+) -> ChatMemoryStatus {
+    let state = app.state::<MemoryState>();
+    let chat = state.chat_ingest();
+    let previous = chat.enabled();
+    chat.set_enabled(desired);
+    match crate::config::save_chat_memory_enabled(app, desired) {
+        Ok(()) => {
+            log::info!("memory: chat memory enabled={desired} via={via}");
+            ChatMemoryStatus { enabled: desired, error: None }
+        }
+        Err(e) => {
+            chat.set_enabled(previous);
+            log::error!("memory: {e}");
+            ChatMemoryStatus { enabled: previous, error: Some(e) }
+        }
+    }
+}
+
+/// Set the chat-memory toggle from the UI (S03, R032). Never rejects — the
+/// resulting [`ChatMemoryStatus`] carries any persist failure as data, same
+/// contract as `set_privacy_mode`.
+#[tauri::command]
+pub fn set_chat_memory_enabled(app: tauri::AppHandle, enable: bool) -> ChatMemoryStatus {
+    apply_chat_memory_enabled(&app, enable, "ipc")
+}
+
 /// Memory health snapshot — never rejects (health-as-value, R006). Safe to
 /// poll from any surface.
 #[tauri::command]
 pub fn memory_status(memory: State<'_, MemoryState>) -> MemoryStatus {
-    let status = build_status(memory.store(), memory.ingest().status());
+    let status = build_status(memory.store(), memory.ingest().status(), memory.chat_ingest().status());
     log::debug!(
         "memory: status available={} count={:?} buffered={}",
         status.available,
@@ -193,6 +249,10 @@ mod tests {
         }
     }
 
+    fn empty_chat_ingest() -> ChatIngestStatus {
+        ChatIngestStatus { buffered: 0, ingested_count: 0, last_error: None, enabled: true }
+    }
+
     fn seeded_store() -> Arc<MemoryStore> {
         let store = MemoryStore::open_in_memory().unwrap();
         store
@@ -202,6 +262,7 @@ mod tests {
                 span_start_ms: 1_000,
                 span_end_ms: 2_000,
                 embedding: None,
+                source: crate::memory::store::MemorySource::Watcher,
             })
             .unwrap();
         Arc::new(store)
@@ -223,7 +284,7 @@ mod tests {
 
     #[test]
     fn status_without_store_is_a_value_not_an_error() {
-        let status = build_status(None, empty_ingest());
+        let status = build_status(None, empty_ingest(), empty_chat_ingest());
         assert!(!status.available);
         assert_eq!(status.count, None);
         assert_eq!(status.db_path, None);
@@ -232,7 +293,7 @@ mod tests {
 
     #[test]
     fn status_with_store_reports_count() {
-        let status = build_status(Some(seeded_store()), empty_ingest());
+        let status = build_status(Some(seeded_store()), empty_ingest(), empty_chat_ingest());
         assert!(status.available);
         assert_eq!(status.count, Some(1));
         // In-memory stores have no file path; the on-disk path shape is
@@ -244,7 +305,7 @@ mod tests {
     #[test]
     fn status_json_is_camel_case_with_nested_ingest() {
         // S04 reads these exact keys; a change here is a breaking IPC change.
-        let status = build_status(Some(seeded_store()), empty_ingest());
+        let status = build_status(Some(seeded_store()), empty_ingest(), empty_chat_ingest());
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["available"], true);
         assert_eq!(v["count"], 1);
@@ -253,6 +314,61 @@ mod tests {
         assert_eq!(v["ingest"]["buffered"], 0);
         assert_eq!(v["ingest"]["distilledCount"], 0);
         assert!(v["ingest"]["lastDistillAtMs"].is_null());
+        assert!(v.get("chatIngest").is_some(), "chatIngest must ride alongside ingest");
+    }
+
+    #[test]
+    fn chat_ingest_block_serializes_camel_case_with_expected_fields() {
+        // Additive IPC contract: chatIngest carries the same health-as-value
+        // shape as ingest, and its typed error surfaces when present.
+        let chat = ChatIngestStatus {
+            buffered: 2,
+            ingested_count: 5,
+            last_error: Some(LlmError::Offline {
+                endpoint: "http://localhost:0".into(),
+                detail: "down".into(),
+            }),
+            enabled: false,
+        };
+        let status = build_status(None, empty_ingest(), chat);
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["chatIngest"]["buffered"], 2);
+        assert_eq!(v["chatIngest"]["ingestedCount"], 5);
+        assert_eq!(v["chatIngest"]["lastError"]["kind"], "offline");
+        // S03 additive field: the exact wire key is "enabled".
+        assert_eq!(v["chatIngest"]["enabled"], false);
+        assert!(v["chatIngest"].get("enabled").is_some(), "wire key must be \"enabled\"");
+    }
+
+    #[test]
+    fn chat_memory_status_serializes_camel_case_with_explicit_null_error() {
+        // The TS contract is `error: string | null` (mirrors PrivacyStatus):
+        // None must serialize as an explicit null, never be omitted.
+        let v = serde_json::to_value(ChatMemoryStatus { enabled: true, error: None }).unwrap();
+        assert_eq!(v, serde_json::json!({ "enabled": true, "error": null }));
+        let v = serde_json::to_value(ChatMemoryStatus {
+            enabled: false,
+            error: Some("failed to persist chatMemoryEnabled=false to /tmp/settings.json".into()),
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], false);
+        assert!(v["error"].as_str().unwrap().contains("chatMemoryEnabled"));
+    }
+
+    #[test]
+    fn chat_ingest_flip_then_rollback_restores_prior_value() {
+        // The applier's rollback arm is AppHandle-bound; pin the state
+        // mechanics it composes: set_enabled(desired) then, on persist
+        // failure, set_enabled(previous) restores exactly the prior value
+        // with counters untouched.
+        let state = crate::memory::chat_ingest::ChatIngestState::new();
+        let previous = state.enabled();
+        assert!(previous, "default is ON (opt-out)");
+        state.set_enabled(false);
+        assert!(!state.enabled());
+        state.set_enabled(previous);
+        assert!(state.enabled(), "rollback restores the prior value");
+        assert_eq!(state.status().ingested_count, 0, "counters untouched by the flip");
     }
 
     #[test]

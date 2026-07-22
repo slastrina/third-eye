@@ -108,6 +108,8 @@ import {
   memoryTimeLabel,
   memoryUpdate,
   memoryWipe,
+  setChatMemoryEnabled,
+  sourceLabel,
   spanLabel,
 } from "./memory-state";
 import {
@@ -476,6 +478,15 @@ function Settings() {
       // Never rejects backend-side; a persist failure rides status.error.
       (status) => dispatch({ type: "privacy", status }),
       (err) => console.debug("settings: set_privacy_mode unavailable:", err),
+    );
+  };
+
+  const toggleChatMemory = (enable: boolean) => {
+    setChatMemoryEnabled(enable).then(
+      // Never rejects backend-side; a persist failure rides status.error
+      // and a rolled-back toggle comes back as the authoritative snapshot.
+      (status) => dispatchMemory({ type: "chat-memory", status }),
+      (err) => console.debug("settings: set_chat_memory_enabled unavailable:", err),
     );
   };
 
@@ -1760,6 +1771,40 @@ function Settings() {
           <h2 id="settings-memory-heading" className="settings-section-title">
             Memory
           </h2>
+          <label className="settings-row">
+            <span className="settings-row-label">Chat memory</span>
+            <input
+              type="checkbox"
+              className="settings-toggle"
+              aria-label="Chat memory"
+              disabled={memory.status === null && memory.chatMemory === null}
+              checked={
+                // A set response is fresher than the mount snapshot, so it wins.
+                memory.chatMemory?.enabled ?? memory.status?.chatIngest.enabled ?? false
+              }
+              onChange={(event) => toggleChatMemory(event.target.checked)}
+            />
+          </label>
+          {memory.chatMemory?.error && (
+            <div className="settings-error" role="alert">
+              <strong>Chat memory couldn't be saved</strong>
+              <span>{memory.chatMemory.error}</span>
+            </div>
+          )}
+          {memory.status && (
+            <p className="settings-hint">
+              Chat memories stored: {memory.status.chatIngest.ingestedCount}
+              {memory.status.chatIngest.buffered > 0
+                ? ` · awaiting retry: ${memory.status.chatIngest.buffered}`
+                : ""}
+              {memory.status.chatIngest.lastError && (
+                <span className="memory-edit-error">
+                  {" "}
+                  · last error: {memory.status.chatIngest.lastError.kind}
+                </span>
+              )}
+            </p>
+          )}
           {memory.availability === "unavailable" ? (
             <p className="settings-unavailable">{MEMORY_UNAVAILABLE_MESSAGE}</p>
           ) : (
@@ -1890,7 +1935,8 @@ function Settings() {
                         </button>
                       )}
                       <span className="memory-meta">
-                        {appsLabel(r.apps)} · {spanLabel(r.spanStartMs, r.spanEndMs)}
+                        {sourceLabel(r.source)} · {appsLabel(r.apps)} ·{" "}
+                        {spanLabel(r.spanStartMs, r.spanEndMs)}
                       </span>
                       <span className="memory-meta">
                         Created {memoryTimeLabel(r.createdAtMs)}

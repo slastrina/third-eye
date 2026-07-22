@@ -15,6 +15,7 @@ import {
   MEMORY_PAGE_SIZE,
   memoryErrorMessage,
   memoryReducer,
+  sourceLabel,
   spanLabel,
   validateSummaryDraft,
   type MemoryRecord,
@@ -26,6 +27,7 @@ function record(id: number, summary = `memory ${id}`): MemoryRecord {
   return {
     id,
     summary,
+    source: "watcher",
     apps: ["Zed"],
     spanStartMs: 1_752_800_000_000,
     spanEndMs: 1_752_800_060_000,
@@ -40,6 +42,7 @@ function status(count: number | null, overrides: Partial<MemoryStatus> = {}): Me
     count,
     dbPath: "/tmp/memory.db",
     ingest: { buffered: 0, distilledCount: 0, lastDistillAtMs: null, lastError: null },
+    chatIngest: { buffered: 0, ingestedCount: 0, lastError: null, enabled: true },
     ...overrides,
   };
 }
@@ -92,6 +95,28 @@ describe("initial state and availability", () => {
     const s = memoryReducer(initialMemoryViewState, { type: "status", status: status(0) });
     expect(s.availability).toBe("ready");
     expect(s.status?.count).toBe(0);
+  });
+
+  it("a status snapshot carrying chatIngest lands in the interface shape", () => {
+    // The wire payload is a plain serde object — the cast must compile and
+    // every chatIngest field must read through the typed interface.
+    const wire = {
+      available: true,
+      count: 3,
+      dbPath: "/tmp/memory.db",
+      ingest: { buffered: 0, distilledCount: 0, lastDistillAtMs: null, lastError: null },
+      chatIngest: {
+        buffered: 2,
+        ingestedCount: 5,
+        lastError: { kind: "offline", endpoint: "http://127.0.0.1:1234", detail: "connection refused" },
+        enabled: false,
+      },
+    } as MemoryStatus;
+    const s = memoryReducer(initialMemoryViewState, { type: "status", status: wire });
+    expect(s.status?.chatIngest.buffered).toBe(2);
+    expect(s.status?.chatIngest.ingestedCount).toBe(5);
+    expect(s.status?.chatIngest.enabled).toBe(false);
+    expect(s.status?.chatIngest.lastError?.kind).toBe("offline");
   });
 
   it("a list db failure surfaces a banner but stays ready, not unavailable", () => {
@@ -361,7 +386,48 @@ describe("two-step wipe", () => {
   });
 });
 
+describe("chat memory toggle state", () => {
+  it("chat-memory stores the authoritative snapshot without touching records or status", () => {
+    const before = loaded([record(1), record(2)]);
+    const s = memoryReducer(before, {
+      type: "chat-memory",
+      status: { enabled: false, error: null },
+    });
+    expect(s.chatMemory).toEqual({ enabled: false, error: null });
+    expect(s.records).toBe(before.records);
+    expect(s.status).toBe(before.status);
+  });
+
+  it("a persist failure lands as data — rolled-back enabled plus the error", () => {
+    const s = memoryReducer(loaded([]), {
+      type: "chat-memory",
+      status: { enabled: true, error: "settings.json: permission denied" },
+    });
+    expect(s.chatMemory?.enabled).toBe(true);
+    expect(s.chatMemory?.error).toBe("settings.json: permission denied");
+  });
+
+  it("starts null and resets to null on unavailable", () => {
+    expect(initialMemoryViewState.chatMemory).toBeNull();
+    const armed = memoryReducer(loaded([]), {
+      type: "chat-memory",
+      status: { enabled: false, error: null },
+    });
+    const s = memoryReducer(armed, { type: "unavailable" });
+    expect(s.chatMemory).toBeNull();
+  });
+});
+
 describe("error narrowing and copy helpers", () => {
+  it("sourceLabel maps the closed vocabulary and degrades unknowns to Watcher", () => {
+    expect(sourceLabel("chat")).toBe("Chat");
+    expect(sourceLabel("watcher")).toBe("Watcher");
+    // Pre-S03 cached rows lack source entirely; future sources this build
+    // doesn't know must degrade, never throw (from_str_lenient mirror).
+    expect(sourceLabel(undefined)).toBe("Watcher");
+    expect(sourceLabel("future-source")).toBe("Watcher");
+  });
+
   it("isMemoryError accepts exactly the kind-tagged contract", () => {
     expect(isMemoryError({ kind: "db", detail: "x" })).toBe(true);
     expect(isMemoryError({ kind: "not-found", id: 3 })).toBe(true);

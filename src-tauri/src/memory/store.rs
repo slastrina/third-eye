@@ -20,6 +20,40 @@ use serde::Serialize;
 
 use super::MemoryError;
 
+/// Provenance of a stored memory — a closed lowercase vocabulary ("watcher"
+/// / "chat"). S03's source labels build on these exact stored strings, so
+/// the set only grows deliberately. Unknown stored values degrade to
+/// [`MemorySource::Watcher`] with a warning rather than failing the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemorySource {
+    Watcher,
+    Chat,
+}
+
+impl MemorySource {
+    /// The exact string stored in the `source` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemorySource::Watcher => "watcher",
+            MemorySource::Chat => "chat",
+        }
+    }
+
+    /// Lenient parse of a stored value: unknown strings degrade to
+    /// `Watcher` with a warning so one odd row never breaks a read path.
+    pub fn from_str_lenient(value: &str) -> Self {
+        match value {
+            "watcher" => MemorySource::Watcher,
+            "chat" => MemorySource::Chat,
+            other => {
+                log::warn!("memory: unknown source {other:?}, defaulting to watcher");
+                MemorySource::Watcher
+            }
+        }
+    }
+}
+
 /// One stored memory as consumed over IPC (S04) and by tool-calling (S03).
 /// camelCase on the wire; the embedding is deliberately absent — it is a
 /// search-internal detail, not part of the record contract.
@@ -34,6 +68,8 @@ pub struct MemoryRecord {
     pub span_end_ms: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Where this memory came from ("watcher" / "chat" on the wire).
+    pub source: MemorySource,
 }
 
 /// Input for [`MemoryStore::insert`] — everything the distiller (T03)
@@ -46,6 +82,7 @@ pub struct NewMemory {
     pub span_start_ms: i64,
     pub span_end_ms: i64,
     pub embedding: Option<Vec<f32>>,
+    pub source: MemorySource,
 }
 
 /// The storage seam: exactly one SQLite file (WAL), text/metadata columns
@@ -71,7 +108,8 @@ CREATE TABLE IF NOT EXISTS memories (
     span_end_ms   INTEGER NOT NULL,
     embedding     TEXT,
     created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'watcher'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     summary,
@@ -93,7 +131,37 @@ END;
 ";
 
 const RECORD_COLUMNS: &str =
-    "id, summary, apps, span_start_ms, span_end_ms, created_at_ms, updated_at_ms";
+    "id, summary, apps, span_start_ms, span_end_ms, created_at_ms, updated_at_ms, source";
+
+/// Additive migration for pre-M008 databases created before the `source`
+/// column existed: `CREATE TABLE IF NOT EXISTS` skips their existing table,
+/// so the column is added here. `ALTER TABLE ... ADD COLUMN` with a constant
+/// default is the one cheap SQLite shape (no table rewrite) and is safe
+/// under WAL. Idempotent: fresh databases already have the column from
+/// `SCHEMA`, and the `table_info` probe skips the ALTER entirely.
+fn migrate_source_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let has_source = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "source");
+    if !has_source {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'watcher'",
+        )?;
+        log::info!("memory: migrated db — added source column (default 'watcher')");
+    }
+    Ok(())
+}
+
+/// Shared connection init for both open paths: pragmas, idempotent schema,
+/// then the additive `source` migration for pre-M008 files.
+fn init_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(SCHEMA)?;
+    migrate_source_column(conn)
+}
 
 impl MemoryStore {
     /// Open (creating if needed) the single memory db at `path`. Creates
@@ -111,8 +179,7 @@ impl MemoryStore {
         // than execute so the statement is consumed either way.
         let mode: String =
             conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
+        init_connection(&conn)?;
         log::info!("memory: db open at {} (journal_mode={mode})", path.display());
         Ok(Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) })
     }
@@ -120,8 +187,7 @@ impl MemoryStore {
     /// In-memory store for tests: same schema and pragmas, no file.
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
+        init_connection(&conn)?;
         Ok(Self { conn: Mutex::new(conn), path: None })
     }
 
@@ -152,15 +218,16 @@ impl MemoryStore {
         conn.execute(
             "INSERT INTO memories
                 (summary, apps, span_start_ms, span_end_ms, embedding,
-                 created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 created_at_ms, updated_at_ms, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             params![
                 new.summary,
                 apps_json,
                 new.span_start_ms,
                 new.span_end_ms,
                 embedding_json,
-                now
+                now,
+                new.source.as_str()
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -386,6 +453,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
         span_end_ms: row.get(4)?,
         created_at_ms: row.get(5)?,
         updated_at_ms: row.get(6)?,
+        source: MemorySource::from_str_lenient(&row.get::<_, String>(7)?),
     })
 }
 
@@ -400,6 +468,7 @@ mod tests {
             span_start_ms: 1_000,
             span_end_ms: 2_000,
             embedding: None,
+            source: MemorySource::Watcher,
         }
     }
 
@@ -586,7 +655,8 @@ mod tests {
                 "span_end_ms",
                 "embedding",
                 "created_at_ms",
-                "updated_at_ms"
+                "updated_at_ms",
+                "source"
             ]
         );
         for (name, ty) in &cols {
@@ -640,12 +710,111 @@ mod tests {
                 "apps",
                 "createdAtMs",
                 "id",
+                "source",
                 "spanEndMs",
                 "spanStartMs",
                 "summary",
                 "updatedAtMs"
             ]
         );
+    }
+
+    /// The current schema minus `source` — the exact pre-M008 CREATE TABLE,
+    /// used to fabricate an old-format db the migration must upgrade.
+    const PRE_M008_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS memories (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary       TEXT NOT NULL,
+    apps          TEXT NOT NULL DEFAULT '[]',
+    span_start_ms INTEGER NOT NULL,
+    span_end_ms   INTEGER NOT NULL,
+    embedding     TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+";
+
+    fn pre_m008_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(PRE_M008_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO memories
+                (summary, apps, span_start_ms, span_end_ms, created_at_ms, updated_at_ms)
+             VALUES ('pre-migration row', '[\"OldApp\"]', 1, 2, 3, 3)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let path = std::env::temp_dir()
+            .join(format!("third-eye-migration-idempotent-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = MemoryStore::open(&path).unwrap();
+        let cols_first = s.column_info().unwrap();
+        drop(s);
+        // Second open re-runs SCHEMA + migration probe — must be a no-op.
+        let s2 = MemoryStore::open(&path).unwrap();
+        assert_eq!(s2.column_info().unwrap(), cols_first);
+        drop(s2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_m008_db_migrates_and_rows_default_to_watcher() {
+        let path = std::env::temp_dir()
+            .join(format!("third-eye-migration-fixture-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        pre_m008_db(&path);
+
+        let s = MemoryStore::open(&path).unwrap();
+        let rows = s.list(10, 0).unwrap();
+        assert_eq!(rows.len(), 1, "pre-migration row must survive the ALTER");
+        assert_eq!(rows[0].summary, "pre-migration row");
+        assert_eq!(rows[0].source, MemorySource::Watcher);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_and_migrated_schemas_are_identical() {
+        let path = std::env::temp_dir()
+            .join(format!("third-eye-migration-equiv-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        pre_m008_db(&path);
+
+        let migrated = MemoryStore::open(&path).unwrap();
+        let fresh = MemoryStore::open_in_memory().unwrap();
+        assert_eq!(
+            migrated.column_info().unwrap(),
+            fresh.column_info().unwrap(),
+            "ALTER-migrated column layout must match a fresh CREATE TABLE"
+        );
+        drop(migrated);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_source_round_trips_and_serializes_lowercase() {
+        let s = store();
+        let rec = s
+            .insert(NewMemory { source: MemorySource::Chat, ..mem("asked to search for rust") })
+            .unwrap();
+        assert_eq!(rec.source, MemorySource::Chat);
+        assert_eq!(s.get(rec.id).unwrap().source, MemorySource::Chat);
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["source"], "chat");
+    }
+
+    #[test]
+    fn unknown_stored_source_degrades_to_watcher() {
+        let s = store();
+        let rec = s.insert(mem("row with odd provenance")).unwrap();
+        s.lock()
+            .execute("UPDATE memories SET source = 'mystery' WHERE id = ?1", params![rec.id])
+            .unwrap();
+        assert_eq!(s.get(rec.id).unwrap().source, MemorySource::Watcher);
     }
 
     #[test]

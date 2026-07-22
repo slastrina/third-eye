@@ -41,7 +41,9 @@ use third_eye_lib::llm::toolloop::{
 };
 use third_eye_lib::screenquery::commands::ScreenQueryState;
 use third_eye_lib::llm::ChatMessage;
-use third_eye_lib::memory::{Embedder, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode};
+use third_eye_lib::memory::{
+    Embedder, MemorySource, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode,
+};
 
 // --- Live-probe doubles (M005 targeting): drive the REAL model through the
 // production composite while capturing HID actions instead of firing them and
@@ -220,6 +222,7 @@ fn seeded_store(scratch: &ScratchDb) -> Arc<MemoryStore> {
             span_start_ms: 1_000,
             span_end_ms: 2_000,
             embedding: None,
+            source: MemorySource::Watcher,
         })
         .expect("insert seed memory");
     store
@@ -229,6 +232,7 @@ fn seeded_store(scratch: &ScratchDb) -> Arc<MemoryStore> {
             span_start_ms: 3_000,
             span_end_ms: 4_000,
             embedding: None,
+            source: MemorySource::Watcher,
         })
         .expect("insert second seed memory");
     store
@@ -570,6 +574,7 @@ async fn live_tool_calling_against_lm_studio() {
                 span_start_ms: 1_000 + i as i64,
                 span_end_ms: 2_000 + i as i64,
                 embedding,
+                source: MemorySource::Watcher,
             })
             .expect("insert seeded memory");
     }

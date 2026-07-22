@@ -26,8 +26,13 @@ use std::sync::Arc;
 use third_eye_lib::llm::guard::GuardState;
 use third_eye_lib::llm::openai::DEFAULT_ENDPOINT;
 use third_eye_lib::llm::router::{ModelRouter, THIN_LANE};
+use third_eye_lib::llm::toolloop::{ToolCallEvent, ToolEvent, ToolResultEvent};
+use third_eye_lib::llm::ToolCall;
+use third_eye_lib::memory::chat_ingest::{self, ChatIngestState};
 use third_eye_lib::memory::ingest::{run_loop, IngestState, BATCH_SIZE};
-use third_eye_lib::memory::{search, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode};
+use third_eye_lib::memory::{
+    search, MemorySource, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode,
+};
 use third_eye_lib::watcher::{TextObservation, WatcherState};
 
 /// A scratch db path under the OS temp dir, cleaned up on drop so failed
@@ -68,6 +73,7 @@ fn memory_db_file_is_text_only() {
                 span_start_ms: 1_000 + i,
                 span_end_ms: 2_000 + i,
                 embedding: Some(vec![0.25, -0.5, 1.0]),
+                source: MemorySource::Watcher,
             })
             .expect("insert");
     }
@@ -276,5 +282,329 @@ async fn live_distill_and_recall_against_lm_studio() {
             .any(|kw| top_lower.contains(kw)),
         "top hit should be the baking summary, got: {}",
         top.summary
+    );
+}
+
+/// The production router shape against LM Studio, shared by the chat-ingest
+/// live proofs below (same lane resolution as the app's
+/// `with_default_endpoint` path).
+fn live_router() -> Arc<ModelRouter> {
+    let thin_model = std::env::var("THIRD_EYE_THIN_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let router = Arc::new(ModelRouter::thin_heavy(
+        DEFAULT_ENDPOINT,
+        thin_model,
+        None,
+        Arc::new(GuardState::new()),
+    ));
+    // Sanity: the lane resolves before spending time on a live round-trip.
+    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+}
+
+/// M008 S01 (T05): the executable half of R032's restart-recall demo. A
+/// realistic completed exchange — ask + verified tool outcome carrying the
+/// typed search text in its arguments JSON + reply — distills on the real
+/// thin lane into exactly one stored `source='chat'` memory, and
+/// `memory_search` (real nomic embeddings) retrieves it by the searched
+/// term. The quit/relaunch half of the demo is milestone-level UAT.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LM Studio serving a chat model and text-embedding-nomic-embed-text-v1.5 at DEFAULT_ENDPOINT"]
+async fn live_chat_exchange_distills_to_source_chat_memory_and_recalls() {
+    let router = live_router();
+
+    let events = vec![
+        ToolEvent::Call(ToolCallEvent {
+            request_id: 1,
+            round: 0,
+            call: ToolCall {
+                id: "c1".into(),
+                name: "type_text".into(),
+                arguments: r#"{"text":"rust async traits"}"#.into(),
+            },
+        }),
+        ToolEvent::Result(ToolResultEvent {
+            request_id: 1,
+            round: 0,
+            call_id: "c1".into(),
+            name: "type_text".into(),
+            ok: true,
+            result_count: None,
+            mode: None,
+            failure: None,
+        }),
+    ];
+    let exchange = chat_ingest::capture_exchange(
+        "search for rust async traits in Chrome",
+        &events,
+        "I typed \"rust async traits\" into Chrome's search bar and submitted the search.",
+    )
+    .expect("a real exchange must capture");
+
+    let scratch = ScratchDb::new("live-chat-recall");
+    let store = Arc::new(MemoryStore::open(&scratch.path).expect("open store"));
+    let state = Arc::new(ChatIngestState::new());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        chat_ingest::ingest_exchange(state.clone(), router, store.clone(), exchange),
+    )
+    .await
+    .expect("one live distillation must finish well inside 5 minutes");
+
+    let status = state.status();
+    eprintln!("live chat ingest status: {status:?}");
+    assert!(
+        status.last_error.is_none(),
+        "live chat distillation failed: {:?}",
+        status.last_error
+    );
+    assert_eq!(status.buffered, 0, "the exchange must not be retained after success");
+
+    let stored = store.list(10, 0).expect("list stored memories");
+    for rec in &stored {
+        eprintln!("stored chat memory {} (source={:?}): {}", rec.id, rec.source, rec.summary);
+    }
+    assert_eq!(stored.len(), 1, "one exchange → exactly one stored memory");
+    let memory = &stored[0];
+    assert_eq!(memory.source, MemorySource::Chat);
+    let summary_lower = memory.summary.to_lowercase();
+    assert!(
+        summary_lower.contains("rust") && summary_lower.contains("async"),
+        "summary must mention the searched term, got: {}",
+        memory.summary
+    );
+
+    // Recall by the searched term with real embeddings — the answer to
+    // "what did I recently ask you to search for?" after a restart.
+    let embedder = OpenAiEmbedder::new(DEFAULT_ENDPOINT);
+    let outcome = search(&store, &embedder, "rust async traits", 3)
+        .await
+        .expect("search must not fail at the store layer");
+    eprintln!(
+        "chat recall outcome: mode={:?} degrade={:?}",
+        outcome.mode, outcome.degrade_reason
+    );
+    assert_eq!(outcome.mode, SearchMode::Semantic, "live embeddings must not degrade");
+    let top = outcome.results.first().expect("recall must return the chat memory");
+    assert_eq!(top.id, memory.id, "top hit must be the stored chat memory");
+}
+
+/// M008 S02 (T04): the roadmap demo at test level — a multi-topic
+/// conversation held past SESSION_SUMMARY_THRESHOLD distills on the real
+/// thin lane into one rolling session-summary memory whose span covers the
+/// session's oldest-to-newest exchange, and searching for one of the
+/// conversation's themes surfaces that summary in memory_search results
+/// (real nomic embeddings, semantic mode).
+///
+/// This answers S02's one mock-unanswerable risk: does a real 9B model
+/// condense five distinct-topic exchanges into one faithful line, and does
+/// that line search-retrieve semantically?
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LM Studio serving a chat model and text-embedding-nomic-embed-text-v1.5 at DEFAULT_ENDPOINT"]
+async fn live_multi_topic_session_summary_distills_and_recalls() {
+    let router = live_router();
+
+    /// A typed-search tool round (call + ok result), the realistic shape
+    /// of the product's primary loop.
+    fn typed_search(text: &str) -> Vec<ToolEvent> {
+        vec![
+            ToolEvent::Call(ToolCallEvent {
+                request_id: 1,
+                round: 0,
+                call: ToolCall {
+                    id: "c1".into(),
+                    name: "type_text".into(),
+                    arguments: format!(r#"{{"text":"{text}"}}"#),
+                },
+            }),
+            ToolEvent::Result(ToolResultEvent {
+                request_id: 1,
+                round: 0,
+                call_id: "c1".into(),
+                name: "type_text".into(),
+                ok: true,
+                result_count: None,
+                mode: None,
+                failure: None,
+            }),
+        ]
+    }
+
+    // Five clearly distinct topics — one session, SESSION_SUMMARY_THRESHOLD
+    // completed exchanges. (ask, tool events, reply)
+    let script: Vec<(&str, Vec<ToolEvent>, &str)> = vec![
+        (
+            "search for flights to Tokyo in Chrome",
+            typed_search("flights to Tokyo late October"),
+            "I typed \"flights to Tokyo late October\" into Chrome's search bar and submitted \
+             the search.",
+        ),
+        (
+            "check the payment-service pods on the kubernetes dashboard",
+            Vec::new(),
+            "I opened the Grafana kubernetes dashboard; payment-service shows 3/3 pods ready \
+             after the v1.30 upgrade.",
+        ),
+        (
+            "look up a sourdough hydration calculator",
+            typed_search("sourdough hydration calculator 75 percent"),
+            "I searched for a sourdough hydration calculator and opened the top result showing \
+             a 75 percent hydration formula.",
+        ),
+        (
+            "draft an email to Sam about the quarterly report in Mail",
+            Vec::new(),
+            "I drafted an email to Sam in Mail summarizing the quarterly report and left it \
+             open for your review.",
+        ),
+        (
+            "search for bouldering gyms near Brooklyn",
+            typed_search("bouldering gyms near Brooklyn"),
+            "I typed \"bouldering gyms near Brooklyn\" into Chrome and submitted the search.",
+        ),
+    ];
+    let threshold = chat_ingest::SESSION_SUMMARY_THRESHOLD;
+    assert_eq!(script.len(), threshold, "script must be exactly one session's worth");
+
+    let scratch = ScratchDb::new("live-session-summary");
+    let store = Arc::new(MemoryStore::open(&scratch.path).expect("open store"));
+    let state = Arc::new(ChatIngestState::new());
+
+    // Capture each exchange immediately before ingesting it, so live
+    // distillation latency guarantees strictly increasing captured_at_ms
+    // and the summary's oldest..newest span is distinguishable from the
+    // per-exchange point spans.
+    let mut first_ts = None;
+    let mut last_ts = 0_i64;
+    for (ask, events, reply) in script {
+        let exchange =
+            chat_ingest::capture_exchange(ask, &events, reply).expect("a real exchange captures");
+        first_ts.get_or_insert(exchange.captured_at_ms);
+        last_ts = exchange.captured_at_ms;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            chat_ingest::ingest_exchange(state.clone(), router.clone(), store.clone(), exchange),
+        )
+        .await
+        .expect("one live distillation must finish well inside 5 minutes");
+    }
+    let first_ts = first_ts.expect("at least one exchange ran");
+    assert!(
+        last_ts > first_ts,
+        "live distillation latency must separate capture timestamps ({first_ts}..{last_ts})"
+    );
+
+    let status = state.status();
+    eprintln!("live session ingest status: {status:?}");
+    assert!(
+        status.last_error.is_none(),
+        "live session distillation failed: {:?}",
+        status.last_error
+    );
+    assert_eq!(status.buffered, 0, "no exchange may be retained after a clean session");
+
+    let stored = store.list(20, 0).expect("list stored memories");
+    for rec in &stored {
+        eprintln!(
+            "stored memory {} (source={:?} span={}..{}): {}",
+            rec.id, rec.source, rec.span_start_ms, rec.span_end_ms, rec.summary
+        );
+    }
+    assert_eq!(
+        status.ingested_count,
+        stored.len() as u64,
+        "ingestedCount must count stored session summaries alongside per-exchange memories"
+    );
+
+    // The rolling summary is the one memory whose span covers the session
+    // oldest..newest; per-exchange memories are points in time.
+    let summaries: Vec<_> = stored
+        .iter()
+        .filter(|r| r.span_start_ms == first_ts && r.span_end_ms == last_ts)
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "exactly one rolling session summary must span {first_ts}..{last_ts}"
+    );
+    let summary = summaries[0];
+    assert_eq!(summary.source, MemorySource::Chat);
+    eprintln!("rolling session summary: {}", summary.summary);
+
+    // Faithful multi-topic line: the single sentence must name at least two
+    // of the session's five distinct themes.
+    let theme_groups: [&[&str]; 5] = [
+        &["tokyo", "flight"],
+        &["kubernetes", "payment", "pod", "grafana"],
+        &["sourdough", "hydration", "bread"],
+        &["email", "quarterly", "report", "mail"],
+        &["boulder", "climbing", "gym"],
+    ];
+    let summary_lower = summary.summary.to_lowercase();
+    let named = theme_groups
+        .iter()
+        .filter(|group| group.iter().any(|kw| summary_lower.contains(kw)))
+        .count();
+    assert!(
+        named >= 2,
+        "session summary must name at least two of the conversation's themes, \
+         named {named}: {}",
+        summary.summary
+    );
+
+    // The roadmap demo's search half: one theme's query surfaces the
+    // rolling summary in memory_search results with real embeddings.
+    let embedder = OpenAiEmbedder::new(DEFAULT_ENDPOINT);
+    let outcome = search(&store, &embedder, "kubernetes payment service pods", 3)
+        .await
+        .expect("search must not fail at the store layer");
+    eprintln!(
+        "session recall outcome: mode={:?} degrade={:?}",
+        outcome.mode, outcome.degrade_reason
+    );
+    for rec in &outcome.results {
+        eprintln!("session recall hit {}: {}", rec.id, rec.summary);
+    }
+    assert_eq!(outcome.mode, SearchMode::Semantic, "live embeddings must not degrade");
+    assert!(outcome.degrade_reason.is_none());
+    assert!(
+        outcome.results.iter().any(|r| r.id == summary.id),
+        "the rolling session summary must surface in theme search results, got ids {:?}",
+        outcome.results.iter().map(|r| r.id).collect::<Vec<_>>()
+    );
+}
+
+/// The other half of the one-line-or-NOTHING risk: a trivial greeting
+/// exchange must store nothing. If the small thin-lane model ignores the
+/// NOTHING instruction, this test's failure output records what it said
+/// instead (one prompt-wording iteration is in scope; structure is not).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LM Studio serving a chat model at DEFAULT_ENDPOINT"]
+async fn live_trivial_exchange_stores_nothing() {
+    let router = live_router();
+
+    let exchange = chat_ingest::capture_exchange("hi", &[], "Hello! How can I help you today?")
+        .expect("even a trivial exchange captures; triviality is the distiller's call");
+
+    let scratch = ScratchDb::new("live-chat-trivial");
+    let store = Arc::new(MemoryStore::open(&scratch.path).expect("open store"));
+    let state = Arc::new(ChatIngestState::new());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        chat_ingest::ingest_exchange(state.clone(), router, store.clone(), exchange),
+    )
+    .await
+    .expect("one live distillation must finish well inside 5 minutes");
+
+    let status = state.status();
+    eprintln!("live trivial ingest status: {status:?}");
+    assert!(status.last_error.is_none(), "trivial distillation errored: {:?}", status.last_error);
+    let stored = store.list(10, 0).expect("list stored memories");
+    assert!(
+        stored.is_empty(),
+        "model over-summarized a greeting instead of replying NOTHING; it stored: {:?}",
+        stored.iter().map(|r| r.summary.as_str()).collect::<Vec<_>>()
     );
 }

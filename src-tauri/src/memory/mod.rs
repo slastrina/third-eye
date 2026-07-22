@@ -11,14 +11,16 @@
 //! kind-tagged [`MemoryError`] (`db` / `not-found` / `invalid-input`) with
 //! camelCase fields — the error half of the memory IPC contract.
 
+pub mod chat_ingest;
 pub mod commands;
 pub mod embed;
 pub mod ingest;
 pub mod store;
 
+pub use chat_ingest::{ChatIngestState, ChatIngestStatus};
 pub use embed::{search, Embedder, OpenAiEmbedder, SearchMode, SearchOutcome};
 pub use ingest::{IngestState, IngestStatus};
-pub use store::{MemoryRecord, MemoryStore, NewMemory};
+pub use store::{MemoryRecord, MemorySource, MemoryStore, NewMemory};
 
 use std::sync::{Arc, OnceLock};
 
@@ -37,6 +39,10 @@ pub const DB_FILE_NAME: &str = "memory.db";
 pub struct MemoryState {
     store: OnceLock<Arc<MemoryStore>>,
     ingest: Arc<IngestState>,
+    /// Chat-exchange ingestion health + retained-retry queue (M008 S01) —
+    /// sibling of `ingest`, fed by the chat command's post-reply spawn.
+    /// `store()` returning `None` means chat ingest silently no-ops.
+    chat_ingest: Arc<ChatIngestState>,
     /// Search embedder, built lazily on the first `memory_search` against
     /// the router's (fixed-per-run) endpoint and reused after — one reqwest
     /// pool per run, not per search. Always the guarded wrapper (M003 S02):
@@ -60,6 +66,7 @@ impl MemoryState {
         Self {
             store: OnceLock::new(),
             ingest: Arc::new(IngestState::new()),
+            chat_ingest: Arc::new(ChatIngestState::new()),
             embedder: OnceLock::new(),
             guard,
         }
@@ -81,6 +88,12 @@ impl MemoryState {
     /// The ingestion health surface — shared with the ingest loop.
     pub fn ingest(&self) -> Arc<IngestState> {
         self.ingest.clone()
+    }
+
+    /// The chat-ingestion health surface — shared with the chat command's
+    /// fire-and-forget ingest spawns (T03) and `memory_status` (T04).
+    pub fn chat_ingest(&self) -> Arc<ChatIngestState> {
+        self.chat_ingest.clone()
     }
 
     /// The shared search embedder, constructed against `endpoint` on first

@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 
 use crate::input::commands::SessionWhitelist;
 use crate::input::ActionKind;
+use crate::memory::chat_ingest;
 
 use super::guard::{GuardState, GuardTelemetry};
 use super::mcp::{
@@ -37,8 +38,8 @@ use super::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
 use super::toolloop::{
     run_tool_loop_with_stop, ApprovalGate, ApprovalPrompt, ApprovalVerdict, CompositeExecutor,
-    FocusAppTool, FocusedApp, InputTool, MemorySearchTool, ScreenQueryTool, ScreenSeen, ToolEvent,
-    ToolExecutor, HID_SYSTEM_PROMPT, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
+    FocusAppTool, FocusedApp, InputTool, LoopOutcome, MemorySearchTool, ScreenQueryTool,
+    ScreenSeen, ToolEvent, ToolExecutor, HID_SYSTEM_PROMPT, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
 };
 use super::{skills, ChatMessage, LlmClient, LlmError, LlmHealth, Role};
 
@@ -639,6 +640,19 @@ fn compose_skills_prompt(discovered: &[skills::Skill]) -> Option<String> {
     Some(prompt)
 }
 
+/// Chat-ingest capture policy (M008 S01), pinned by tests: a completed
+/// request feeds the memory capture exactly when the loop returned `Ok` —
+/// INCLUDING user-stopped runs, because executed tool outcomes are verified
+/// facts even when the user cut the run short — and never on `Err` (a failed
+/// exchange has no settled reply to remember). Returns the reply text to
+/// capture, or `None` to skip ingestion entirely.
+fn ingest_reply_text(result: &Result<LoopOutcome, LlmError>) -> Option<String> {
+    match result {
+        Ok(loop_outcome) => Some(loop_outcome.outcome.text.clone()),
+        Err(_) => None,
+    }
+}
+
 /// Start a streaming chat completion. Returns the request id immediately;
 /// tokens and the terminal outcome arrive as `llm://*` events tagged with it.
 /// Any in-flight request is aborted first (single-flight).
@@ -673,6 +687,11 @@ pub async fn chat(
             crate::tray::begin_activity(&task_app, crate::tray::ActivityKind::Stream);
         let started = Instant::now();
         let first_token_at: Mutex<Option<Instant>> = Mutex::new(None);
+        // Chat-ingest capture (M008 S01): every tool event is accumulated so
+        // the post-DONE exchange capture can pair each call with its verified
+        // outcome. Accumulation must never panic or slow the reply path — a
+        // poisoned lock skips the push (the reply always wins over capture).
+        let tool_events: Mutex<Vec<ToolEvent>> = Mutex::new(Vec::new());
 
         let on_token = |token: &str| {
             {
@@ -706,6 +725,9 @@ pub async fn chat(
         // UI's memory-consulted indicator (T04). Emission failure is logged,
         // never fatal, same policy as tokens.
         let on_event = |event: &ToolEvent| {
+            if let Ok(mut events) = tool_events.lock() {
+                events.push(event.clone());
+            }
             let emitted = match event {
                 ToolEvent::Call(e) => task_app.emit(TOOL_CALL_EVENT, e.clone()),
                 ToolEvent::Result(e) => task_app.emit(TOOL_RESULT_EVENT, e.clone()),
@@ -834,6 +856,15 @@ pub async fn chat(
             }
         }
         let executor = CompositeExecutor::new(executors);
+        // Chat-ingest capture (M008 S01): the ask is the last user turn,
+        // cloned NOW — `messages` gains system-turn inserts below and then
+        // moves into the loop, and `LoopOutcome` does not return it.
+        let user_ask = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
         // Ground the model in the focus→query→click discipline (M005 targeting
         // fix). Only when the caller didn't already send a system turn — the
         // summon-from-nudge path prepends its own screen-context system message
@@ -884,6 +915,10 @@ pub async fn chat(
         let terminal_phase =
             if matches!(&result, Ok(outcome) if outcome.stopped) { RunPhase::Stopped } else { RunPhase::Idle };
 
+        // Chat-ingest policy read before `result` moves into the match arms:
+        // `Some` exactly for Ok outcomes (stopped included), `None` on Err.
+        let reply_for_ingest = ingest_reply_text(&result);
+
         match result {
             Ok(loop_outcome) => {
                 let outcome = loop_outcome.outcome;
@@ -926,6 +961,44 @@ pub async fn chat(
                 let payload = ErrorEvent { request_id: id, error: err };
                 if let Err(e) = task_app.emit(ERROR_EVENT, payload) {
                     log::warn!("llm: request {id} error emit failed: {e}");
+                }
+            }
+        }
+
+        // M008 S01: AFTER the terminal emit, capture the completed exchange
+        // and hand it to a SEPARATE spawn. Separate is load-bearing, not
+        // stylistic: supersede aborts THIS task via `state.arm(id,
+        // handle.abort())`, so an inline await here would be killed mid-write
+        // by a fast follow-up chat. The spawned ingest returns `()` and logs
+        // only — no failure in it can reach the reply path, which already
+        // settled above.
+        if let Some(reply_text) = reply_for_ingest {
+            // S03 gate, BEFORE capture_exchange — placement is load-bearing:
+            // while the toggle is off nothing composes, queues, redacts, or
+            // distills (structurally inert, MEM140 pattern), so redaction
+            // never runs on content that will never be stored.
+            let chat_state = memory.chat_ingest();
+            if !chat_state.enabled() {
+                log::debug!("llm: request {id} chat ingest skipped (disabled in settings)");
+            } else {
+                match memory.store() {
+                    Some(store) => {
+                        let events = tool_events.lock().map(|e| e.clone()).unwrap_or_default();
+                        if let Some(exchange) =
+                            chat_ingest::capture_exchange(&user_ask, &events, &reply_text)
+                        {
+                            let router = task_app.state::<LlmState>().router.clone();
+                            tauri::async_runtime::spawn(async move {
+                                chat_ingest::ingest_exchange(chat_state, router, store, exchange)
+                                    .await;
+                            });
+                        }
+                    }
+                    None => {
+                        log::debug!(
+                            "llm: request {id} chat ingest skipped (memory store unavailable)"
+                        );
+                    }
                 }
             }
         }
@@ -1488,6 +1561,40 @@ mod tests {
             assert_eq!(obj["present"], present);
             assert!(obj.values().all(|value| value.is_boolean()));
         }
+    }
+
+    // --- M008 S01: chat-ingest capture policy (T03) ---
+
+    /// Ok outcomes feed capture, INCLUDING user-stopped runs: executed tool
+    /// outcomes are verified facts even when the run was cut short.
+    #[test]
+    fn ingest_reply_text_captures_ok_outcomes_including_stopped() {
+        for stopped in [false, true] {
+            let result: Result<LoopOutcome, LlmError> = Ok(LoopOutcome {
+                outcome: super::super::StreamOutcome {
+                    text: "I searched for whales.".into(),
+                    token_count: 4,
+                    tool_calls: Vec::new(),
+                },
+                stopped,
+            });
+            assert_eq!(
+                ingest_reply_text(&result).as_deref(),
+                Some("I searched for whales."),
+                "Ok outcome (stopped={stopped}) must feed the exchange capture"
+            );
+        }
+    }
+
+    /// Err outcomes are skipped entirely — a failed exchange has no settled
+    /// reply to remember, and nothing about it may reach the ingest path.
+    #[test]
+    fn ingest_reply_text_skips_err_outcomes_entirely() {
+        let result: Result<LoopOutcome, LlmError> = Err(LlmError::Offline {
+            endpoint: "http://x:1".into(),
+            detail: "connection refused".into(),
+        });
+        assert!(ingest_reply_text(&result).is_none());
     }
 
     struct NoopClient;

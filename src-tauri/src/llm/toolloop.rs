@@ -1514,6 +1514,7 @@ mod tests {
                 span_start_ms: 1_000,
                 span_end_ms: 2_000,
                 embedding: None,
+                source: crate::memory::store::MemorySource::Watcher,
             })
             .unwrap();
         MemorySearchTool::new(Arc::new(store), Arc::new(DownEmbedder))
