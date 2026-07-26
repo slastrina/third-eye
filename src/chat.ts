@@ -27,6 +27,8 @@ export const TOOL_CALL_EVENT = "llm://tool-call";
 export const TOOL_RESULT_EVENT = "llm://tool-result";
 /** The one tool S03 ships; results under this name flip the indicator. */
 export const MEMORY_SEARCH_TOOL = "memory_search";
+/** The terminal tool (computer-control I2) — Rust's RUN_COMMAND_TOOL twin. */
+export const RUN_COMMAND_TOOL = "run_command";
 /** Routing-state broadcast (S07): mutation responses only reach the calling
  *  window, so the backend emits the updated ModelInfo app-wide after every
  *  successful set_model / set_lane_model. The overlay consumes this to stay
@@ -122,6 +124,9 @@ export interface ToolResultPayload {
   resultCount: number | null;
   mode: SearchMode | null;
   failure: string | null;
+  /** Bounded output preview — present only on run_command results (the
+   *  chat terminal block's content; serde skips it elsewhere). */
+  preview?: string | null;
 }
 
 export interface LlmHealth {
@@ -451,6 +456,10 @@ export function onHidStateChanged(cb: (status: HidArmedStatus) => void): Promise
  *  and awaits a `respond_hid_approval` reply. Keep in sync with HID_APPROVAL_EVENT
  *  in src-tauri/src/llm/commands.rs (pinned by a Rust test and its TS twin). */
 export const HID_APPROVAL_EVENT = "hid://approval-request";
+/** Broadcast when a pending approval stops being pending (a verdict landed
+ *  from ANY window, or the gate timed out): every surface showing the card
+ *  removes it. Keep in sync with HID_APPROVAL_RESOLVED_EVENT in Rust. */
+export const HID_APPROVAL_RESOLVED_EVENT = "hid://approval-resolved";
 
 /** The kind of a HID action, stripped of payload — the granularity the session
  *  whitelist grants by. The kebab-case serde tags of Rust's ActionKind.
@@ -461,7 +470,8 @@ export type ActionKind =
   | "mouse-click"
   | "type-text"
   | "key-press"
-  | "focus-app";
+  | "focus-app"
+  | "run-command";
 
 /** The `hid://approval-request` payload — the serde camelCase serialization of
  *  Rust's ApprovalRequestPayload. Pixel-free: a correlation id, the action kind,
@@ -494,6 +504,18 @@ export function respondHidApproval(
   return invoke<boolean>("respond_hid_approval", { approvalId, verdict });
 }
 
+/** The approval-resolved payload: just the correlation id. */
+export interface ApprovalResolvedPayload {
+  approvalId: number;
+}
+
+/** Subscribe to HID approval resolutions (answered anywhere, or timed out). */
+export function onHidApprovalResolved(
+  cb: (payload: ApprovalResolvedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ApprovalResolvedPayload>(HID_APPROVAL_RESOLVED_EVENT, (e) => cb(e.payload));
+}
+
 // ---------------------------------------------------------------------------
 // MCP per-tool approval IPC (S04/M007) — contract defined in
 // src-tauri/src/llm/commands.rs (event + payload) and the pure resolver in
@@ -506,6 +528,7 @@ export function respondHidApproval(
  *  sync with MCP_APPROVAL_EVENT in src-tauri/src/llm/commands.rs (pinned by a Rust
  *  test and its TS twin). */
 export const MCP_APPROVAL_EVENT = "mcp://approval-request";
+export const MCP_APPROVAL_RESOLVED_EVENT = "mcp://approval-resolved";
 
 /** The `mcp://approval-request` payload — the serde camelCase serialization of
  *  Rust's McpApprovalRequestPayload. Pixel-free: a correlation id, the namespaced
@@ -539,6 +562,13 @@ export function respondMcpApproval(
   verdict: McpApprovalVerdict,
 ): Promise<boolean> {
   return invoke<boolean>("respond_mcp_approval", { approvalId, verdict });
+}
+
+/** Subscribe to MCP approval resolutions — the MCP twin. */
+export function onMcpApprovalResolved(
+  cb: (payload: ApprovalResolvedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ApprovalResolvedPayload>(MCP_APPROVAL_RESOLVED_EVENT, (e) => cb(e.payload));
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +693,97 @@ export function hotkeyStatus(): Promise<HotkeyStatus> {
   return invoke<HotkeyStatus>("hotkey_status");
 }
 
+/** Terminal-commands gate snapshot (computer-control I2) — serde camelCase
+ *  of Rust's CommandsStatus. Default OFF; `error` carries a persist failure
+ *  as data (never an IPC rejection). */
+export interface CommandsStatus {
+  enabled: boolean;
+  /** Persistent user-defined allowlist: entries matching a command (exact,
+   *  or entry + space-separated tail) run without an approval prompt. */
+  allowlist: string[];
+  error: string | null;
+}
+
+/** Read the terminal-commands gate. */
+export function commandsStatus(): Promise<CommandsStatus> {
+  return invoke<CommandsStatus>("commands_status");
+}
+
+/** Flip the terminal-commands gate (Settings → Automation). A persist
+ *  failure rolls back and returns as data. */
+export function setCommandsEnabled(enable: boolean): Promise<CommandsStatus> {
+  return invoke<CommandsStatus>("set_commands_enabled", { enable });
+}
+
+/** Replace the persistent command allowlist (Settings editor). Sanitized
+ *  server-side; a persist failure rolls back and returns as data. */
+export function setCommandsAllowlist(entries: string[]): Promise<CommandsStatus> {
+  return invoke<CommandsStatus>("set_commands_allowlist", { entries });
+}
+
+/** Machine-inventory health (computer-control I1) — serde camelCase of
+ *  Rust's InventoryStatus. */
+export interface InventoryStatus {
+  apps: number;
+  tools: number;
+  lastRefreshMs: number | null;
+  error: string | null;
+}
+
+/** One cached program — serde camelCase of Rust's InventoryEntry. */
+export interface InventoryEntry {
+  name: string;
+  path: string;
+  kind: string;
+  refreshedAtMs: number;
+}
+
+export function inventoryStatus(): Promise<InventoryStatus> {
+  return invoke<InventoryStatus>("inventory_status");
+}
+
+export function inventorySearch(query: string, limit?: number): Promise<InventoryEntry[]> {
+  return invoke<InventoryEntry[]>("inventory_search", { query, limit });
+}
+
+/** Re-scan the machine now; resolves with the resulting status. */
+export function refreshInventory(): Promise<InventoryStatus> {
+  return invoke<InventoryStatus>("refresh_inventory");
+}
+
+/** One stored chat session's list row (computer-control I3) — serde
+ *  camelCase of Rust's ChatSessionSummary. `title` is the first user line. */
+export interface ChatSessionSummary {
+  id: number;
+  startedAtMs: number;
+  lastAtMs: number;
+  title: string;
+  messageCount: number;
+}
+
+/** One transcript line of a stored session. */
+export interface ChatSessionMessage {
+  role: string;
+  text: string;
+  atMs: number;
+}
+
+/** Start a fresh chat session; subsequent exchanges append to it. */
+export function chatNewSession(): Promise<number> {
+  return invoke<number>("chat_new_session");
+}
+
+/** Newest-first stored session summaries (memory window Chats tab). A
+ *  non-empty `query` searches across stored transcript text. */
+export function chatSessions(limit?: number, query?: string): Promise<ChatSessionSummary[]> {
+  return invoke<ChatSessionSummary[]>("chat_sessions", { limit, query });
+}
+
+/** One stored session's ordered transcript. */
+export function chatSessionMessages(id: number): Promise<ChatSessionMessage[]> {
+  return invoke<ChatSessionMessage[]>("chat_session_messages", { id });
+}
+
 /** Whether an LLM endpoint URL points at this machine — the truth condition
  *  for the palette's "● on-device" badge (no-fake-data rule: the badge only
  *  renders when the model actually runs locally). Unparseable URLs are not
@@ -688,6 +809,16 @@ export type AssistantStatus = "streaming" | "done" | "interrupted";
  *  answers, but the answer is not memory-grounded and must not claim so. */
 export type MemoryPhase = "searching" | "consulted";
 
+/** One terminal command executed during an assistant turn (computer-control
+ *  I2): rendered as the transcript's monospace terminal block. `ok: null`
+ *  while running; `preview` is the bounded output from the result event. */
+export interface TerminalRun {
+  callId: string;
+  command: string;
+  ok: boolean | null;
+  preview: string | null;
+}
+
 export interface UiMessage {
   role: "user" | "assistant";
   text: string;
@@ -695,6 +826,8 @@ export interface UiMessage {
   status: AssistantStatus;
   /** True when a screen attachment rode this user turn (renders the chip). */
   attached?: boolean;
+  /** Assistant only: terminal commands run during this turn (I2). */
+  terminal?: TerminalRun[];
   /** Assistant only: memory_search tool phase (renders the indicator). */
   memory?: MemoryPhase;
   /** Assistant only: accumulated chain-of-thought from a thinking model,
@@ -753,6 +886,13 @@ export interface ChatState {
    *  from submit until the backend's terminal run-state broadcast, then
    *  "idle"/"stopped". Fed by submit and the `llm://run-state` broadcast. */
   runPhase: RunPhase;
+  /** Pending HID/run_command approval prompts (hid://approval-request): the
+   *  gate parks the action until the user answers or the 120s backend
+   *  timeout denies. Rendered as the overlay's approval block; answering
+   *  fires respond_hid_approval and removes the entry. */
+  hidApprovals: HidApprovalRequest[];
+  /** Pending MCP tool-call approvals (mcp://approval-request) — the MCP twin. */
+  mcpApprovals: McpApprovalRequest[];
 }
 
 export const initialChatState: ChatState = {
@@ -771,6 +911,8 @@ export const initialChatState: ChatState = {
   nudge: null,
   nudgePreload: null,
   runPhase: "idle",
+  hidApprovals: [],
+  mcpApprovals: [],
 };
 
 export type LlmEvent =
@@ -796,6 +938,16 @@ export type ChatAction =
   | { type: "nudge-shown"; payload: NudgePayload }
   | { type: "nudge-dismissed"; reason: NudgeDismissReason }
   | { type: "run-state"; phase: RunPhase }
+  // The New-chat control (I3): clear the conversation, keep the environment
+  // snapshots (routing, permissions, privacy, nudge) — they describe the
+  // machine, not the conversation.
+  | { type: "new-chat" }
+  // Approval prompts (gate ↔ overlay): a request parks an action until its
+  // verdict; answered removes it (the IPC reply itself is fired by the view).
+  | { type: "hid-approval"; request: HidApprovalRequest }
+  | { type: "hid-approval-answered"; approvalId: number }
+  | { type: "mcp-approval"; request: McpApprovalRequest }
+  | { type: "mcp-approval-answered"; approvalId: number }
   | LlmEvent;
 
 function withLastAssistant(
@@ -918,6 +1070,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         // composed history before dispatching) — consumed here so it can
         // never ride a later, unrelated question.
         nudgePreload: null,
+        // Pending approvals belong to the (single-flight) run being replaced;
+        // the backend aborts it, and any parked gate resolves by timeout.
+        hidApprovals: state.hidApprovals,
+        mcpApprovals: state.mcpApprovals,
         // A submit starts a run: show the Stop control immediately, before the
         // backend's `running` broadcast lands (which confirms the same state).
         runPhase: "running",
@@ -976,11 +1132,67 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         })),
       };
     }
+    case "new-chat":
+      return {
+        ...initialChatState,
+        modelInfo: state.modelInfo,
+        capturePermission: state.capturePermission,
+        privacy: state.privacy,
+        nudge: state.nudge,
+        runPhase: state.runPhase,
+        // A run (and its parked approvals) outlives the transcript reset —
+        // dropping these would hang the gate until its timeout denies.
+        hidApprovals: state.hidApprovals,
+        mcpApprovals: state.mcpApprovals,
+      };
+    case "hid-approval":
+      // Replay-safe: the same approvalId folds once.
+      if (state.hidApprovals.some((r) => r.approvalId === action.request.approvalId)) return state;
+      return { ...state, hidApprovals: [...state.hidApprovals, action.request] };
+    case "hid-approval-answered":
+      return {
+        ...state,
+        hidApprovals: state.hidApprovals.filter((r) => r.approvalId !== action.approvalId),
+      };
+    case "mcp-approval":
+      if (state.mcpApprovals.some((r) => r.approvalId === action.request.approvalId)) return state;
+      return { ...state, mcpApprovals: [...state.mcpApprovals, action.request] };
+    case "mcp-approval-answered":
+      return {
+        ...state,
+        mcpApprovals: state.mcpApprovals.filter((r) => r.approvalId !== action.approvalId),
+      };
     case "tool-call": {
       // Same stale-filtering and pre-resolve buffering as tokens: a tool
       // phase from an aborted predecessor must not touch the active answer.
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state; // stale
+      if (action.payload.call.name === RUN_COMMAND_TOOL) {
+        // The exact command line, straight from the call's own arguments —
+        // the transcript block shows what actually runs (I2 visibility).
+        let command = action.payload.call.arguments;
+        try {
+          const parsed: unknown = JSON.parse(action.payload.call.arguments);
+          if (parsed && typeof parsed === "object" && typeof (parsed as { command?: unknown }).command === "string") {
+            command = (parsed as { command: string }).command;
+          }
+        } catch {
+          // Malformed args still execute-and-fail loop-side; show them raw.
+        }
+        const run: TerminalRun = {
+          callId: action.payload.call.id,
+          command,
+          ok: null,
+          preview: null,
+        };
+        return {
+          ...state,
+          messages: withLastAssistant(state.messages, (m) => ({
+            ...m,
+            terminal: [...(m.terminal ?? []), run],
+          })),
+        };
+      }
       if (action.payload.call.name !== MEMORY_SEARCH_TOOL) return state;
       return {
         ...state,
@@ -990,6 +1202,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "tool-result": {
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state; // stale
+      if (action.payload.name === RUN_COMMAND_TOOL) {
+        const { callId, ok, preview, failure } = action.payload;
+        return {
+          ...state,
+          messages: withLastAssistant(state.messages, (m) => ({
+            ...m,
+            terminal: (m.terminal ?? []).map((run) =>
+              run.callId === callId
+                ? { ...run, ok, preview: preview ?? (failure ? `[${failure}]` : null) }
+                : run,
+            ),
+          })),
+        };
+      }
       if (action.payload.name !== MEMORY_SEARCH_TOOL) return state;
       return {
         ...state,

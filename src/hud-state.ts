@@ -8,7 +8,13 @@
 //
 // The reducer is Tauri-free; Hud.tsx is glue that subscribes and dispatches.
 
-import type { RunPhase, ToolCallPayload, ToolResultPayload } from "./chat";
+import type {
+  HidApprovalRequest,
+  McpApprovalRequest,
+  RunPhase,
+  ToolCallPayload,
+  ToolResultPayload,
+} from "./chat";
 
 /** One announced tool call in the trail. */
 export interface HudEntry {
@@ -35,16 +41,30 @@ export type HudPhase = "idle" | "live" | "done" | "stopped";
 export interface HudViewState {
   phase: HudPhase;
   entries: HudEntry[];
+  /** Pending approval prompts, mirrored into the hud-pill window so the
+   *  user sees them even when the overlay is hidden mid-run. Cleared by the
+   *  backend's approval-resolved broadcast (answered anywhere / timed out). */
+  hidApprovals: HidApprovalRequest[];
+  mcpApprovals: McpApprovalRequest[];
 }
 
-export const initialHudState: HudViewState = { phase: "idle", entries: [] };
+export const initialHudState: HudViewState = {
+  phase: "idle",
+  entries: [],
+  hidApprovals: [],
+  mcpApprovals: [],
+};
 
 export type HudAction =
   | { type: "run-state"; phase: RunPhase }
   | { type: "tool-call"; payload: ToolCallPayload }
   | { type: "tool-result"; payload: ToolResultPayload }
   // The linger timer fired (or the surface unmounted) — back to idle.
-  | { type: "dismiss" };
+  | { type: "dismiss" }
+  | { type: "hid-approval"; request: HidApprovalRequest }
+  | { type: "mcp-approval"; request: McpApprovalRequest }
+  // The backend's resolved broadcast: answered in any window, or timed out.
+  | { type: "approval-resolved"; approvalId: number };
 
 /** Derive the trail label + ghost target from one tool call. The arguments
  *  string is the model's raw JSON; malformed JSON falls back to the bare tool
@@ -84,6 +104,13 @@ export function describeCall(name: string, rawArguments: string): {
         return { label: "input action", input: true, target: null };
     }
   }
+  if (name === "run_command") {
+    const command = typeof args.command === "string" ? args.command : "";
+    const shown = command.length > 40 ? `${command.slice(0, 40)}…` : command;
+    // Commands hold the terminal, not the pointer — input:true so the HUD
+    // shows while they run (they act on the machine like input does).
+    return { label: shown ? `run · ${shown}` : "run a command", input: true, target: null };
+  }
   if (name === "screen_query") return { label: "read the screen", input: false, target: null };
   if (name === "memory_search") {
     const query = typeof args.query === "string" ? args.query : "";
@@ -103,7 +130,15 @@ export function hudReducer(state: HudViewState, action: HudAction): HudViewState
         case "running":
           // A new run starts a fresh trail; a redundant "running" mid-run
           // (mount query racing the broadcast) must not clear live entries.
-          return state.phase === "live" ? state : { phase: "live", entries: [] };
+          // Parked approvals carry over — they clear via approval-resolved.
+          return state.phase === "live"
+            ? state
+            : {
+                ...initialHudState,
+                phase: "live",
+                hidApprovals: state.hidApprovals,
+                mcpApprovals: state.mcpApprovals,
+              };
         case "stopped":
           return state.phase === "idle" ? state : { ...state, phase: "stopped" };
         case "idle":
@@ -144,11 +179,29 @@ export function hudReducer(state: HudViewState, action: HudAction): HudViewState
         ),
       };
     }
+    case "hid-approval":
+      if (state.hidApprovals.some((r) => r.approvalId === action.request.approvalId)) return state;
+      return { ...state, hidApprovals: [...state.hidApprovals, action.request] };
+    case "mcp-approval":
+      if (state.mcpApprovals.some((r) => r.approvalId === action.request.approvalId)) return state;
+      return { ...state, mcpApprovals: [...state.mcpApprovals, action.request] };
+    case "approval-resolved":
+      return {
+        ...state,
+        hidApprovals: state.hidApprovals.filter((r) => r.approvalId !== action.approvalId),
+        mcpApprovals: state.mcpApprovals.filter((r) => r.approvalId !== action.approvalId),
+      };
     case "dismiss":
       return initialHudState;
     default:
       return state;
   }
+}
+
+/** Whether any approval is parked — the pill must surface these even when
+ *  no input action has been announced yet (e.g. a gated focus_app). */
+export function hudApprovalsPending(state: HudViewState): boolean {
+  return state.hidApprovals.length > 0 || state.mcpApprovals.length > 0;
 }
 
 /** Whether the pill window has anything truthful to show. */

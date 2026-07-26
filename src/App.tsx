@@ -6,6 +6,7 @@ import {
   captureErrorDetail,
   captureErrorTitle,
   captureScreen,
+  chatNewSession,
   chatReducer,
   completeFirstRun,
   composeMessages,
@@ -21,6 +22,10 @@ import {
   onLlmToken,
   onLlmToolCall,
   onLlmToolResult,
+  onHidApprovalRequest,
+  onHidApprovalResolved,
+  onMcpApprovalRequest,
+  onMcpApprovalResolved,
   onModelInfoBroadcast,
   onNudgeDismiss,
   onNudgeShow,
@@ -31,6 +36,8 @@ import {
   privacyStatus,
   requestCapturePermission,
   requestInputPermission,
+  respondHidApproval,
+  respondMcpApproval,
   runState,
   sendChat,
   setMemoryRetention,
@@ -40,6 +47,8 @@ import {
   stopChat,
   stripFailedTail,
   toCaptureFlowError,
+  type ApprovalVerdict,
+  type McpApprovalVerdict,
 } from "./chat";
 import {
   hotkeyFinishesTour,
@@ -53,6 +62,7 @@ import {
 import { Tour } from "./Tour";
 import { EyeIcon } from "./ui/EyeIcon";
 import { Toast } from "./ui/Toast";
+import { ApprovalCard } from "./ui/ApprovalCard";
 import {
   hideOverlay,
   onOverlayStateChanged,
@@ -146,6 +156,7 @@ function App() {
   // Event handlers registered once need the live state without re-binding.
   const stateRef = useRef(state);
   stateRef.current = state;
+
   const inputRef = useRef<HTMLInputElement>(null);
 
   const [chat, dispatchChat] = useReducer(chatReducer, initialChatState);
@@ -332,7 +343,25 @@ function App() {
     );
   }, [probing]);
 
+  // Stick-to-bottom autoscroll: while an answer streams, follow it ONLY when
+  // the user is already at (or near) the bottom. Scrolling up to reread
+  // detaches the stick — onScroll records the position — and scrolling back
+  // down within the threshold re-attaches it. A new message always re-sticks
+  // (the user just asked; they want to see the answer start).
+  const stickToBottomRef = useRef(true);
+  const onMessagesScroll = () => {
+    const el = messagesRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  };
+  const messageCount = chat.messages.length;
   useEffect(() => {
+    // A new turn (submit / answer placeholder) always re-sticks.
+    stickToBottomRef.current = true;
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+  }, [messageCount]);
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
   }, [chat.messages]);
 
@@ -465,6 +494,19 @@ function App() {
       // Run-state (S04 T04): the backend broadcasts running/stopped/idle so the
       // Stop control tracks the in-flight run without polling.
       onRunState((payload) => dispatchChat({ type: "run-state", phase: payload.phase })),
+      // Approval prompts (the gate parks the action until answered; without
+      // this subscription every prompt-requiring action hangs to the 120s
+      // deny — the run_command "stuck running" bug).
+      onHidApprovalRequest((request) => dispatchChat({ type: "hid-approval", request })),
+      onMcpApprovalRequest((request) => dispatchChat({ type: "mcp-approval", request })),
+      // Resolutions from ANY window (or the gate's timeout) clear the card
+      // here too — answering in the hud-pill must not leave a stale prompt.
+      onHidApprovalResolved((payload) =>
+        dispatchChat({ type: "hid-approval-answered", approvalId: payload.approvalId }),
+      ),
+      onMcpApprovalResolved((payload) =>
+        dispatchChat({ type: "mcp-approval-answered", approvalId: payload.approvalId }),
+      ),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -938,6 +980,33 @@ function App() {
     );
   };
 
+  // New chat (computer-control I3): the current session stays stored; the
+  // backend starts pointing exchanges at a fresh one, and the transcript
+  // clears (environment snapshots survive the reset).
+  const startNewChat = () => {
+    dispatchChat({ type: "new-chat" });
+    chatNewSession().catch((err) =>
+      console.debug("chat: chat_new_session unavailable:", err),
+    );
+  };
+
+  // Answer a pending approval: deliver the verdict (fire-and-forget — the
+  // backend never rejects; false just means the gate already timed out) and
+  // drop the prompt either way.
+  const answerHidApproval = (approvalId: number, verdict: ApprovalVerdict) => {
+    respondHidApproval(approvalId, verdict).catch((err) =>
+      console.warn("hid: respond_hid_approval failed:", err),
+    );
+    dispatchChat({ type: "hid-approval-answered", approvalId });
+  };
+
+  const answerMcpApproval = (approvalId: number, verdict: McpApprovalVerdict) => {
+    respondMcpApproval(approvalId, verdict).catch((err) =>
+      console.warn("mcp: respond_mcp_approval failed:", err),
+    );
+    dispatchChat({ type: "mcp-approval-answered", approvalId });
+  };
+
   const overrideLane = (lane: string) => {
     setModel(lane).then(
       (info) => dispatchChat({ type: "model-info", info }),
@@ -1029,6 +1098,7 @@ function App() {
       className="overlay-root"
       data-state={state}
       data-edge={drawerEdge ?? undefined}
+      data-empty-chat={chat.messages.length === 0 || undefined}
     >
       <div className="overlay-panel">
         {/* Header drag region (M006/S01): grabs the whole panel to move the
@@ -1040,164 +1110,8 @@ function App() {
           onMouseUp={persistMoveEnd}
           aria-hidden="true"
         />
-        <form onSubmit={onSubmit} className="overlay-input-row">
-          {/* The eye mirrors the run truthfully: amber acting while a run is
-              live (Stop visible), scanning green while summoned, calm watching
-              otherwise. */}
-          <span className="overlay-input-eye" aria-hidden="true">
-            <EyeIcon
-              state={
-                showStopButton(chat)
-                  ? "acting"
-                  : state === "visible-focused"
-                    ? "thinking"
-                    : "watching"
-              }
-              size={34}
-              stroke="#ffffff"
-            />
-          </span>
-          <input
-            ref={inputRef}
-            className="overlay-input"
-            type="text"
-            placeholder="Ask, act, or recall anything…"
-            aria-label="Overlay input"
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-          />
-          <span className="overlay-esc-chip" aria-hidden="true">
-            esc
-          </span>
-        </form>
-        {showStopButton(chat) && (
-          <div className="run-controls">
-            <button
-              type="button"
-              className="chat-stop"
-              aria-label="Stop the running task"
-              onClick={stopRun}
-            >
-              Stop
-            </button>
-          </div>
-        )}
-        {trayNotice && (
-          <div className="tray-notice" role="status">
-            <Toast placement="inline">
-              <span className="tray-notice-text">
-                <strong>{trayNotice.title}</strong> {trayNotice.detail}
-              </span>
-            </Toast>
-            <button
-              type="button"
-              className="tray-notice-dismiss"
-              aria-label="Dismiss notice"
-              onClick={() => setTrayNotice(null)}
-            >
-              ✕
-            </button>
-          </div>
-        )}
-        {/* Attach affordance: hidden only when the platform reports no
-            capture backend at all (supported === false). */}
-        {chat.capturePermission?.supported !== false && (
-          <div className="attach-row">
-            {chat.attachment ? (
-              <span className="attach-chip">
-                Screen attached · {chat.attachment.width}×{chat.attachment.height}
-                <button
-                  type="button"
-                  className="attach-chip-clear"
-                  aria-label="Remove screen attachment"
-                  onClick={() => dispatchChat({ type: "attach-clear" })}
-                >
-                  ×
-                </button>
-              </span>
-            ) : (
-              <button
-                type="button"
-                className="attach-button"
-                disabled={chat.attachPending}
-                onClick={attachScreen}
-              >
-                {chat.attachPending && <span className="attach-spinner" aria-hidden="true" />}
-                {chat.attachPending ? "Capturing…" : "Attach my screen"}
-              </button>
-            )}
-            {/* Privacy hint only — the button stays live so an attempted
-                capture still surfaces the typed privacy-mode error. */}
-            {chat.privacy?.enabled && (
-              <span className="attach-privacy-hint" title="Turn Privacy Mode off in the tray menu or settings">
-                Privacy Mode on — capture blocked
-              </span>
-            )}
-          </div>
-        )}
-        {chat.captureError &&
-          (chat.captureError.kind === "permission-denied" ? (
-            <div className="capture-walkthrough" role="alert">
-              <strong>{captureErrorTitle(chat.captureError)}</strong>
-              <ol className="capture-walkthrough-steps">
-                <li>Open System Settings below — it lands on Privacy &amp; Security → Screen Recording.</li>
-                <li>Turn on Third Eye in the list (macOS may ask to relaunch the app).</li>
-                <li>Come back and press Try again.</li>
-              </ol>
-              <div className="capture-walkthrough-actions">
-                <button type="button" className="chat-retry" onClick={openScreenRecordingSettings}>
-                  Open System Settings
-                </button>
-                <button type="button" className="chat-retry" onClick={attachScreen}>
-                  Try again
-                </button>
-                <button
-                  type="button"
-                  className="chat-retry"
-                  onClick={() => dispatchChat({ type: "attach-clear" })}
-                >
-                  Dismiss
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="chat-banner" role="alert">
-              <div className="chat-banner-text">
-                <strong>{captureErrorTitle(chat.captureError)}</strong>
-                <span>{captureErrorDetail(chat.captureError)}</span>
-              </div>
-              <button type="button" className="chat-retry" onClick={attachScreen}>
-                Try again
-              </button>
-            </div>
-          ))}
-        {chat.banner && (
-          <div
-            className="chat-banner"
-            data-online={chat.banner.online}
-            data-kind={chat.banner.error.kind}
-            role="alert"
-          >
-            <div className="chat-banner-text">
-              <strong>
-                {chat.banner.online
-                  ? "Local AI back online"
-                  : bannerTitle(chat.banner.error)}
-              </strong>
-              <span>{bannerDetail(chat.banner.error)}</span>
-            </div>
-            <button
-              type="button"
-              className="chat-retry"
-              disabled={chat.lastQuestion === null}
-              onClick={() => submit(chat.lastQuestion ?? "", true)}
-            >
-              Retry
-            </button>
-          </div>
-        )}
         {chat.messages.length > 0 && (
-          <div className="chat-messages" ref={messagesRef}>
+          <div className="chat-messages" ref={messagesRef} onScroll={onMessagesScroll}>
             {chat.messages.map((message, index) => (
               <div
                 key={index}
@@ -1216,6 +1130,20 @@ function App() {
                     <span className="chat-reasoning-text">{message.reasoning}</span>
                   </div>
                 )}
+                {message.role === "assistant" &&
+                  (message.terminal ?? []).map((run) => (
+                    <div key={run.callId} className="chat-terminal" data-ok={run.ok ?? undefined}>
+                      <div className="chat-terminal-cmd">
+                        <span className="chat-terminal-prompt" aria-hidden="true">
+                          $
+                        </span>
+                        {run.command}
+                        {run.ok === null && <span className="chat-terminal-running">running…</span>}
+                        {run.ok === false && <span className="chat-terminal-failed">failed</span>}
+                      </div>
+                      {run.preview && <pre className="chat-terminal-out">{run.preview}</pre>}
+                    </div>
+                  ))}
                 <span className="chat-text">{message.text}</span>
                 {message.role === "user" && message.attached && (
                   <span className="chat-attached-tag" title="A screenshot rode this message">
@@ -1245,6 +1173,194 @@ function App() {
             ))}
           </div>
         )}
+        {showStopButton(chat) && (
+          <div className="run-controls">
+            <button
+              type="button"
+              className="chat-stop"
+              aria-label="Stop the running task"
+              onClick={stopRun}
+            >
+              Stop
+            </button>
+          </div>
+        )}
+        <div className="overlay-composer">
+          {chat.hidApprovals.map((request) => (
+            <ApprovalCard
+              key={request.approvalId}
+              title="Third Eye wants to act"
+              summary={request.summary}
+              onAllowOnce={() => answerHidApproval(request.approvalId, "allow-once")}
+              onAllowAlways={() => answerHidApproval(request.approvalId, "allow-kind")}
+              onDeny={() => answerHidApproval(request.approvalId, "deny")}
+            />
+          ))}
+          {chat.mcpApprovals.map((request) => (
+            <ApprovalCard
+              key={request.approvalId}
+              title={`External tool: ${request.toolName}`}
+              summary={request.summary}
+              onAllowOnce={() => answerMcpApproval(request.approvalId, "allow-once")}
+              onAllowAlways={() => answerMcpApproval(request.approvalId, "allow-tool")}
+              onDeny={() => answerMcpApproval(request.approvalId, "deny")}
+            />
+          ))}
+          {trayNotice && (
+            <div className="tray-notice" role="status">
+              <Toast placement="inline">
+                <span className="tray-notice-text">
+                  <strong>{trayNotice.title}</strong> {trayNotice.detail}
+                </span>
+              </Toast>
+              <button
+                type="button"
+                className="tray-notice-dismiss"
+                aria-label="Dismiss notice"
+                onClick={() => setTrayNotice(null)}
+              >
+                ✕
+              </button>
+            </div>
+          )}
+          {/* Attach affordance: hidden only when the platform reports no
+              capture backend at all (supported === false). */}
+          {chat.capturePermission?.supported !== false && (
+            <div className="attach-row">
+              {chat.attachment ? (
+                <span className="attach-chip">
+                  Screen attached · {chat.attachment.width}×{chat.attachment.height}
+                  <button
+                    type="button"
+                    className="attach-chip-clear"
+                    aria-label="Remove screen attachment"
+                    onClick={() => dispatchChat({ type: "attach-clear" })}
+                  >
+                    ×
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="attach-button"
+                  disabled={chat.attachPending}
+                  onClick={attachScreen}
+                >
+                  {chat.attachPending && <span className="attach-spinner" aria-hidden="true" />}
+                  {chat.attachPending ? "Capturing…" : "Attach my screen"}
+                </button>
+              )}
+              {/* Privacy hint only — the button stays live so an attempted
+                  capture still surfaces the typed privacy-mode error. */}
+              {chat.privacy?.enabled && (
+                <span className="attach-privacy-hint" title="Turn Privacy Mode off in the tray menu or settings">
+                  Privacy Mode on — capture blocked
+                </span>
+              )}
+            </div>
+          )}
+          {chat.captureError &&
+            (chat.captureError.kind === "permission-denied" ? (
+              <div className="capture-walkthrough" role="alert">
+                <strong>{captureErrorTitle(chat.captureError)}</strong>
+                <ol className="capture-walkthrough-steps">
+                  <li>Open System Settings below — it lands on Privacy &amp; Security → Screen Recording.</li>
+                  <li>Turn on Third Eye in the list (macOS may ask to relaunch the app).</li>
+                  <li>Come back and press Try again.</li>
+                </ol>
+                <div className="capture-walkthrough-actions">
+                  <button type="button" className="chat-retry" onClick={openScreenRecordingSettings}>
+                    Open System Settings
+                  </button>
+                  <button type="button" className="chat-retry" onClick={attachScreen}>
+                    Try again
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-retry"
+                    onClick={() => dispatchChat({ type: "attach-clear" })}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="chat-banner" role="alert">
+                <div className="chat-banner-text">
+                  <strong>{captureErrorTitle(chat.captureError)}</strong>
+                  <span>{captureErrorDetail(chat.captureError)}</span>
+                </div>
+                <button type="button" className="chat-retry" onClick={attachScreen}>
+                  Try again
+                </button>
+              </div>
+            ))}
+          {chat.banner && (
+            <div
+              className="chat-banner"
+              data-online={chat.banner.online}
+              data-kind={chat.banner.error.kind}
+              role="alert"
+            >
+              <div className="chat-banner-text">
+                <strong>
+                  {chat.banner.online
+                    ? "Local AI back online"
+                    : bannerTitle(chat.banner.error)}
+                </strong>
+                <span>{bannerDetail(chat.banner.error)}</span>
+              </div>
+              <button
+                type="button"
+                className="chat-retry"
+                disabled={chat.lastQuestion === null}
+                onClick={() => submit(chat.lastQuestion ?? "", true)}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          <form onSubmit={onSubmit} className="overlay-input-row">
+            {/* The eye mirrors the run truthfully: amber acting while a run is
+                live (Stop visible), scanning green while summoned, calm watching
+                otherwise. */}
+            <span className="overlay-input-eye" aria-hidden="true">
+              <EyeIcon
+                state={
+                  showStopButton(chat)
+                    ? "acting"
+                    : state === "visible-focused"
+                      ? "thinking"
+                      : "watching"
+                }
+                size={34}
+                stroke="#ffffff"
+              />
+            </span>
+            <input
+              ref={inputRef}
+              className="overlay-input"
+              type="text"
+              placeholder="Ask, act, or recall anything…"
+              aria-label="Overlay input"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+            />
+            {chat.messages.length > 0 && (
+              <button
+                type="button"
+                className="overlay-new-chat"
+                title="Start a fresh chat (this one is saved)"
+                onClick={startNewChat}
+              >
+                ＋ New
+              </button>
+            )}
+            <span className="overlay-esc-chip" aria-hidden="true">
+              esc
+            </span>
+          </form>
+        </div>
         {routing && (
           <div className="model-indicator" data-lane={routing.activeLane}>
             <span className="model-indicator-model" title={routing.endpoint}>

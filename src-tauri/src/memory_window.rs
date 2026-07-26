@@ -84,6 +84,7 @@ mod platform {
                 .into(),
         );
         panel.set_hides_on_deactivate(false);
+        let _ = window.set_shadow(false);
         log::debug!("memory-window: converted to nonactivating NSPanel (level=floating)");
         Ok(())
     }

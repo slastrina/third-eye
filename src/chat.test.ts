@@ -1043,3 +1043,108 @@ describe("chat run-state and the Stop control", () => {
     expect(showStopButton(failed)).toBe(false);
   });
 });
+
+
+describe("terminal runs in the transcript (computer-control I2)", () => {
+  const streamingState = () => {
+    let state = chatReducer(initialChatState, { type: "submit", question: "what time is it?", retry: false });
+    state = chatReducer(state, { type: "request-started", requestId: 7 });
+    return state;
+  };
+  const runCall = (id: string, command: string) => ({
+    type: "tool-call" as const,
+    payload: {
+      requestId: 7,
+      round: 0,
+      call: { id, name: "run_command", arguments: JSON.stringify({ command }) },
+    },
+  });
+  const runResult = (callId: string, ok: boolean, preview: string | null, failure: string | null = null) => ({
+    type: "tool-result" as const,
+    payload: {
+      requestId: 7,
+      round: 0,
+      callId,
+      name: "run_command",
+      ok,
+      resultCount: null,
+      mode: null,
+      failure,
+      preview,
+    },
+  });
+  const lastAssistant = (s: ReturnType<typeof chatReducer>) =>
+    s.messages[s.messages.length - 1];
+
+  it("a run_command call appends a pending terminal block with the exact command", () => {
+    const state = chatReducer(streamingState(), runCall("t1", "date"));
+    const terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toEqual({ callId: "t1", command: "date", ok: null, preview: null });
+  });
+
+  it("the result settles the matching block with its output preview", () => {
+    let state = chatReducer(streamingState(), runCall("t1", "date"));
+    state = chatReducer(state, runResult("t1", true, "exit code: 0\nstdout:\nSat 26 Jul"));
+    const terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal[0].ok).toBe(true);
+    expect(terminal[0].preview).toContain("Sat 26 Jul");
+  });
+
+  it("a failed run without a preview shows the typed failure kind", () => {
+    let state = chatReducer(streamingState(), runCall("t1", "date"));
+    state = chatReducer(state, runResult("t1", false, null, "approval-denied"));
+    const terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal[0].ok).toBe(false);
+    expect(terminal[0].preview).toBe("[approval-denied]");
+  });
+
+  it("malformed arguments still render raw so nothing runs invisibly", () => {
+    const state = chatReducer(streamingState(), {
+      type: "tool-call",
+      payload: {
+        requestId: 7,
+        round: 0,
+        call: { id: "t2", name: "run_command", arguments: "{not json" },
+      },
+    });
+    const terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal[0].command).toBe("{not json");
+  });
+});
+
+
+describe("approval prompt queues (the stuck-run fix)", () => {
+  const hid = (approvalId: number): HidApprovalRequest => ({
+    approvalId,
+    kind: "run-command",
+    summary: "Run command: curl -s ifconfig.me",
+  });
+
+  it("a request folds once (replay-safe) and renders until answered", () => {
+    let s = chatReducer(initialChatState, { type: "hid-approval", request: hid(1) });
+    s = chatReducer(s, { type: "hid-approval", request: hid(1) });
+    expect(s.hidApprovals).toHaveLength(1);
+    s = chatReducer(s, { type: "hid-approval-answered", approvalId: 1 });
+    expect(s.hidApprovals).toHaveLength(0);
+  });
+
+  it("pending approvals survive new-chat and a fresh submit (the run outlives both)", () => {
+    let s = chatReducer(initialChatState, { type: "hid-approval", request: hid(7) });
+    s = chatReducer(s, { type: "new-chat" });
+    expect(s.hidApprovals).toHaveLength(1);
+    s = chatReducer(s, { type: "submit", question: "again" });
+    expect(s.hidApprovals).toHaveLength(1);
+  });
+
+  it("mcp approvals queue independently", () => {
+    let s = chatReducer(initialChatState, {
+      type: "mcp-approval",
+      request: { approvalId: 2, toolName: "mcp__files__write", summary: "write ~/notes.txt" },
+    });
+    expect(s.mcpApprovals).toHaveLength(1);
+    expect(s.hidApprovals).toHaveLength(0);
+    s = chatReducer(s, { type: "mcp-approval-answered", approvalId: 2 });
+    expect(s.mcpApprovals).toHaveLength(0);
+  });
+});

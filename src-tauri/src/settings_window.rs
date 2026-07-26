@@ -107,6 +107,7 @@ mod platform {
         // The app never activates, so never auto-hide on deactivate.
         panel.set_hides_on_deactivate(false);
 
+        let _ = window.set_shadow(false);
         log::debug!(
             "settings: converted to nonactivating NSPanel (level=floating, active-space, fullscreen-auxiliary)"
         );

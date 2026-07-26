@@ -19,3 +19,29 @@
   inset: 0;
   pointer-events: none;
 }
+
+/* Approval cards in the pill window ride a transparent desktop overlay —
+   back them with the glass panel treatment and match the trail width. */
+.hud-pill-root .approval-prompt {
+  width: 380px;
+  max-width: 100%;
+  box-sizing: border-box;
+  background: var(--te-glass-heavy);
+  backdrop-filter: var(--te-blur);
+  -webkit-backdrop-filter: var(--te-blur);
+  box-shadow: 0 18px 60px rgba(2, 8, 24, 0.55);
+}
+
+/* The pill and its trail must never exceed the window (a long run·open URL
+   previously clipped Stop at the window edge). */
+.hud-pill-root > * {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.te-hudpill {
+  min-width: 0;
+}
+.te-hudpill .te-hudpill__headline {
+  flex-shrink: 1;
+  min-width: 0;
+}

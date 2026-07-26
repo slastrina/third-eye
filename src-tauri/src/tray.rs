@@ -881,6 +881,11 @@ pub fn tray_panel_position(click_x: f64, click_y: f64, mon_x: f64, mon_w: f64) -
 /// policy). Fatal on failure, like the overlay/settings conversions.
 pub fn init_panel(app: &AppHandle) -> Result<(), String> {
     crate::hud::convert_never_key_panel(app, TRAY_PANEL_LABEL, 1)?;
+    // Same post-conversion shadow kill as the HUD windows (the NSPanel
+    // conversion re-enables the native shadow the config disabled).
+    if let Some(window) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        let _ = window.set_shadow(false);
+    }
     #[cfg(target_os = "macos")]
     outside_click::install(app);
     Ok(())

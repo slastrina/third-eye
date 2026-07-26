@@ -13,7 +13,7 @@ TAURI := npm run tauri --
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev tauri-dev build build-web build-tauri preview \
+.PHONY: help install dev tauri-dev build build-web build-tauri run-app preview \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
         clean-web clean-rust
@@ -48,6 +48,18 @@ preview:
 
 ## build: Build the full Tauri app bundle (frontend + native)
 build: build-tauri
+
+# The bundled app the OS permission grants attach to. Grant Screen Recording
+# and Accessibility to THIS app (System Settings → Privacy & Security); the
+# grant sticks across launches, and only drops when the app is REBUILT
+# (ad-hoc signing changes the binary hash — re-toggle the grant after a
+# rebuild, or set a real signingIdentity in tauri.conf.json to make it
+# survive rebuilds too).
+APP_BUNDLE := src-tauri/target/release/bundle/macos/Third Eye.app
+
+## run-app: Build the release app bundle and launch it (stable binary for OS permission grants)
+run-app: build-tauri
+	open "$(APP_BUNDLE)"
 
 ## build-web: Type-check and build the frontend (tsc && vite build)
 build-web:

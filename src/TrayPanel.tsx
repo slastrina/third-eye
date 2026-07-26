@@ -6,6 +6,12 @@
 import { useEffect, useReducer, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  capturePermissionStatus,
+  hidArmedStatus,
+  openCaptureSettings,
+  openInputSettings,
+} from "./chat";
+import {
   onWatcherState,
   setWatcherEnabled,
   watcherStatus,
@@ -15,6 +21,7 @@ import {
   PAUSE_OPTIONS,
   initialTrayPanelState,
   pauseMs,
+  permissionIssues,
   trayEye,
   trayPanelReducer,
   traySub,
@@ -52,6 +59,21 @@ export function TrayPanel() {
           if (!cancelled) dispatch({ type: "latest", records });
         },
         (err) => console.debug("tray-panel: memory_list unavailable:", err),
+      );
+      // Live permission health — the panel's front-and-center check, re-run
+      // on every open (visibilitychange) so a grant made in System Settings
+      // reflects the next time the tray is clicked.
+      capturePermissionStatus().then(
+        (permission) => {
+          if (!cancelled) dispatch({ type: "capture-permission", permission });
+        },
+        (err) => console.debug("tray-panel: capture_permission_status unavailable:", err),
+      );
+      hidArmedStatus().then(
+        (status) => {
+          if (!cancelled) dispatch({ type: "hid-status", status });
+        },
+        (err) => console.debug("tray-panel: hid_armed_status unavailable:", err),
       );
     };
     refresh();
@@ -136,7 +158,26 @@ export function TrayPanel() {
           </button>
         </div>
 
-        {panel.watching === true && (
+        {permissionIssues(panel).map((issue) => (
+          <div key={issue.key} className="tray-panel-issue" role="alert">
+            <div className="tray-panel-issue-text">
+              <strong>{issue.title}</strong>
+              <span>{issue.detail}</span>
+            </div>
+            <Button
+              variant="outline"
+              onClick={() => {
+                (issue.key === "screen" ? openCaptureSettings() : openInputSettings()).catch(
+                  (err) => console.debug("tray-panel: open settings no-op:", err),
+                );
+              }}
+            >
+              Open System Settings
+            </Button>
+          </div>
+        ))}
+
+                {panel.watching === true && (
           <div className="tray-panel-section">
             <SectionLabel>Pause watching</SectionLabel>
             <div className="tray-panel-pause-row">

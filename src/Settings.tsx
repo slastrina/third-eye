@@ -22,14 +22,23 @@ import {
   onHidStateChanged,
   onModelInfoBroadcast,
   onNudgeState,
+  commandsStatus,
+  inventorySearch,
+  inventoryStatus,
   memoryRetention,
+  refreshInventory,
   onPrivacyChanged,
   openInputSettings,
   privacyStatus,
+  setCommandsAllowlist,
+  setCommandsEnabled,
   setHidRunMode,
   setMemoryRetention,
   setNudgesEnabled,
+  type CommandsStatus,
   type HidRunMode,
+  type InventoryEntry,
+  type InventoryStatus,
   type InputError,
   type NudgeStatus,
 } from "./chat";
@@ -82,6 +91,7 @@ import {
   type SectionId,
 } from "./settings-nav";
 import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geometry";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Toggle } from "./ui/Toggle";
 import { ChoiceChips } from "./ui/Chip";
 import { RETENTION_OPTIONS, type Retention } from "./tour-state";
@@ -267,6 +277,16 @@ function Settings() {
   // or persist failure lands the truthful state, never a lying chip.
   const [retention, setRetention] = useState<Retention>("30d");
   const [retentionError, setRetentionError] = useState<string | null>(null);
+  // Terminal-commands gate (computer-control I2): a single authoritative
+  // backend snapshot, like nudges.
+  const [commands, setCommands] = useState<CommandsStatus | null>(null);
+  const [allowlistDraft, setAllowlistDraft] = useState("");
+  // Programs pane (computer-control I1 surface): cache health, an on-demand
+  // rescan, and a search over the cached inventory.
+  const [inventory, setInventory] = useState<InventoryStatus | null>(null);
+  const [inventoryBusy, setInventoryBusy] = useState(false);
+  const [programQuery, setProgramQuery] = useState("");
+  const [programs, setPrograms] = useState<InventoryEntry[] | null>(null);
   // Guard telemetry is likewise a single authoritative backend snapshot
   // (mount query and privacy://state broadcast land the same shape); all
   // display logic lives in pure privacy-state.ts helpers.
@@ -348,6 +368,14 @@ function Settings() {
     memoryRetention().then(
       (status) => setRetention(status.retention as Retention),
       (err) => console.debug("settings: memory_retention unavailable:", err),
+    );
+    commandsStatus().then(
+      (status) => setCommands(status),
+      (err) => console.debug("settings: commands_status unavailable:", err),
+    );
+    inventoryStatus().then(
+      (status) => setInventory(status),
+      (err) => console.debug("settings: inventory_status unavailable:", err),
     );
     guardStatus().then(
       (telemetry) => setGuard(telemetry),
@@ -514,6 +542,55 @@ function Settings() {
         setRetentionError(status.error);
       },
       (err) => console.debug("settings: set_memory_retention unavailable:", err),
+    );
+  };
+
+  const toggleCommands = (enable: boolean) => {
+    setCommandsEnabled(enable).then(
+      // Never rejects backend-side; a persist failure rides status.error and
+      // the rolled-back value comes back as the authoritative snapshot.
+      (status) => setCommands(status),
+      (err) => console.debug("settings: set_commands_enabled unavailable:", err),
+    );
+  };
+
+  const updateAllowlist = (entries: string[]) => {
+    setCommandsAllowlist(entries).then(
+      (status) => setCommands(status),
+      (err) => console.debug("settings: set_commands_allowlist unavailable:", err),
+    );
+  };
+
+  const addAllowlistEntry = () => {
+    const entry = allowlistDraft.trim();
+    if (!entry || commands === null) return;
+    setAllowlistDraft("");
+    updateAllowlist([...commands.allowlist, entry]);
+  };
+
+  const rescanInventory = () => {
+    setInventoryBusy(true);
+    refreshInventory().then(
+      (status) => {
+        setInventoryBusy(false);
+        setInventory(status);
+      },
+      (err) => {
+        setInventoryBusy(false);
+        console.debug("settings: refresh_inventory unavailable:", err);
+      },
+    );
+  };
+
+  const searchPrograms = (query: string) => {
+    setProgramQuery(query);
+    if (query.trim().length === 0) {
+      setPrograms(null);
+      return;
+    }
+    inventorySearch(query, 50).then(
+      (entries) => setPrograms(entries),
+      (err) => console.debug("settings: inventory_search unavailable:", err),
     );
   };
 
@@ -839,10 +916,24 @@ function Settings() {
   const presentationExtent =
     presentation && presentationEdge ? drawerExtentFor(presentation, presentationEdge) : 0;
 
+  // Drag the borderless window by its header (overlay drag-handle idiom).
+  // Interactive children (close button) keep their clicks; outside a Tauri
+  // runtime getCurrentWindow throws synchronously — absorbed.
+  const startWindowDrag = (event: React.MouseEvent) => {
+    if ((event.target as HTMLElement).closest("button, input, select, a")) return;
+    try {
+      getCurrentWindow()
+        .startDragging()
+        .catch((err) => console.debug("settings: drag no-op:", err));
+    } catch (err) {
+      console.debug("settings: drag unavailable:", err);
+    }
+  };
+
   return (
     <div className="settings-root">
       <div className="settings-panel">
-        <header className="settings-header">
+        <header className="settings-header" onMouseDown={startWindowDrag}>
           <h1 className="settings-title">Third Eye Settings</h1>
           <button
             type="button"
@@ -1111,6 +1202,71 @@ function Settings() {
             performs them without asking. Needs macOS Accessibility permission;
             switching to Off reverts to fully inert.
           </p>
+          <label className="settings-row">
+            <span className="settings-row-label">Terminal commands</span>
+            <Toggle
+              ariaLabel="Terminal commands"
+              disabled={commands === null}
+              on={commands?.enabled ?? false}
+              onChange={(next) => toggleCommands(next)}
+            />
+          </label>
+          <p className="settings-hint">
+            Off by default. When on, Third Eye can run shell commands for you —
+            every command is shown and asked about before it runs, and its
+            output appears in the chat.
+          </p>
+          {commands?.error && (
+            <div className="settings-error" role="alert">
+              <strong>Terminal commands couldn't be saved</strong>
+              <span>{commands.error}</span>
+            </div>
+          )}
+          {commands !== null && (
+            <div className="allowlist-editor">
+              <span className="settings-row-label">Always-allowed commands</span>
+              <p className="settings-hint">
+                Commands matching an entry run without asking — an entry covers
+                itself and anything after it separated by a space ("ls" covers
+                "ls -la", never "lsof"). Every run still shows in the chat and
+                the on-screen HUD.
+              </p>
+              {commands.allowlist.map((entry) => (
+                <div key={entry} className="allowlist-row">
+                  <code className="allowlist-entry">{entry}</code>
+                  <button
+                    type="button"
+                    className="memory-delete"
+                    aria-label={`Remove ${entry} from the allowlist`}
+                    onClick={() =>
+                      updateAllowlist(commands.allowlist.filter((e) => e !== entry))
+                    }
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+              <form
+                className="allowlist-add"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  addAllowlistEntry();
+                }}
+              >
+                <input
+                  className="settings-nav-search"
+                  type="text"
+                  placeholder='Add a command, e.g. "date" or "curl -s ifconfig.me"'
+                  aria-label="Add allowed command"
+                  value={allowlistDraft}
+                  onChange={(event) => setAllowlistDraft(event.target.value)}
+                />
+                <button type="button" className="chat-retry" onClick={addAllowlistEntry}>
+                  Add
+                </button>
+              </form>
+            </div>
+          )}
           {state.hid && hidModeShowsAutoRunWarning(state.hid.mode) && (
             // Auto-run performs every HID action without a prompt — the most
             // dangerous posture, so it is called out explicitly (R007).
@@ -2074,7 +2230,81 @@ function Settings() {
         </section>
         )}
 
-        {active === "status" && (
+        {active === "programs" && (
+        <section className="settings-section" aria-labelledby="settings-programs-heading">
+          <h2 id="settings-programs-heading" className="settings-section-title">
+            Programs
+          </h2>
+          <p className="settings-hint">
+            What Third Eye knows is installed on this machine — GUI apps and
+            terminal tools, scanned daily. The assistant checks this cache
+            before claiming something is (or isn't) installed.
+          </p>
+          {inventory === null ? (
+            <p className="settings-unavailable">
+              Inventory is unavailable outside the app.
+            </p>
+          ) : (
+            <>
+              <div className="settings-row">
+                <span className="settings-row-label">
+                  {inventory.apps} apps · {inventory.tools} terminal tools
+                  {inventory.lastRefreshMs !== null && (
+                    <span className="settings-hint-inline">
+                      {" "}
+                      · scanned {new Date(inventory.lastRefreshMs).toLocaleString()}
+                    </span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  className="chat-retry"
+                  disabled={inventoryBusy}
+                  onClick={rescanInventory}
+                >
+                  {inventoryBusy ? "Scanning…" : "Rescan now"}
+                </button>
+              </div>
+              {inventory.error && (
+                <div className="settings-error" role="alert">
+                  <span>{inventory.error}</span>
+                </div>
+              )}
+              <input
+                className="settings-nav-search"
+                type="text"
+                placeholder="Search installed programs…"
+                aria-label="Search installed programs"
+                value={programQuery}
+                onChange={(event) => searchPrograms(event.target.value)}
+              />
+              {programs !== null &&
+                (programs.length === 0 ? (
+                  <p className="settings-hint">No installed program matches.</p>
+                ) : (
+                  <div className="programs-list">
+                    {programs.map((entry) => (
+                      <div key={entry.path} className="programs-row">
+                        <span
+                          className="programs-kind"
+                          data-kind={entry.kind}
+                        >
+                          {entry.kind === "app" ? "app" : "cli"}
+                        </span>
+                        <span className="programs-name">{entry.name}</span>
+                        <span className="programs-path" title={entry.path}>
+                          {entry.path}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+            </>
+          )}
+        </section>
+        )}
+
+                {active === "status" && (
         <section className="settings-section" aria-labelledby="settings-status-heading">
           <h2 id="settings-status-heading" className="settings-section-title">
             Status

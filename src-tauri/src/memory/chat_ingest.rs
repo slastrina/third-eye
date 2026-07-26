@@ -783,6 +783,7 @@ mod tests {
             result_count: None,
             mode: None,
             failure: failure.map(Into::into),
+            preview: None,
         })
     }
 

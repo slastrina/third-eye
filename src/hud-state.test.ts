@@ -134,3 +134,41 @@ describe("derived views", () => {
     expect(ghostTarget(state)).toBeNull();
   });
 });
+
+
+describe("approval mirroring in the HUD", () => {
+  const request = {
+    approvalId: 9,
+    kind: "run-command" as const,
+    summary: "Run command: curl -s ifconfig.me",
+  };
+
+  it("folds a request once, keeps it across a run start, clears on resolved", () => {
+    let state = hudReducer(initialHudState, { type: "hid-approval", request });
+    state = hudReducer(state, { type: "hid-approval", request });
+    expect(state.hidApprovals).toHaveLength(1);
+    // A (re)start of the run must not drop a parked ask.
+    state = hudReducer(state, { type: "run-state", phase: "running" });
+    expect(state.hidApprovals).toHaveLength(1);
+    state = hudReducer(state, { type: "approval-resolved", approvalId: 9 });
+    expect(state.hidApprovals).toHaveLength(0);
+  });
+
+  it("pending approvals alone make the pill visible (gated focus_app case)", async () => {
+    const { hudApprovalsPending } = await import("./hud-state");
+    const state = hudReducer(initialHudState, { type: "hid-approval", request });
+    expect(hudApprovalsPending(state)).toBe(true);
+    expect(hudApprovalsPending(initialHudState)).toBe(false);
+  });
+
+  it("resolved clears across both queues by id", () => {
+    let state = hudReducer(initialHudState, { type: "hid-approval", request });
+    state = hudReducer(state, {
+      type: "mcp-approval",
+      request: { approvalId: 10, toolName: "mcp__files__write", summary: "write x" },
+    });
+    state = hudReducer(state, { type: "approval-resolved", approvalId: 10 });
+    expect(state.hidApprovals).toHaveLength(1);
+    expect(state.mcpApprovals).toHaveLength(0);
+  });
+});

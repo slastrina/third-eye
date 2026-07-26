@@ -49,24 +49,114 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     // The app never activates, so never auto-hide on deactivate.
     panel.set_hides_on_deactivate(false);
 
+    // The conversion re-enables the native shadow the config disabled;
+    // kill it so the transparent window never grows a grey shadow blob.
+    let _ = window.set_shadow(false);
     log::debug!("overlay: converted to nonactivating NSPanel (level=main-menu+1, all-spaces, fullscreen-auxiliary)");
     Ok(())
 }
 
-/// Show without taking key/focus: orderFrontRegardless leaves the previously
-/// frontmost app with keyboard focus (visible-idle state).
-pub fn show(app: &AppHandle) -> Result<(), String> {
-    let panel = panel(app)?;
-    app.run_on_main_thread(move || panel.order_front_regardless())
-        .map_err(|e| format!("main-thread dispatch for show failed: {e}"))
+/// Summon/dismiss fade (user request 2026-07-26, replacing the CSS slide
+/// that fought WebKit's occluded-window paint skipping and backdrop-filter
+/// compositing): the NATIVE window alpha is stepped, so both directions
+/// render regardless of webview state, and the window only orders out once
+/// fully transparent — a real fade-out. Each show/hide bumps the epoch;
+/// a stale stepper aborts, so rapid toggling never fights itself.
+static FADE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const FADE_STEPS: u32 = 8;
+const FADE_IN_MS: u64 = 140;
+const FADE_OUT_MS: u64 = 120;
+
+/// The overlay's NSWindow pointer as a usize (Send) for main-thread hops.
+fn ns_window_addr(app: &AppHandle) -> Result<usize, String> {
+    let window = app
+        .get_webview_window(crate::OVERLAY_WINDOW_LABEL)
+        .ok_or_else(|| format!("overlay window '{}' not found", crate::OVERLAY_WINDOW_LABEL))?;
+    Ok(window
+        .ns_window()
+        .map_err(|e| format!("overlay ns_window handle unavailable: {e}"))? as usize)
 }
 
-/// Order the panel out. Focus returns to the prior app automatically because
-/// the app was never activated.
-pub fn hide(app: &AppHandle) -> Result<(), String> {
+/// Set the window alpha on the main thread. The pointer stays valid for the
+/// app's lifetime (the overlay window is never destroyed).
+fn set_alpha(app: &AppHandle, addr: usize, alpha: f64) -> Result<(), String> {
+    app.run_on_main_thread(move || {
+        let window = unsafe { &*(addr as *const objc2_app_kit::NSWindow) };
+        window.setAlphaValue(alpha);
+    })
+    .map_err(|e| format!("main-thread alpha dispatch failed: {e}"))
+}
+
+/// Show without taking key/focus: orderFrontRegardless leaves the previously
+/// frontmost app with keyboard focus (visible-idle state). Fades in from
+/// alpha 0 over ~140ms; interaction is live immediately (alpha is visual).
+pub fn show(app: &AppHandle) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let epoch = FADE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let panel = panel(app)?;
-    app.run_on_main_thread(move || panel.hide())
-        .map_err(|e| format!("main-thread dispatch for hide failed: {e}"))
+    let addr = ns_window_addr(app)?;
+    app.run_on_main_thread(move || {
+        let window = unsafe { &*(addr as *const objc2_app_kit::NSWindow) };
+        window.setAlphaValue(0.0);
+        panel.order_front_regardless();
+    })
+    .map_err(|e| format!("main-thread dispatch for show failed: {e}"))?;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for step in 1..=FADE_STEPS {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                FADE_IN_MS / FADE_STEPS as u64,
+            ))
+            .await;
+            if FADE_EPOCH.load(Ordering::SeqCst) != epoch {
+                return; // superseded by a newer show/hide
+            }
+            let alpha = f64::from(step) / f64::from(FADE_STEPS);
+            if set_alpha(&app, addr, alpha).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Order the panel out after fading to transparent (~120ms). Focus returns
+/// to the prior app automatically because the app was never activated. The
+/// state machine has already transitioned (click-through is on), so the
+/// fading window never intercepts input; a stale epoch aborts mid-fade and
+/// leaves the newer show in control.
+pub fn hide(app: &AppHandle) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let epoch = FADE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let panel = panel(app)?;
+    let addr = ns_window_addr(app)?;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for step in (0..FADE_STEPS).rev() {
+            if FADE_EPOCH.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            let alpha = f64::from(step) / f64::from(FADE_STEPS);
+            if set_alpha(&app, addr, alpha).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                FADE_OUT_MS / FADE_STEPS as u64,
+            ))
+            .await;
+        }
+        if FADE_EPOCH.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        let _ = app.run_on_main_thread(move || {
+            let window = unsafe { &*(addr as *const objc2_app_kit::NSWindow) };
+            panel.hide();
+            // Reset so the next non-faded path (yield_key_focus's raw
+            // hide/orderFront) never encounters a transparent window.
+            window.setAlphaValue(1.0);
+        });
+    });
+    Ok(())
 }
 
 /// Make the panel key so it accepts typing (visible-focused state). Because

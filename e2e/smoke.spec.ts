@@ -100,12 +100,18 @@ test("a docked drawer's chat transcript flex-fills the panel height", async ({ p
   await expect(messages).toBeVisible();
   const panelBox = await page.locator(".overlay-panel").boundingBox();
   const messagesBox = await messages.boundingBox();
-  if (!panelBox || !messagesBox) throw new Error("panel/messages not laid out");
+  const inputBox = await page.locator(".overlay-input-row").boundingBox();
+  if (!panelBox || !messagesBox || !inputBox) throw new Error("panel/messages not laid out");
   // Grew past the floating-mode cap (40vh of the default 720px viewport = 288).
   expect(messagesBox.height).toBeGreaterThan(0.4 * 720);
-  // And its bottom edge reaches the panel's, minus the panel padding.
-  const gap = panelBox.y + panelBox.height - (messagesBox.y + messagesBox.height);
-  expect(gap).toBeLessThan(40);
+  // Bottom-anchored input layout: the transcript ends just above the input
+  // row, and the input row (plus the model footer under it) hugs the panel
+  // bottom — the leftover vertical space is still all chat.
+  // (Banners/attach affordances may legitimately sit between them, so only
+  // the ordering is asserted, not a tight gap.)
+  expect(messagesBox.y + messagesBox.height).toBeLessThanOrEqual(inputBox.y + 1);
+  const bottomGap = panelBox.y + panelBox.height - (inputBox.y + inputBox.height);
+  expect(bottomGap).toBeLessThan(80);
 });
 
 test("overlay input accepts keyboard text", async ({ page }) => {
@@ -125,4 +131,25 @@ test("failed backend calls degrade silently instead of crashing", async ({ page 
   // No error banner and no stray chat messages on a cold load either.
   await expect(page.locator(".chat-banner")).toHaveCount(0);
   await expect(page.locator(".chat-messages")).toHaveCount(0);
+});
+
+test("an empty chat centers the composer; the first message bottom-anchors it", async ({ page }) => {
+  // Spotlight posture: before any message the input cluster floats at the
+  // vertical center of the full-height drawer; submitting moves it to the
+  // bottom (covered by the flex-fill test above).
+  await page.goto("/?edge=right");
+  const panelBox = await page.locator(".overlay-panel").boundingBox();
+  const composerBox = await page.locator(".overlay-composer").boundingBox();
+  if (!panelBox || !composerBox) throw new Error("panel/composer not laid out");
+  const panelCenter = panelBox.y + panelBox.height / 2;
+  const composerCenter = composerBox.y + composerBox.height / 2;
+  expect(Math.abs(composerCenter - panelCenter)).toBeLessThan(panelBox.height * 0.2);
+
+  // First message: the composer drops to the bottom region of the panel.
+  const input = page.getByLabel("Overlay input");
+  await input.fill("anchor me");
+  await input.press("Enter");
+  const anchored = await page.locator(".overlay-composer").boundingBox();
+  if (!anchored) throw new Error("composer vanished after submit");
+  expect(anchored.y + anchored.height).toBeGreaterThan(panelBox.y + panelBox.height * 0.6);
 });

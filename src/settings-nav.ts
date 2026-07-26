@@ -19,6 +19,7 @@ export type SectionId =
   | "mcp"
   | "nudges"
   | "overlay"
+  | "programs"
   | "status";
 
 export interface SectionEntry {
@@ -71,6 +72,7 @@ export const SECTION_GROUPS: SectionGroup[] = [
   {
     title: "System",
     entries: [
+      { id: "programs", label: "Programs", keywords: "inventory apps tools installed cli path scan" },
       { id: "status", label: "Status", keywords: "hotkey autostart login shortcut" },
     ],
   },

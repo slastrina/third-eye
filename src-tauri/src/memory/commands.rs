@@ -320,6 +320,47 @@ pub fn set_memory_retention(app: tauri::AppHandle, retention: String) -> MemoryR
     }
 }
 
+/// Start a fresh chat session (computer-control I3): the overlay's New-chat
+/// control. Subsequent exchanges append here; resolves with the new id.
+#[tauri::command]
+pub fn chat_new_session(memory: State<'_, MemoryState>) -> Result<i64, MemoryError> {
+    let store = require_store(&memory)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let id = store.chat_session_create(now_ms)?;
+    memory.set_current_chat_session(id);
+    log::info!("memory: chat session {id} started (ipc)");
+    Ok(id)
+}
+
+/// Newest-first chat session summaries (memory window Chats tab). A
+/// non-empty `query` searches across stored transcript text.
+#[tauri::command]
+pub fn chat_sessions(
+    memory: State<'_, MemoryState>,
+    limit: Option<usize>,
+    query: Option<String>,
+) -> Result<Vec<crate::memory::store::ChatSessionSummary>, MemoryError> {
+    let store = require_store(&memory)?;
+    let limit = limit.unwrap_or(50).min(200);
+    match query.as_deref().map(str::trim) {
+        Some(q) if !q.is_empty() => store.chat_sessions_matching(q, limit),
+        _ => store.chat_sessions(limit),
+    }
+}
+
+/// One stored session's ordered transcript.
+#[tauri::command]
+pub fn chat_session_messages(
+    memory: State<'_, MemoryState>,
+    id: i64,
+) -> Result<Vec<crate::memory::store::ChatSessionMessage>, MemoryError> {
+    let store = require_store(&memory)?;
+    store.chat_session_messages(id)
+}
+
 /// Memory health snapshot — never rejects (health-as-value, R006). Safe to
 /// poll from any surface.
 #[tauri::command]

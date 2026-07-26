@@ -1459,6 +1459,114 @@ pub fn parse_memory_retention(value: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// Store key for the terminal-commands gate (computer-control I2). Default
+/// OFF and fail-safe-off on garbage — run_command is the most powerful
+/// actuator in the app, so it follows the capture toggles' posture, not the
+/// chat-memory inversion.
+pub const COMMANDS_ENABLED_KEY: &str = "commandsEnabled";
+
+/// Read the persisted commands toggle. `None` = nothing usable persisted:
+/// the caller keeps the default (OFF).
+pub fn load_commands_enabled(app: &AppHandle) -> Option<bool> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
+            return None;
+        }
+    };
+    let value = store.get(COMMANDS_ENABLED_KEY)?;
+    Some(match value {
+        serde_json::Value::Bool(b) => b,
+        other => {
+            log::warn!(
+                "config: {COMMANDS_ENABLED_KEY} holds non-boolean value {other}; treating as off"
+            );
+            false
+        }
+    })
+}
+
+/// Persist the commands toggle. The error names the failed persist path.
+pub fn save_commands_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(COMMANDS_ENABLED_KEY, serde_json::json!(enabled));
+    store.save().map_err(|e| {
+        format!("failed to persist {COMMANDS_ENABLED_KEY}={enabled} to {path}: {e}")
+    })?;
+    log::info!("config: persisted {COMMANDS_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Store key for the persistent command allowlist (computer-control,
+/// user request 2026-07-26): commands matching an entry run WITHOUT an
+/// approval prompt while the commands gate is enabled. User-defined in
+/// Settings; matching is exact-or-token-prefix (command_runner).
+pub const COMMAND_ALLOWLIST_KEY: &str = "commandAllowlist";
+
+/// Read the persisted allowlist. Garbage-tolerant: a non-array value or
+/// non-string entries are dropped with a warning (never invent grants);
+/// entries are trimmed and de-duplicated preserving order.
+pub fn load_command_allowlist(app: &AppHandle) -> Vec<String> {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        log::error!(
+            "config: failed to open settings store at {}",
+            store_path(app)
+        );
+        return Vec::new();
+    };
+    let Some(value) = store.get(COMMAND_ALLOWLIST_KEY) else {
+        return Vec::new();
+    };
+    sanitize_command_allowlist(&value)
+}
+
+/// Interpret one stored allowlist value (pure, unit-tested).
+pub fn sanitize_command_allowlist(value: &serde_json::Value) -> Vec<String> {
+    let Some(items) = value.as_array() else {
+        log::warn!("config: {COMMAND_ALLOWLIST_KEY} holds a non-array value; treating as empty");
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| match item.as_str() {
+            Some(s) => {
+                let trimmed = s.trim();
+                (!trimmed.is_empty() && seen.insert(trimmed.to_string()))
+                    .then(|| trimmed.to_string())
+            }
+            None => {
+                log::warn!("config: {COMMAND_ALLOWLIST_KEY} entry is not a string; dropped");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Persist the allowlist (already sanitized by the caller).
+pub fn save_command_allowlist(app: &AppHandle, entries: &[String]) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(COMMAND_ALLOWLIST_KEY, serde_json::json!(entries));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {COMMAND_ALLOWLIST_KEY} to {path}: {e}"))?;
+    log::info!(
+        "config: persisted {COMMAND_ALLOWLIST_KEY} ({} entries) to {path}",
+        entries.len()
+    );
+    Ok(())
+}
+
 /// The retention window in milliseconds; `None` for "forever" (never prune)
 /// AND for out-of-contract values — garbage must never widen deletion.
 pub fn memory_retention_window_ms(retention: &str) -> Option<i64> {
@@ -1536,6 +1644,18 @@ mod tests {
         assert_eq!(parse_memory_retention("60d"), None);
         assert_eq!(parse_memory_retention(""), None);
         assert_eq!(parse_memory_retention("Forever"), None); // case-sensitive wire contract
+    }
+
+    #[test]
+    fn command_allowlist_sanitizer_drops_garbage_and_dedupes() {
+        let value = serde_json::json!(["date", "  date  ", "", 42, "curl -s ifconfig.me"]);
+        assert_eq!(
+            sanitize_command_allowlist(&value),
+            vec!["date".to_string(), "curl -s ifconfig.me".to_string()]
+        );
+        // Non-array garbage must never invent grants.
+        assert!(sanitize_command_allowlist(&serde_json::json!("date")).is_empty());
+        assert!(sanitize_command_allowlist(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

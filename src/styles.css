@@ -1274,3 +1274,266 @@ body,
   align-items: flex-start;
   gap: 8px;
 }
+
+/* --- Terminal block (computer-control I2): every run_command in the
+   transcript, monospace, with its bounded output preview. ---------------- */
+
+.chat-terminal {
+  margin: 6px 0;
+  border: 1px solid var(--te-line-strong);
+  border-radius: var(--te-r-sm);
+  background: rgba(2, 8, 24, 0.55);
+  overflow: hidden;
+}
+.chat-terminal[data-ok="false"] {
+  border-color: var(--te-red-border);
+}
+
+.chat-terminal-cmd {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 10px;
+  font-family: var(--te-font-mono);
+  font-size: 12px;
+  color: var(--te-text);
+  border-bottom: 1px solid var(--te-line);
+}
+.chat-terminal-prompt {
+  color: var(--te-green);
+  flex: none;
+}
+.chat-terminal-running {
+  margin-left: auto;
+  font-family: var(--te-font);
+  font-size: 10.5px;
+  color: var(--te-amber);
+}
+.chat-terminal-failed {
+  margin-left: auto;
+  font-family: var(--te-font);
+  font-size: 10.5px;
+  color: var(--te-red-soft);
+}
+
+.chat-terminal-out {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--te-font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--te-text-mid);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.overlay-new-chat {
+  appearance: none;
+  border: 1px solid var(--te-line-strong);
+  background: none;
+  margin: 0;
+  flex: none;
+  font-family: var(--te-font);
+  font-size: 11px;
+  color: var(--te-text-mid);
+  border-radius: var(--te-r-pill);
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.overlay-new-chat:hover {
+  color: var(--te-text-strong);
+  border-color: rgba(255, 255, 255, 0.3);
+  background: var(--te-fill-hover);
+}
+
+/* --- Approval prompt (gate ↔ overlay): a pending HID / run_command / MCP
+   action parked on the user's verdict. Amber = "holds your input". -------- */
+
+.approval-prompt {
+  margin-top: 8px;
+  border: 1px solid var(--te-amber-border);
+  background: rgba(233, 162, 59, 0.08);
+  border-radius: var(--te-r-md);
+  padding: 10px 12px;
+  animation: te-in 0.18s ease;
+}
+
+.approval-prompt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 9px;
+}
+.approval-prompt-text strong {
+  font-size: 12.5px;
+  color: var(--te-amber);
+}
+.approval-prompt-summary {
+  font-family: var(--te-font-mono);
+  font-size: 12px;
+  color: var(--te-text);
+  word-break: break-all;
+}
+
+.approval-prompt-actions {
+  display: flex;
+  gap: 6px;
+}
+.approval-prompt-actions button {
+  appearance: none;
+  margin: 0;
+  font-family: var(--te-font);
+  font-size: 12px;
+  border-radius: var(--te-r-pill);
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.approval-allow {
+  background: var(--te-green);
+  border: 1px solid var(--te-green);
+  color: var(--te-navy);
+  font-weight: 600;
+}
+.approval-allow:hover {
+  background: var(--te-green-hover);
+}
+.approval-always {
+  background: transparent;
+  border: 1px solid var(--te-line-strong);
+  color: var(--te-text);
+}
+.approval-always:hover {
+  background: var(--te-fill-hover);
+}
+.approval-deny {
+  background: transparent;
+  border: 1px solid var(--te-red-border);
+  color: var(--te-red-soft);
+  margin-left: auto;
+}
+.approval-deny:hover {
+  background: var(--te-red-glow);
+}
+
+/* Input row lives at the panel bottom (chats scroll downward); when a
+   transcript is present, a hairline separates it from the input. */
+.chat-messages ~ .overlay-composer .overlay-input-row {
+  border-top: 1px solid var(--te-line);
+  margin-top: 8px;
+  padding-top: 10px;
+}
+
+/* The composer cluster (approvals, notices, attach, input) stacks as one
+   block so an empty chat can center it. */
+.overlay-composer {
+  display: flex;
+  flex-direction: column;
+}
+
+/* New/empty chat (Spotlight posture): the floating panel centers vertically
+   in the window; the first message anchors it back to 15vh-from-top with
+   the input at the panel bottom. */
+.overlay-root[data-empty-chat]:not([data-edge]) {
+  align-items: center;
+  padding-top: 16px;
+}
+
+/* Full-height drawer, empty chat: center the composer between the drag
+   handle and the model footer (the two auto margins split the free space). */
+.overlay-root[data-edge][data-empty-chat] .overlay-composer {
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+/* Borderless dialogs drag by their headers (overlay drag-handle idiom). */
+.settings-header {
+  cursor: move;
+}
+
+/* Programs pane (inventory browser). */
+.settings-hint-inline {
+  color: rgba(255, 255, 255, 0.45);
+  font-weight: 400;
+}
+.programs-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.programs-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 12.5px;
+}
+.programs-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.programs-kind {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid var(--te-line-strong);
+  border-radius: var(--te-r-pill);
+  padding: 1px 7px;
+  color: var(--te-text-dim);
+}
+.programs-kind[data-kind="app"] {
+  color: var(--te-green);
+  border-color: var(--te-green-border);
+}
+.programs-name {
+  color: var(--te-text);
+  flex: none;
+}
+.programs-path {
+  color: var(--te-text-ghost);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--te-font-mono);
+  font-size: 11px;
+}
+
+/* Command allowlist editor (Input Control pane). */
+.allowlist-editor {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.allowlist-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.allowlist-entry {
+  flex: 1;
+  font-family: var(--te-font-mono);
+  font-size: 12px;
+  color: var(--te-text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--te-line);
+  border-radius: var(--te-r-sm);
+  padding: 5px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.allowlist-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.allowlist-add input {
+  flex: 1;
+}

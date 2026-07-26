@@ -7,15 +7,24 @@
 import { useEffect, useReducer, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  onHidApprovalRequest,
+  onHidApprovalResolved,
   onLlmToolCall,
   onLlmToolResult,
+  onMcpApprovalRequest,
+  onMcpApprovalResolved,
   onRunState,
+  respondHidApproval,
+  respondMcpApproval,
   runState,
   stopChat,
+  type ApprovalVerdict,
+  type McpApprovalVerdict,
 } from "./chat";
 import {
   currentEntry,
   ghostTarget,
+  hudApprovalsPending,
   hudHeadline,
   hudProgress,
   hudReducer,
@@ -25,6 +34,7 @@ import {
 import { ActionTrail } from "./ui/ActionTrail";
 import { GhostIndicator } from "./ui/GhostIndicator";
 import { HudPill } from "./ui/HudPill";
+import { ApprovalCard } from "./ui/ApprovalCard";
 import "./hud.css";
 
 /** How long the terminal pill (Done / Stopped) lingers before dismissing. */
@@ -71,6 +81,17 @@ function useHudState() {
       onRunState((payload) => dispatch({ type: "run-state", phase: payload.phase })),
       onLlmToolCall((payload) => dispatch({ type: "tool-call", payload })),
       onLlmToolResult((payload) => dispatch({ type: "tool-result", payload })),
+      // Approval prompts mirror into the HUD so a hidden overlay never
+      // leaves an action parked invisibly; resolutions (answered anywhere,
+      // or timed out) clear the card.
+      onHidApprovalRequest((request) => dispatch({ type: "hid-approval", request })),
+      onMcpApprovalRequest((request) => dispatch({ type: "mcp-approval", request })),
+      onHidApprovalResolved((payload) =>
+        dispatch({ type: "approval-resolved", approvalId: payload.approvalId }),
+      ),
+      onMcpApprovalResolved((payload) =>
+        dispatch({ type: "approval-resolved", approvalId: payload.approvalId }),
+      ),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("hud: event subscription failed:", err));
@@ -98,8 +119,10 @@ function useHudState() {
 export function HudPillView() {
   const hud = useHudState();
   // Input transparency is the HUD's job: pill appears once the run announces
-  // an input_action; earlier non-input calls are already in the trail then.
-  const shouldShow = hudVisible(hud) && hud.entries.some((entry) => entry.input);
+  // an input_action — or the moment ANY approval parks (a gated focus_app
+  // has no input entry yet, but the user must still see the ask).
+  const shouldShow =
+    (hudVisible(hud) && hud.entries.some((entry) => entry.input)) || hudApprovalsPending(hud);
   const shownRef = useRef(false);
   useEffect(() => {
     if (shouldShow === shownRef.current) return;
@@ -111,6 +134,18 @@ export function HudPillView() {
 
   if (!shouldShow) return null;
   const live = hud.phase === "live";
+  // Fire-and-forget verdicts; the backend's resolved broadcast clears the
+  // card in every window (including this one).
+  const answerHid = (approvalId: number, verdict: ApprovalVerdict) => {
+    respondHidApproval(approvalId, verdict).catch((err) =>
+      console.warn("hud: respond_hid_approval failed:", err),
+    );
+  };
+  const answerMcp = (approvalId: number, verdict: McpApprovalVerdict) => {
+    respondMcpApproval(approvalId, verdict).catch((err) =>
+      console.warn("hud: respond_mcp_approval failed:", err),
+    );
+  };
   return (
     <div className="hud-pill-root">
       <HudPill
@@ -125,6 +160,26 @@ export function HudPillView() {
             : undefined
         }
       />
+      {hud.hidApprovals.map((request) => (
+        <ApprovalCard
+          key={request.approvalId}
+          title="Third Eye wants to act"
+          summary={request.summary}
+          onAllowOnce={() => answerHid(request.approvalId, "allow-once")}
+          onAllowAlways={() => answerHid(request.approvalId, "allow-kind")}
+          onDeny={() => answerHid(request.approvalId, "deny")}
+        />
+      ))}
+      {hud.mcpApprovals.map((request) => (
+        <ApprovalCard
+          key={request.approvalId}
+          title={`External tool: ${request.toolName}`}
+          summary={request.summary}
+          onAllowOnce={() => answerMcp(request.approvalId, "allow-once")}
+          onAllowAlways={() => answerMcp(request.approvalId, "allow-tool")}
+          onDeny={() => answerMcp(request.approvalId, "deny")}
+        />
+      ))}
       <ActionTrail
         items={hud.entries.map((entry) => ({
           id: entry.callId,

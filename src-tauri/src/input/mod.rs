@@ -158,6 +158,12 @@ pub enum ActionKind {
     /// enigo event), but it is HID-class: gated through the same `ApprovalGate`
     /// and grantable ("Always allow this kind") via the session whitelist.
     FocusApp,
+    /// Execute a terminal command — the `run_command` tool's action kind
+    /// (computer-control I2). No [`InputAction`] payload (not an enigo
+    /// event) and gated by its OWN structural switch (`commandsEnabled`,
+    /// default OFF) plus per-command approval through the same prompt/
+    /// whitelist plumbing; the approval summary is the exact command line.
+    RunCommand,
 }
 
 /// Which mouse button an action targets. Kebab-case in JSON to match the rest

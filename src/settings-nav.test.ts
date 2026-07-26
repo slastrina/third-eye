@@ -27,6 +27,7 @@ describe("SECTION_GROUPS", () => {
         "nudges",
         "overlay",
         "privacy",
+        "programs",
         "status",
         "watcher",
       ].sort(),

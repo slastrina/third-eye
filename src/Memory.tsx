@@ -3,7 +3,14 @@
 // fires the IPC). Opened from the tray panel; closes via hide_memory_window.
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { memoryRetention } from "./chat";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  chatSessionMessages,
+  chatSessions,
+  memoryRetention,
+  type ChatSessionMessage,
+  type ChatSessionSummary,
+} from "./chat";
 import {
   memoryDelete,
   memoryList,
@@ -34,6 +41,11 @@ export function MemoryWindow() {
   const [recallQuery, setRecallQuery] = useState("");
   const [recallBusy, setRecallBusy] = useState(false);
   const [recall, setRecall] = useState<SearchOutcome | null>(null);
+  // Chats tab (I3): stored sessions + the opened transcript. null = the
+  // list/transcript hasn't loaded (or IPC is unavailable) — honest empty.
+  const [sessions, setSessions] = useState<ChatSessionSummary[] | null>(null);
+  const [openSession, setOpenSession] = useState<number | null>(null);
+  const [transcript, setTranscript] = useState<ChatSessionMessage[] | null>(null);
 
   const refresh = () => {
     memoryList(PAGE_SIZE, 0).then(
@@ -65,6 +77,19 @@ export function MemoryWindow() {
     };
   }, []);
 
+  // Drag the borderless window by its header dead space; interactive
+  // children (close, filter) keep their events.
+  const startWindowDrag = (event: React.MouseEvent) => {
+    if ((event.target as HTMLElement).closest("button, input, select, a")) return;
+    try {
+      getCurrentWindow()
+        .startDragging()
+        .catch((err) => console.debug("memory-window: drag no-op:", err));
+    } catch (err) {
+      console.debug("memory-window: drag unavailable:", err);
+    }
+  };
+
   const close = () => {
     invoke("hide_memory_window").catch((err) =>
       console.debug("memory-window: hide unavailable:", err),
@@ -74,6 +99,28 @@ export function MemoryWindow() {
   const forget = (id: number) => {
     memoryDelete(id).then(refresh, (err) =>
       console.debug("memory-window: memory_delete failed:", err),
+    );
+  };
+
+  useEffect(() => {
+    if (tab !== "chats") return;
+    // The header filter doubles as a transcript search here: a non-empty
+    // query matches across every stored message, not just titles.
+    chatSessions(50, filter.trim() || undefined).then(
+      (list) => setSessions(list),
+      (err) => {
+        console.debug("memory-window: chat_sessions unavailable:", err);
+        setSessions(null);
+      },
+    );
+  }, [tab, filter]);
+
+  const openTranscript = (id: number) => {
+    setOpenSession(id);
+    setTranscript(null);
+    chatSessionMessages(id).then(
+      (messages) => setTranscript(messages),
+      (err) => console.debug("memory-window: chat_session_messages unavailable:", err),
     );
   };
 
@@ -100,14 +147,14 @@ export function MemoryWindow() {
   return (
     <div className="memwin-root">
       <Panel variant="solid" className="memwin-card">
-        <div className="memwin-header">
+        <div className="memwin-header" onMouseDown={startWindowDrag}>
           <button type="button" className="memwin-close" aria-label="Close" onClick={close} />
           <EyeIcon state="watching" size={26} stroke="#ffffff" />
           <span className="memwin-title">Memory</span>
           <input
             className="memwin-filter"
             type="text"
-            placeholder="Filter moments…"
+            placeholder={tab === "chats" ? "Search chats…" : "Filter moments…"}
             aria-label="Filter moments"
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
@@ -187,6 +234,63 @@ export function MemoryWindow() {
                       </button>
                     </div>
                   </div>
+                ))}
+              </div>
+            ))}
+
+          {tab === "chats" &&
+            (openSession !== null ? (
+              <div className="memwin-transcript">
+                <button
+                  type="button"
+                  className="memwin-back"
+                  onClick={() => {
+                    setOpenSession(null);
+                    setTranscript(null);
+                  }}
+                >
+                  ← All chats
+                </button>
+                {transcript === null ? (
+                  <p className="memwin-empty">Loading transcript…</p>
+                ) : transcript.length === 0 ? (
+                  <p className="memwin-empty">This chat has no stored messages.</p>
+                ) : (
+                  transcript.map((message, index) => (
+                    <div
+                      key={index}
+                      className="memwin-bubble"
+                      data-role={message.role}
+                    >
+                      {message.text}
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : sessions === null ? (
+              <p className="memwin-empty">Chat history is unavailable outside the app.</p>
+            ) : sessions.length === 0 ? (
+              <p className="memwin-empty">
+                {filter.trim() ? "No chat mentions that." : "No chats stored yet."}
+              </p>
+            ) : (
+              <div className="memwin-timeline">
+                {sessions.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className="memwin-row memwin-session"
+                    onClick={() => openTranscript(session.id)}
+                  >
+                    <span className="memwin-row-time">
+                      {new Date(session.lastAtMs).toLocaleDateString()}
+                    </span>
+                    <span className="memwin-row-dot" aria-hidden="true" />
+                    <span className="memwin-row-text">{session.title}</span>
+                    <span className="memwin-row-dur">
+                      {session.messageCount} message{session.messageCount === 1 ? "" : "s"}
+                    </span>
+                  </button>
                 ))}
               </div>
             ))}

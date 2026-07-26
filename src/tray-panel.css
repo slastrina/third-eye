@@ -118,3 +118,37 @@
 .tray-panel-actions > * {
   flex: 1;
 }
+
+/* Permission health — front and center when a grant is missing. */
+.tray-panel-issue {
+  margin: 10px 10px 0;
+  border: 1px solid var(--te-amber-border);
+  background: rgba(233, 162, 59, 0.1);
+  border-radius: var(--te-r-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tray-panel-issue-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tray-panel-issue-text strong {
+  font-size: 12.5px;
+  color: var(--te-amber);
+}
+.tray-panel-issue-text span {
+  font-size: 11.5px;
+  color: var(--te-text);
+  line-height: 1.45;
+}
+.tray-panel-issue .te-btn {
+  align-self: flex-start;
+}
+
+.tray-panel-card {
+  max-height: 100%;
+  overflow-y: auto;
+}

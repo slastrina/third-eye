@@ -11,6 +11,7 @@
 // to a plain persisted off — the sub-line derives from `pausedUntil`, which
 // does not survive restart, so the UI never claims a resume it can't keep.
 
+import type { CapturePermission, HidArmedStatus } from "./chat";
 import type { WatcherStatus } from "./watcher-state";
 import type { MemoryStatus, MemoryRecord } from "./memory-state";
 
@@ -46,6 +47,10 @@ export interface TrayPanelViewState {
   memoriesStored: number | null;
   /** Latest stored memories (newest first) for the LATEST section. */
   latest: MemoryRecord[];
+  /** Live permission snapshots (null until the mount queries land). The
+   *  panel's front-and-center health check derives from these. */
+  capturePermission: CapturePermission | null;
+  inputPermission: { granted: boolean; supported: boolean } | null;
 }
 
 export const initialTrayPanelState: TrayPanelViewState = {
@@ -53,6 +58,8 @@ export const initialTrayPanelState: TrayPanelViewState = {
   pausedUntil: null,
   memoriesStored: null,
   latest: [],
+  capturePermission: null,
+  inputPermission: null,
 };
 
 export type TrayPanelAction =
@@ -60,7 +67,10 @@ export type TrayPanelAction =
   | { type: "memory"; status: MemoryStatus }
   | { type: "latest"; records: MemoryRecord[] }
   // The user chose a pause option; `now` injected for testability.
-  | { type: "paused"; choice: PauseChoice; now: number };
+  | { type: "paused"; choice: PauseChoice; now: number }
+  // Live permission snapshots (capture_permission_status / hid_armed_status).
+  | { type: "capture-permission"; permission: CapturePermission }
+  | { type: "hid-status"; status: HidArmedStatus };
 
 export function trayPanelReducer(
   state: TrayPanelViewState,
@@ -77,6 +87,10 @@ export function trayPanelReducer(
       return { ...state, memoriesStored: action.status.count };
     case "latest":
       return { ...state, latest: action.records };
+    case "capture-permission":
+      return { ...state, capturePermission: action.permission };
+    case "hid-status":
+      return { ...state, inputPermission: action.status.permission };
     case "paused": {
       const ms = pauseMs(action.choice);
       return { ...state, watching: false, pausedUntil: ms === null ? null : action.now + ms };
@@ -101,6 +115,37 @@ export function traySub(state: TrayPanelViewState, now: number): string {
   if (state.pausedUntil === null) return "resumes when you say so";
   const minutes = Math.max(1, Math.round((state.pausedUntil - now) / 60000));
   return `resumes in ~${minutes} min`;
+}
+
+/** One actionable permission problem for the panel's health section. */
+export interface PermissionIssue {
+  key: "screen" | "input";
+  title: string;
+  detail: string;
+}
+
+/** Every permission that is supported on this platform but not granted to
+ *  the RUNNING binary — the front-and-center list. Unknown (null) snapshots
+ *  claim nothing; unsupported platforms have nothing to grant. */
+export function permissionIssues(state: TrayPanelViewState): PermissionIssue[] {
+  const issues: PermissionIssue[] = [];
+  if (state.capturePermission?.supported && !state.capturePermission.granted) {
+    issues.push({
+      key: "screen",
+      title: "Screen Recording is not granted",
+      detail:
+        "Watching and screen reading are blind. Grant it, then RELAUNCH Third Eye — macOS only applies this one at startup.",
+    });
+  }
+  if (state.inputPermission?.supported && !state.inputPermission.granted) {
+    issues.push({
+      key: "input",
+      title: "Accessibility is not granted",
+      detail:
+        "Mouse and keyboard control stay off. After a rebuild, remove and re-add Third Eye in the list — toggling a stale entry is not enough.",
+    });
+  }
+  return issues;
 }
 
 /** The eye's state for the header. */

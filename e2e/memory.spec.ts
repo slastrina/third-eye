@@ -123,6 +123,11 @@ async function installMemoryIpcMock(
                 count: records.length,
                 dbPath: "/mock/memory.db",
                 ingest: seed.ingest,
+                // The real MemoryStatus always carries the chat-ingest half
+                // (M008 S03); omitting it crashes the pane's unconditional
+                // `status.chatIngest.ingestedCount` read and takes the whole
+                // settings view down with it.
+                chatIngest: { buffered: 0, ingestedCount: 0, lastError: null, enabled: true },
               });
             default:
               return Promise.reject(`mock: no such command ${cmd}`);
@@ -185,7 +190,9 @@ test("empty store shows the hint and hides pager and wipe controls", async ({ pa
   await installMemoryIpcMock(page, { records: [] });
   await page.goto("/?view=settings&section=memory");
   const memory = section(page);
-  await expect(memory.locator(".settings-hint")).toHaveText("No memories stored yet");
+  // The pane now carries several hints (retention, chat count); assert the
+  // empty-state one specifically.
+  await expect(memory.getByText("No memories stored yet")).toBeVisible();
   await expect(memory.locator(".memory-row")).toHaveCount(0);
   await expect(memory.locator(".memory-pager")).toHaveCount(0);
   await expect(memory.getByRole("button", { name: "Wipe all memories" })).toHaveCount(0);
@@ -376,7 +383,9 @@ test("wipe-all is two-step and lands on the Cleared notice then the empty state"
   const notice = memory.locator(".settings-notice");
   await expect(notice).toContainText("Cleared 3 memories");
   await expect(memory.locator(".memory-row")).toHaveCount(0);
-  await expect(memory.locator(".settings-hint")).toHaveText("No memories stored yet");
+  // The pane now carries several hints (retention, chat count); assert the
+  // empty-state one specifically.
+  await expect(memory.getByText("No memories stored yet")).toBeVisible();
   await expect(memory.locator(".settings-status-row", { hasText: "Stored memories" })).toContainText("0");
   await notice.getByRole("button", { name: "Dismiss" }).click();
   await expect(memory.locator(".settings-notice")).toHaveCount(0);

@@ -72,6 +72,49 @@ pub struct MemoryRecord {
     pub source: MemorySource,
 }
 
+/// One cached machine-inventory entry (computer-control I1): a GUI app
+/// bundle (`kind: "app"`) or a PATH executable (`kind: "cli"`). Serialized
+/// camelCase for the `inventory_search` IPC and the find_programs tool.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub refreshed_at_ms: i64,
+}
+
+/// One chat session's list row (computer-control I3). Serialized camelCase
+/// for the `chat_sessions` IPC.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionSummary {
+    pub id: i64,
+    pub started_at_ms: i64,
+    pub last_at_ms: i64,
+    /// First user line, truncated — derivable, never invented.
+    pub title: String,
+    pub message_count: usize,
+}
+
+/// One transcript line of a stored chat session.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionMessage {
+    pub role: String,
+    pub text: String,
+    pub at_ms: i64,
+}
+
+/// What one inventory scan produces per program found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewInventoryEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub refreshed_at_ms: i64,
+}
+
 /// Input for [`MemoryStore::insert`] — everything the distiller (T03)
 /// produces for one memory. `embedding` is optional: keyword-only rows are
 /// valid and get embedded lazily (T02).
@@ -128,6 +171,25 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF summary ON memories
         VALUES ('delete', old.id, old.summary);
     INSERT INTO memories_fts(rowid, summary) VALUES (new.id, new.summary);
 END;
+CREATE TABLE IF NOT EXISTS inventory (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    refreshed_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at_ms INTEGER NOT NULL,
+    last_at_ms    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_session_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    at_ms      INTEGER NOT NULL
+);
 ";
 
 const RECORD_COLUMNS: &str =
@@ -311,6 +373,236 @@ impl MemoryStore {
         let removed = self.lock().execute("DELETE FROM memories", [])?;
         log::info!("memory: wiped {removed} rows");
         Ok(removed)
+    }
+
+    /// Replace the whole machine inventory in one transaction (computer-
+    /// control I1): the refresh loop's atomic wipe+refill, so readers never
+    /// see a half-scanned cache. Returns how many entries landed.
+    pub fn inventory_replace(&self, entries: &[NewInventoryEntry]) -> Result<usize, MemoryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM inventory", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO inventory (name, path, kind, refreshed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for entry in entries {
+                stmt.execute(params![
+                    entry.name,
+                    entry.path,
+                    entry.kind,
+                    entry.refreshed_at_ms
+                ])?;
+            }
+        }
+        tx.commit()?;
+        log::info!("inventory: cache replaced with {} entries", entries.len());
+        Ok(entries.len())
+    }
+
+    /// Case-insensitive name-substring search over the inventory, GUI apps
+    /// ranked before CLI tools, then by name. An empty query lists from the
+    /// top (bounded by `limit`).
+    pub fn inventory_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<InventoryEntry>, MemoryError> {
+        let pattern = format!("%{}%", query.trim());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name, path, kind, refreshed_at_ms FROM inventory
+             WHERE name LIKE ?1 COLLATE NOCASE
+             ORDER BY (kind = 'app') DESC, name COLLATE NOCASE
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |row| {
+                Ok(InventoryEntry {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    kind: row.get(2)?,
+                    refreshed_at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Inventory health: `(apps, cli tools, last refresh ms)` — the last
+    /// refresh is `None` until a first scan lands.
+    pub fn inventory_counts(&self) -> Result<(usize, usize, Option<i64>), MemoryError> {
+        let conn = self.lock();
+        let apps: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inventory WHERE kind = 'app'",
+            [],
+            |row| row.get(0),
+        )?;
+        let tools: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inventory WHERE kind = 'cli'",
+            [],
+            |row| row.get(0),
+        )?;
+        let last: Option<i64> =
+            conn.query_row("SELECT MAX(refreshed_at_ms) FROM inventory", [], |row| {
+                row.get(0)
+            })?;
+        Ok((apps as usize, tools as usize, last))
+    }
+
+    /// Start a new chat session (computer-control I3); returns its id.
+    pub fn chat_session_create(&self, now_ms: i64) -> Result<i64, MemoryError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO chat_sessions (started_at_ms, last_at_ms) VALUES (?1, ?1)",
+            params![now_ms],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Append one completed exchange (user ask + assistant answer) to a
+    /// session and bump its last-activity stamp. Raw transcript only — the
+    /// distilled-recall path is chat_ingest's, unchanged.
+    pub fn chat_append_exchange(
+        &self,
+        session_id: i64,
+        user: &str,
+        assistant: &str,
+        now_ms: i64,
+    ) -> Result<(), MemoryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Existence check first (SQLite does not enforce the REFERENCES
+        // clause without a pragma): a missing session is typed not-found
+        // and nothing is written.
+        let changed = tx.execute(
+            "UPDATE chat_sessions SET last_at_ms = ?2 WHERE id = ?1",
+            params![session_id, now_ms],
+        )?;
+        if changed == 0 {
+            return Err(MemoryError::NotFound { id: session_id });
+        }
+        tx.execute(
+            "INSERT INTO chat_session_messages (session_id, role, text, at_ms)
+             VALUES (?1, 'user', ?2, ?3)",
+            params![session_id, user, now_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO chat_session_messages (session_id, role, text, at_ms)
+             VALUES (?1, 'assistant', ?2, ?3)",
+            params![session_id, assistant, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Newest-first session summaries. `title` is the first user line
+    /// (truncated to 80 chars) — honest and derivable, never invented.
+    pub fn chat_sessions(&self, limit: usize) -> Result<Vec<ChatSessionSummary>, MemoryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.started_at_ms, s.last_at_ms,
+                    (SELECT text FROM chat_session_messages
+                     WHERE session_id = s.id AND role = 'user'
+                     ORDER BY id LIMIT 1),
+                    (SELECT COUNT(*) FROM chat_session_messages WHERE session_id = s.id)
+             FROM chat_sessions s
+             ORDER BY s.last_at_ms DESC, s.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let raw_title: Option<String> = row.get(3)?;
+                let title = raw_title
+                    .map(|t| {
+                        let t = t.trim().to_string();
+                        if t.chars().count() > 80 {
+                            format!("{}…", t.chars().take(80).collect::<String>())
+                        } else {
+                            t
+                        }
+                    })
+                    .unwrap_or_else(|| "(empty chat)".into());
+                Ok(ChatSessionSummary {
+                    id: row.get(0)?,
+                    started_at_ms: row.get(1)?,
+                    last_at_ms: row.get(2)?,
+                    title,
+                    message_count: row.get::<_, i64>(4)? as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Sessions whose title or ANY transcript line matches `query`
+    /// (case-insensitive substring), newest-activity-first — the Chats tab's
+    /// search across stored transcripts (the distilled recall layer already
+    /// has memory_search; this covers the raw text).
+    pub fn chat_sessions_matching(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatSessionSummary>, MemoryError> {
+        let pattern = format!("%{}%", query.trim());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.started_at_ms, s.last_at_ms,
+                    (SELECT text FROM chat_session_messages
+                     WHERE session_id = s.id AND role = 'user'
+                     ORDER BY id LIMIT 1),
+                    (SELECT COUNT(*) FROM chat_session_messages WHERE session_id = s.id)
+             FROM chat_sessions s
+             WHERE EXISTS (SELECT 1 FROM chat_session_messages m
+                           WHERE m.session_id = s.id
+                             AND m.text LIKE ?1 COLLATE NOCASE)
+             ORDER BY s.last_at_ms DESC, s.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |row| {
+                let raw_title: Option<String> = row.get(3)?;
+                let title = raw_title
+                    .map(|t| {
+                        let t = t.trim().to_string();
+                        if t.chars().count() > 80 {
+                            format!("{}…", t.chars().take(80).collect::<String>())
+                        } else {
+                            t
+                        }
+                    })
+                    .unwrap_or_else(|| "(empty chat)".into());
+                Ok(ChatSessionSummary {
+                    id: row.get(0)?,
+                    started_at_ms: row.get(1)?,
+                    last_at_ms: row.get(2)?,
+                    title,
+                    message_count: row.get::<_, i64>(4)? as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One session's transcript in order.
+    pub fn chat_session_messages(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<ChatSessionMessage>, MemoryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT role, text, at_ms FROM chat_session_messages
+             WHERE session_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(ChatSessionMessage {
+                    role: row.get(0)?,
+                    text: row.get(1)?,
+                    at_ms: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Retention enforcement (memoryRetention follow-up): delete memories
@@ -533,6 +825,84 @@ mod tests {
         assert_eq!(s.db_path(), Some(path.as_path()));
         drop(s);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_session_round_trip_with_titles_and_ordering() {
+        let s = store();
+        let a = s.chat_session_create(1_000).unwrap();
+        let b = s.chat_session_create(2_000).unwrap();
+        s.chat_append_exchange(a, "what's my ip?", "203.0.113.7", 3_000)
+            .unwrap();
+        s.chat_append_exchange(b, &"x".repeat(120), "long question answer", 4_000)
+            .unwrap();
+        // Newest-activity-first; titles derive from the first user line, the
+        // long one truncated with a marker; empty sessions get honest copy.
+        let c = s.chat_session_create(5_000).unwrap();
+        let sessions = s.chat_sessions(10).unwrap();
+        assert_eq!(
+            sessions.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![c, b, a]
+        );
+        assert_eq!(sessions[2].title, "what's my ip?");
+        assert!(sessions[1].title.ends_with('…'));
+        assert_eq!(sessions[0].title, "(empty chat)");
+        assert_eq!(sessions[2].message_count, 2);
+        // Transcript in order.
+        let transcript = s.chat_session_messages(a).unwrap();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].role, "user");
+        assert_eq!(transcript[1].text, "203.0.113.7");
+        // Appending to a missing session is typed not-found.
+        assert!(matches!(
+            s.chat_append_exchange(999, "q", "a", 6_000),
+            Err(MemoryError::NotFound { id: 999 })
+        ));
+    }
+
+    #[test]
+    fn chat_sessions_matching_searches_transcript_text() {
+        let s = store();
+        let a = s.chat_session_create(1_000).unwrap();
+        let b = s.chat_session_create(2_000).unwrap();
+        s.chat_append_exchange(a, "how do I prune tomatoes?", "Cut the suckers.", 3_000)
+            .unwrap();
+        s.chat_append_exchange(b, "what's my ip", "203.0.113.7", 4_000)
+            .unwrap();
+        // Matches assistant text too, case-insensitive; misses honestly.
+        let hits = s.chat_sessions_matching("SUCKERS", 10).unwrap();
+        assert_eq!(hits.iter().map(|x| x.id).collect::<Vec<_>>(), vec![a]);
+        assert!(s.chat_sessions_matching("lasagne", 10).unwrap().is_empty());
+        // A broad match returns newest-activity-first.
+        let all = s.chat_sessions_matching("", 10).unwrap();
+        assert_eq!(all.iter().map(|x| x.id).collect::<Vec<_>>(), vec![b, a]);
+    }
+
+    #[test]
+    fn inventory_replace_search_counts_round_trip() {
+        let s = store();
+        let entry = |name: &str, kind: &str| NewInventoryEntry {
+            name: name.into(),
+            path: format!("/x/{name}"),
+            kind: kind.into(),
+            refreshed_at_ms: 42,
+        };
+        s.inventory_replace(&[
+            entry("Google Chrome", "app"),
+            entry("chromedriver", "cli"),
+            entry("ffmpeg", "cli"),
+        ])
+        .unwrap();
+        // Case-insensitive substring, apps ranked before tools.
+        let hits = s.inventory_search("CHROME", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "Google Chrome");
+        assert_eq!(hits[0].kind, "app");
+        assert_eq!(s.inventory_counts().unwrap(), (1, 2, Some(42)));
+        // Replace is atomic wipe+refill — old rows vanish.
+        s.inventory_replace(&[entry("ffmpeg", "cli")]).unwrap();
+        assert_eq!(s.inventory_counts().unwrap(), (0, 1, Some(42)));
+        assert!(s.inventory_search("chrome", 10).unwrap().is_empty());
     }
 
     #[test]

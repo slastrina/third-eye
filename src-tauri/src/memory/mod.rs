@@ -51,6 +51,10 @@ pub struct MemoryState {
     embedder: OnceLock<Arc<dyn Embedder>>,
     /// Shared privacy-guard telemetry the guarded embedder records into.
     guard: Arc<GuardState>,
+    /// The chat session new exchanges append to (computer-control I3).
+    /// 0 = none yet — the first exchange creates one lazily; the
+    /// `chat_new_session` IPC starts a fresh one on demand.
+    current_chat_session: std::sync::atomic::AtomicI64,
 }
 
 impl Default for MemoryState {
@@ -69,7 +73,36 @@ impl MemoryState {
             chat_ingest: Arc::new(ChatIngestState::new()),
             embedder: OnceLock::new(),
             guard,
+            current_chat_session: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// The session new exchanges append to, creating one lazily on first
+    /// use. `None` when the store is unavailable or creation failed (logged
+    /// — the exchange simply goes unrecorded, never a chat failure).
+    pub fn ensure_chat_session(&self, store: &MemoryStore, now_ms: i64) -> Option<i64> {
+        use std::sync::atomic::Ordering;
+        let current = self.current_chat_session.load(Ordering::SeqCst);
+        if current > 0 {
+            return Some(current);
+        }
+        match store.chat_session_create(now_ms) {
+            Ok(id) => {
+                self.current_chat_session.store(id, Ordering::SeqCst);
+                log::info!("memory: chat session {id} started (lazy)");
+                Some(id)
+            }
+            Err(e) => {
+                log::warn!("memory: chat session create failed: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Point subsequent exchanges at a session (the `chat_new_session` IPC).
+    pub fn set_current_chat_session(&self, id: i64) {
+        self.current_chat_session
+            .store(id, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the opened store, exactly once. Returns `false` when one is

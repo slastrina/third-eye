@@ -21,8 +21,8 @@ const record = (over: Partial<MemoryRecord>): MemoryRecord => ({
 });
 
 describe("memory window helpers", () => {
-  it("exposes the three designed tabs in order", () => {
-    expect(MEMORY_TABS.map((tab) => tab.id)).toEqual(["timeline", "learned", "recall"]);
+  it("exposes the tabs in order (design three + Chats)", () => {
+    expect(MEMORY_TABS.map((tab) => tab.id)).toEqual(["timeline", "learned", "recall", "chats"]);
   });
 
   it("filters over summary and apps, case-insensitive; empty filter passes all", () => {

@@ -3,6 +3,7 @@ import type { WatcherStatus } from "./watcher-state";
 import type { MemoryStatus } from "./memory-state";
 import {
   PAUSE_OPTIONS,
+  permissionIssues,
   initialTrayPanelState,
   pauseMs,
   trayEye,
@@ -89,5 +90,41 @@ describe("tray panel reducer", () => {
       ],
     });
     expect(state.latest).toHaveLength(1);
+  });
+});
+
+
+describe("permission health", () => {
+  it("claims nothing while snapshots are unknown or unsupported", () => {
+    expect(permissionIssues(initialTrayPanelState)).toHaveLength(0);
+    const unsupported = trayPanelReducer(initialTrayPanelState, {
+      type: "capture-permission",
+      permission: { granted: false, supported: false },
+    });
+    expect(permissionIssues(unsupported)).toHaveLength(0);
+  });
+
+  it("lists exactly the supported-but-ungranted permissions", () => {
+    let state = trayPanelReducer(initialTrayPanelState, {
+      type: "capture-permission",
+      permission: { granted: false, supported: true },
+    });
+    state = trayPanelReducer(state, {
+      type: "hid-status",
+      status: {
+        armed: false,
+        mode: "off",
+        permission: { granted: false, supported: true },
+        error: null,
+      } as never,
+    });
+    const issues = permissionIssues(state);
+    expect(issues.map((i) => i.key)).toEqual(["screen", "input"]);
+    // A grant clears its issue.
+    state = trayPanelReducer(state, {
+      type: "capture-permission",
+      permission: { granted: true, supported: true },
+    });
+    expect(permissionIssues(state).map((i) => i.key)).toEqual(["input"]);
   });
 });

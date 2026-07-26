@@ -7,12 +7,16 @@ pub mod capture;
 #[cfg(desktop)]
 pub mod cloud;
 #[cfg(desktop)]
+pub mod command_runner;
+#[cfg(desktop)]
 pub mod config;
 #[cfg(desktop)]
 pub mod hotkey;
 #[cfg(desktop)]
 pub mod hud;
 pub mod input;
+#[cfg(desktop)]
+pub mod inventory;
 pub mod llm;
 #[cfg(desktop)]
 pub mod memory;
@@ -85,6 +89,10 @@ pub fn run() {
     // the stream/capture activity guards always find their counter.
     #[cfg(desktop)]
     let builder = builder.manage(tray::TrayActivity::new());
+    // Terminal-commands gate (computer-control I2): default OFF; the
+    // persisted value is applied in setup(), before any chat can run.
+    #[cfg(desktop)]
+    let builder = builder.manage(std::sync::Arc::new(command_runner::CommandState::new()));
     // settings.json (config.rs): the configurable hotkey persists here so a
     // rebind survives restart; S07 adds lane models and privacy mode.
     #[cfg(desktop)]
@@ -223,6 +231,21 @@ pub fn run() {
             memory::commands::set_chat_memory_enabled,
             memory::commands::memory_retention,
             memory::commands::set_memory_retention,
+            memory::commands::chat_new_session,
+            memory::commands::chat_sessions,
+            memory::commands::chat_session_messages,
+            #[cfg(desktop)]
+            command_runner::commands_status,
+            #[cfg(desktop)]
+            command_runner::set_commands_enabled,
+            #[cfg(desktop)]
+            command_runner::set_commands_allowlist,
+            #[cfg(desktop)]
+            inventory::inventory_status,
+            #[cfg(desktop)]
+            inventory::inventory_search,
+            #[cfg(desktop)]
+            inventory::refresh_inventory,
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
             settings_window::show_settings_window,
@@ -424,6 +447,16 @@ pub fn run() {
             // ingest::spawn; also re-runs on every retention write.
             #[cfg(desktop)]
             memory::commands::apply_retention(app.handle());
+
+            // Machine inventory (computer-control I1): first scan now, then
+            // every 24 h; refresh_inventory re-scans on demand.
+            #[cfg(desktop)]
+            inventory::spawn(app.handle());
+
+            // Terminal-commands gate: restore the persisted toggle before
+            // any chat can run (default OFF).
+            #[cfg(desktop)]
+            command_runner::apply_persisted(app.handle());
 
             // Nudge detector (S05): the observation broadcast's second
             // consumer. Batches on a fixed interval, classifies via the

@@ -72,6 +72,12 @@ pub const PRIVACY_STATE_EVENT: &str = "privacy://state";
 /// the `respond_hid_approval` IPC. The string half of the contract with
 /// `src/chat.ts` (pinned by a Rust test and its TS twin).
 pub const HID_APPROVAL_EVENT: &str = "hid://approval-request";
+/// Broadcast when a pending approval stops being pending — a verdict was
+/// delivered (from ANY window) or the gate timed out. Every surface showing
+/// the prompt (overlay chat, hud-pill) removes it on this event, so
+/// answering in one window clears the others and a timed-out prompt never
+/// lingers. Payload: [`ApprovalResolvedPayload`].
+pub const HID_APPROVAL_RESOLVED_EVENT: &str = "hid://approval-resolved";
 /// MCP tool approval-request broadcast (S03 T02): when the [`McpApprovalGate`]
 /// hits an `Ask`-mode call whose tool name is not yet allowlisted, it emits this
 /// event carrying the pending call's summary and awaits the overlay's verdict via
@@ -79,6 +85,8 @@ pub const HID_APPROVAL_EVENT: &str = "hid://approval-request";
 /// The string half of the contract with `src/chat.ts` — its reply command lands
 /// in S04; until then an `Ask` prompt fails closed (times out → Deny).
 pub const MCP_APPROVAL_EVENT: &str = "mcp://approval-request";
+/// The MCP twin of [`HID_APPROVAL_RESOLVED_EVENT`].
+pub const MCP_APPROVAL_RESOLVED_EVENT: &str = "mcp://approval-resolved";
 /// MCP host health broadcast (S04 T02): every lifecycle transition — spawn
 /// start, handshake ready, a spawn/handshake/mid-session crash — and every
 /// run-mode change emits the resulting [`McpHealthStatus`] app-wide, so the
@@ -130,6 +138,21 @@ pub struct ApprovalRequestPayload {
     pub approval_id: u64,
     pub kind: ActionKind,
     pub summary: String,
+}
+
+/// Payload of the approval-resolved broadcasts: just the correlation id.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResolvedPayload {
+    pub approval_id: u64,
+}
+
+/// Emit an approval-resolved broadcast (failure logged, never fatal — a
+/// missed cleanup leaves a stale card, not a stuck action).
+fn broadcast_approval_resolved(app: &AppHandle, event: &str, approval_id: u64) {
+    if let Err(e) = app.emit(event, ApprovalResolvedPayload { approval_id }) {
+        log::warn!("llm: {event} broadcast failed id={approval_id}: {e}");
+    }
 }
 
 /// App-shared HID approval state (S04 T03): the session-scoped by-kind whitelist
@@ -238,6 +261,7 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
             }
             Ok(Err(_closed)) => {
                 log::warn!("llm: HID approval id={approval_id} channel closed; denying");
+                broadcast_approval_resolved(&self.app, HID_APPROVAL_RESOLVED_EVENT, approval_id);
                 ApprovalVerdict::Deny
             }
             Err(_elapsed) => {
@@ -246,6 +270,7 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
                     "llm: HID approval id={approval_id} timed out after {}s; denying",
                     APPROVAL_TIMEOUT.as_secs()
                 );
+                broadcast_approval_resolved(&self.app, HID_APPROVAL_RESOLVED_EVENT, approval_id);
                 ApprovalVerdict::Deny
             }
         }
@@ -311,6 +336,7 @@ impl McpApprovalPrompt for OverlayMcpApprovalPrompt {
             }
             Ok(Err(_closed)) => {
                 log::warn!("llm: MCP approval id={approval_id} channel closed; denying");
+                broadcast_approval_resolved(&self.app, MCP_APPROVAL_RESOLVED_EVENT, approval_id);
                 McpApprovalVerdict::Deny
             }
             Err(_elapsed) => {
@@ -319,6 +345,7 @@ impl McpApprovalPrompt for OverlayMcpApprovalPrompt {
                     "llm: MCP approval id={approval_id} timed out after {}s; denying",
                     APPROVAL_TIMEOUT.as_secs()
                 );
+                broadcast_approval_resolved(&self.app, MCP_APPROVAL_RESOLVED_EVENT, approval_id);
                 McpApprovalVerdict::Deny
             }
         }
@@ -835,7 +862,7 @@ pub async fn chat(
             FocusAppTool::new(appfocus_state.backend()),
             mode,
             approval.whitelist(),
-            approver,
+            approver.clone(),
             screen_seen.clone(),
             focused_app.clone(),
         )));
@@ -843,6 +870,23 @@ pub async fn chat(
             screen_state.backend(),
             screen_seen,
             focused_app,
+        )));
+        // Machine inventory (computer-control I1): read-only cache search, no
+        // gate needed — it discloses what the filesystem scan already found.
+        executors.push(Box::new(crate::inventory::FindProgramsTool::new(
+            task_app.state::<crate::memory::MemoryState>().store(),
+        )));
+        // Terminal commands (computer-control I2): structurally gated by the
+        // commandsEnabled setting (default OFF) and per-command approved
+        // through the SAME prompt/whitelist plumbing as HID — the overlay
+        // shows the exact command line. No auto-run mode exists for commands.
+        executors.push(Box::new(crate::command_runner::RunCommandTool::new(
+            task_app
+                .state::<Arc<crate::command_runner::CommandState>>()
+                .inner()
+                .clone(),
+            approval.whitelist(),
+            approver.clone(),
         )));
         // External MCP tools (M007 S02): when an already-serving MCP client peer
         // has been injected for this run, mount an McpExecutor so the agent loop
@@ -1017,6 +1061,25 @@ pub async fn chat(
             } else {
                 match memory.store() {
                     Some(store) => {
+                        // Session transcript (computer-control I3): the raw
+                        // user/assistant pair, appended under the current
+                        // session (created lazily). Same chatMemoryEnabled
+                        // gate as distillation — off means NOTHING chat-
+                        // derived is stored, raw or distilled. Failures log;
+                        // the reply already settled.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        if let Some(session) = memory.ensure_chat_session(&store, now_ms) {
+                            if let Err(e) =
+                                store.chat_append_exchange(session, &user_ask, &reply_text, now_ms)
+                            {
+                                log::warn!(
+                                    "llm: request {id} session transcript append failed: {e:?}"
+                                );
+                            }
+                        }
                         let events = tool_events.lock().map(|e| e.clone()).unwrap_or_default();
                         if let Some(exchange) =
                             chat_ingest::capture_exchange(&user_ask, &events, &reply_text)
@@ -1325,11 +1388,15 @@ pub fn guard_status(state: State<'_, Arc<GuardState>>) -> GuardTelemetry {
 /// can fire-and-forget without racing the timeout into an error.
 #[tauri::command]
 pub fn respond_hid_approval(
+    app: AppHandle,
     state: State<'_, Arc<ApprovalState>>,
     approval_id: u64,
     verdict: ApprovalVerdict,
 ) -> bool {
     let delivered = state.respond(approval_id, verdict);
+    // Every surface showing this prompt (overlay, hud-pill) clears it now —
+    // whichever window answered, and even when the reply raced the timeout.
+    broadcast_approval_resolved(&app, HID_APPROVAL_RESOLVED_EVENT, approval_id);
     if delivered {
         log::debug!("llm: HID approval reply id={approval_id} verdict={verdict:?} delivered");
     } else {
@@ -1414,11 +1481,13 @@ pub fn mcp_status(state: State<'_, McpState>) -> McpHealthStatus {
 /// managed [`McpState`] (managed by value, beside the HID `ApprovalState`).
 #[tauri::command]
 pub fn respond_mcp_approval(
+    app: AppHandle,
     state: State<'_, McpState>,
     approval_id: u64,
     verdict: McpApprovalVerdict,
 ) -> bool {
     let delivered = state.respond(approval_id, verdict);
+    broadcast_approval_resolved(&app, MCP_APPROVAL_RESOLVED_EVENT, approval_id);
     if delivered {
         log::debug!("llm: MCP approval reply id={approval_id} verdict={verdict:?} delivered");
     } else {

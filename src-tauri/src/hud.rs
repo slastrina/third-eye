@@ -43,7 +43,7 @@ pub fn esc_guard_wanted(run_live: bool, hid_armed: bool) -> bool {
 const ESC_SHORTCUT: &str = "Escape";
 
 /// Logical size of the pill window (fits pill + trail; transparent slack).
-const PILL_WIDTH: f64 = 460.0;
+const PILL_WIDTH: f64 = 600.0;
 const PILL_HEIGHT: f64 = 360.0;
 /// Logical offset of the pill from the monitor's top edge.
 const PILL_TOP: f64 = 56.0;
@@ -185,10 +185,16 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     canvas
         .set_ignore_cursor_events(true)
         .map_err(|e| format!("hud canvas set_ignore_cursor_events failed: {e}"))?;
+    // The NSPanel conversion re-enables the native window shadow (the
+    // config's shadow:false applied to the pre-conversion window). A shadow
+    // drawn around a transparent window's content union renders as a grey
+    // blob behind the disjoint pill/card/trail — kill it post-conversion.
+    let _ = canvas.set_shadow(false);
 
     let pill = app
         .get_webview_window(HUD_PILL_LABEL)
         .ok_or_else(|| format!("hud window '{HUD_PILL_LABEL}' missing from tauri.conf.json"))?;
+    let _ = pill.set_shadow(false);
 
     // Geometry from the primary monitor. A missing monitor readout leaves the
     // conf.json defaults — the HUD still works, just not perfectly fitted.

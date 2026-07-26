@@ -113,7 +113,22 @@ fails it for you (kind verification-failed) — treat that like any failed step:
 re-aim, retry.\n\n\
 Report tool results honestly, using the `verified` evidence: only claim an action worked when its \
 verified block confirms it. If a tool call returns an error, tell the user it failed and why — \
-never claim an action succeeded when the tool reported a failure.";
+never claim an action succeeded when the tool reported a failure.\n\n\
+You also have find_programs (search what is installed on this machine — GUI apps and terminal \
+tools) and run_command (run one shell command; the user approves each one). For simple machine \
+facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk space (`df -h`), \
+battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. \
+Check find_programs before claiming an app or tool is or is not installed, and before running a \
+CLI tool you are not sure exists.\n\n\
+To open a website or run a web search, prefer ONE run_command with `open` and the full URL — \
+e.g. `open \"https://www.google.com/search?q=lasagne+recipes\"` — the browser opens and loads it \
+directly, with no clicking or typing. Only drive the browser with screen_query/input_action for \
+interactions a URL cannot express (filling forms, pressing page buttons).\n\n\
+When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed`, or any error — \
+the action DID NOT HAPPEN. Tell the user exactly what you completed, what failed, and why \
+(e.g. \"I opened Chrome, but input control is disabled so I could not type the search\"). NEVER \
+describe an outcome you did not verify from a successful tool result: claiming an unperformed \
+action happened is the worst possible answer.";
 
 /// The typed failure kind the [`ApprovalGate`] returns when the model tries to
 /// aim the mouse at coordinates it never obtained from [`SCREEN_QUERY_TOOL`].
@@ -347,6 +362,34 @@ pub struct ToolResultEvent {
     pub result_count: Option<usize>,
     pub mode: Option<SearchMode>,
     pub failure: Option<String>,
+    /// Bounded human-facing output preview (computer-control I2): populated
+    /// for `run_command` results so the chat transcript's terminal block can
+    /// show what the command printed — the visible-terminal requirement.
+    /// Absent for every other tool (their results are model-facing data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// Cap on the UI preview riding a tool-result event.
+const RESULT_PREVIEW_CHARS: usize = 2000;
+
+/// The UI preview for one executed call: run_command's report, bounded on a
+/// char boundary; `None` for every other tool.
+fn result_preview(call_name: &str, content: &str) -> Option<String> {
+    // String literal, not crate::command_runner::RUN_COMMAND_TOOL: that
+    // module is cfg(desktop) while the llm module is not; the pair is
+    // pinned equal by a command_runner unit test.
+    if call_name != "run_command" {
+        return None;
+    }
+    if content.len() <= RESULT_PREVIEW_CHARS {
+        return Some(content.to_string());
+    }
+    let mut cut = RESULT_PREVIEW_CHARS;
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}…", &content[..cut]))
 }
 
 /// A tool-phase event leaving the loop. The `chat` command maps each variant
@@ -374,6 +417,17 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
+    /// A plain successful outcome: `content` rides to the model verbatim.
+    pub(crate) fn success(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            ok: true,
+            result_count: None,
+            mode: None,
+            failure: None,
+        }
+    }
+
     /// A typed failure: the model sees `{"error": detail}` (so it can
     /// recover or answer without the tool), the UI sees the kind.
     pub(crate) fn failure(kind: &str, detail: impl Into<String>) -> Self {
@@ -1566,6 +1620,7 @@ pub async fn run_tool_loop_with_stop(
                 result_count: result.result_count,
                 mode: result.mode,
                 failure: result.failure,
+                preview: result_preview(&call.name, &result.content),
             }));
 
             // Second half of the round-trip: the tool-role answer.
@@ -2172,6 +2227,7 @@ mod tests {
             result_count: Some(3),
             mode: Some(SearchMode::Semantic),
             failure: None,
+            preview: None,
         };
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["requestId"], 7);

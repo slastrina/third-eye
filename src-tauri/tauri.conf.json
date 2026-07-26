@@ -66,7 +66,7 @@
         "label": "hud-pill",
         "title": "Third Eye HUD",
         "url": "index.html?view=hud-pill",
-        "width": 460,
+        "width": 600,
         "height": 360,
         "center": false,
         "resizable": false,
@@ -84,7 +84,7 @@
         "title": "Third Eye",
         "url": "index.html?view=tray-panel",
         "width": 336,
-        "height": 430,
+        "height": 540,
         "center": false,
         "resizable": false,
         "decorations": false,
@@ -130,6 +130,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": null
+    }
   }
 }
