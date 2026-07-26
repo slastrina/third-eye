@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { ToolCallPayload, ToolResultPayload } from "./chat";
 import {
+  TRAIL_MAX_AGE_MS,
+  TRAIL_MAX_POINTS,
+  appendTrailPoint,
   currentEntry,
   describeCall,
   ghostTarget,
@@ -9,6 +12,9 @@ import {
   hudReducer,
   hudVisible,
   initialHudState,
+  isClickEntry,
+  settledClickRipples,
+  trailOpacity,
   type HudViewState,
 } from "./hud-state";
 
@@ -38,6 +44,30 @@ describe("describeCall", () => {
     const described = describeCall("input_action", JSON.stringify({ action: "type-text", text: "a".repeat(40) }));
     expect(described.label).toBe(`type · “${"a".repeat(24)}…”`);
     expect(described.target).toBeNull();
+  });
+
+  it("labels the extended vocabulary: drag, scroll, multi-click, combos", () => {
+    const drag = describeCall(
+      "input_action",
+      JSON.stringify({ action: "mouse-drag", button: "left", fromX: 1, fromY: 2, toX: 30, toY: 40 }),
+    );
+    expect(drag.label).toBe("drag · 1, 2 → 30, 40");
+    expect(drag.target).toEqual({ x: 30, y: 40 });
+    expect(
+      describeCall("input_action", JSON.stringify({ action: "scroll", deltaY: 5 })).label,
+    ).toBe("scroll · down");
+    expect(
+      describeCall(
+        "input_action",
+        JSON.stringify({ action: "mouse-click", x: 1, y: 2, clicks: 2 }),
+      ).label,
+    ).toBe("double-click · 1, 2");
+    expect(
+      describeCall(
+        "input_action",
+        JSON.stringify({ action: "key-press", key: "c", modifiers: ["cmd"] }),
+      ).label,
+    ).toBe("press · cmd+c");
   });
 
   it("labels non-input tools and survives malformed arguments", () => {
@@ -170,5 +200,77 @@ describe("approval mirroring in the HUD", () => {
     state = hudReducer(state, { type: "approval-resolved", approvalId: 10 });
     expect(state.hidApprovals).toHaveLength(1);
     expect(state.mcpApprovals).toHaveLength(0);
+  });
+});
+
+describe("cursor motion trail (canvas animation)", () => {
+  it("folds samples, skipping idle duplicates and expiring old points", () => {
+    let trail = appendTrailPoint([], { x: 10, y: 10, t: 1000 });
+    trail = appendTrailPoint(trail, { x: 10, y: 10, t: 1033 });
+    expect(trail).toHaveLength(1);
+    trail = appendTrailPoint(trail, { x: 40, y: 22, t: 1066 });
+    expect(trail).toHaveLength(2);
+    // The first point ages out once TRAIL_MAX_AGE_MS passes.
+    trail = appendTrailPoint(trail, { x: 60, y: 30, t: 1000 + TRAIL_MAX_AGE_MS + 1 });
+    expect(trail.map((p) => p.x)).toEqual([40, 60]);
+  });
+
+  it("caps the retained points at the newest TRAIL_MAX_POINTS", () => {
+    let trail: { x: number; y: number; t: number }[] = [];
+    for (let i = 0; i < TRAIL_MAX_POINTS + 8; i++) {
+      trail = appendTrailPoint(trail, { x: i, y: 0, t: 1000 + i });
+    }
+    expect(trail).toHaveLength(TRAIL_MAX_POINTS);
+    expect(trail[trail.length - 1].x).toBe(TRAIL_MAX_POINTS + 7);
+  });
+
+  it("fades opacity linearly from fresh to expiry", () => {
+    const p = { x: 0, y: 0, t: 1000 };
+    expect(trailOpacity(p, 1000)).toBe(1);
+    expect(trailOpacity(p, 1000 + TRAIL_MAX_AGE_MS / 2)).toBeCloseTo(0.5);
+    expect(trailOpacity(p, 1000 + TRAIL_MAX_AGE_MS)).toBe(0);
+  });
+});
+
+describe("click ripples (canvas animation)", () => {
+  const clickEntry = (
+    callId: string,
+    status: "running" | "ok" | "failed",
+    label = "click · 300, 200",
+  ) => ({
+    callId,
+    name: "input_action",
+    label,
+    input: true,
+    target: { x: 300, y: 200 },
+    status,
+    failure: null,
+  });
+
+  it("classifies single/double/triple clicks and nothing else", () => {
+    expect(isClickEntry(clickEntry("a", "ok"))).toBe(true);
+    expect(isClickEntry(clickEntry("a", "ok", "double-click · 3, 4"))).toBe(true);
+    expect(isClickEntry(clickEntry("a", "ok", "triple-click"))).toBe(true);
+    expect(isClickEntry(clickEntry("a", "ok", "move · 3, 4"))).toBe(false);
+    expect(isClickEntry({ ...clickEntry("a", "ok"), name: "screen_query" })).toBe(false);
+  });
+
+  it("bursts exactly when a click settles, colored by outcome", () => {
+    const prev = [clickEntry("c1", "running")];
+    const settledOk = settledClickRipples(prev, [clickEntry("c1", "ok")]);
+    expect(settledOk).toEqual([{ callId: "c1", x: 300, y: 200, ok: true }]);
+    const settledBad = settledClickRipples(prev, [clickEntry("c1", "failed")]);
+    expect(settledBad[0].ok).toBe(false);
+    // Already-settled entries never re-burst (replayed events, StrictMode).
+    expect(settledClickRipples([clickEntry("c1", "ok")], [clickEntry("c1", "ok")])).toEqual([]);
+    // A still-running click has not settled.
+    expect(settledClickRipples(prev, prev)).toEqual([]);
+  });
+
+  it("ignores settling non-click actions and targetless clicks", () => {
+    const move = { ...clickEntry("m1", "running"), label: "move · 1, 2" };
+    expect(settledClickRipples([move], [{ ...move, status: "ok" as const }])).toEqual([]);
+    const bare = { ...clickEntry("b1", "running"), target: null };
+    expect(settledClickRipples([bare], [{ ...bare, status: "ok" as const }])).toEqual([]);
   });
 });

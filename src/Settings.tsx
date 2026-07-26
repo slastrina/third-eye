@@ -12,6 +12,7 @@
 // absorbed into named unavailable states — the view must stay renderable in
 // a plain browser, never crash.
 
+import type { ToolTogglesStatus } from "./chat";
 import { useEffect, useReducer, useState } from "react";
 import {
   bannerDetail,
@@ -35,6 +36,8 @@ import {
   setHidRunMode,
   setMemoryRetention,
   setNudgesEnabled,
+  setToolEnabled,
+  toolTogglesStatus,
   type CommandsStatus,
   type HidRunMode,
   type InventoryEntry,
@@ -272,6 +275,7 @@ function Settings() {
   // toggle response, nudge://state broadcast all land the same shape), so a
   // plain state cell suffices — no transitions to keep pure.
   const [nudges, setNudges] = useState<NudgeStatus | null>(null);
+  const [toolToggles, setToolToggles] = useState<ToolTogglesStatus | null>(null);
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
   // or persist failure lands the truthful state, never a lying chip.
@@ -364,6 +368,10 @@ function Settings() {
     nudgeStatus().then(
       (status) => setNudges(status),
       (err) => console.debug("settings: nudge_status unavailable:", err),
+    );
+    toolTogglesStatus().then(
+      (status) => setToolToggles(status),
+      (err) => console.debug("settings: tool_toggles_status unavailable:", err),
     );
     memoryRetention().then(
       (status) => setRetention(status.retention as Retention),
@@ -617,6 +625,15 @@ function Settings() {
       // and a rolled-back toggle comes back as the authoritative snapshot.
       (status) => dispatchWatcher({ type: "status", status }),
       (err) => console.debug("settings: set_watcher_enabled unavailable:", err),
+    );
+  };
+
+  const toggleTool = (name: string, enable: boolean) => {
+    setToolEnabled(name, enable).then(
+      // Never rejects backend-side; a persist failure rides persistError and
+      // a rolled-back toggle comes back as the authoritative snapshot.
+      (status) => setToolToggles(status),
+      (err) => console.debug("settings: set_tool_enabled unavailable:", err),
     );
   };
 
@@ -1506,6 +1523,44 @@ function Settings() {
               <span>{bannerDetail(nudges.lastError)}</span>
             </div>
           )}
+        </section>
+        )}
+
+        {active === "tools" && (
+        <section className="settings-section" aria-labelledby="settings-tools-heading">
+          <h2 id="settings-tools-heading" className="settings-section-title">
+            Tools
+          </h2>
+          <p className="settings-hint">
+            Every built-in tool the assistant can use. A tool turned off here
+            is never offered to the model and refuses to run — some tools also
+            have their own gates (Input Control's HID mode, the Terminal
+            commands switch), and both must be on.
+          </p>
+          {toolToggles === null && (
+            <p className="settings-unavailable">
+              Tool state is unavailable outside the app.
+            </p>
+          )}
+          {toolToggles?.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Tool setting couldn't be saved</strong>
+              <span>{toolToggles.persistError}</span>
+            </div>
+          )}
+          {toolToggles?.tools.map((tool) => (
+            <label className="settings-row" key={tool.name}>
+              <span className="settings-row-label">
+                {tool.label}
+                <span className="settings-row-sub">{tool.description}</span>
+              </span>
+              <Toggle
+                ariaLabel={`${tool.label} tool`}
+                on={tool.enabled}
+                onChange={(next) => toggleTool(tool.name, next)}
+              />
+            </label>
+          ))}
         </section>
         )}
 

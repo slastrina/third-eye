@@ -29,6 +29,8 @@ fn screen_element_payload_carries_coordinates() {
         y: 200,
         width: 60,
         height: 24,
+        cx: 0,
+        cy: 0,
         app: None,
     };
     let v = serde_json::to_value(&element).unwrap();

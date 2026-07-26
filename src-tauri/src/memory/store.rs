@@ -106,6 +106,18 @@ pub struct ChatSessionMessage {
     pub at_ms: i64,
 }
 
+/// One transcript line matching a free-text search, with its session — the
+/// `chat_history_search` tool's row (the model quoting what the user
+/// actually asked before needs the message, not just the session).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchedChatMessage {
+    pub session_id: i64,
+    pub role: String,
+    pub text: String,
+    pub at_ms: i64,
+}
+
 /// What one inventory scan produces per program found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewInventoryEntry {
@@ -584,6 +596,33 @@ impl MemoryStore {
     }
 
     /// One session's transcript in order.
+    /// Transcript lines whose text matches `query` (case-insensitive LIKE,
+    /// same containment contract as [`Self::chat_sessions_matching`]),
+    /// newest first — the model-facing recall path over past conversations.
+    pub fn chat_messages_matching(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MatchedChatMessage>, MemoryError> {
+        let pattern = format!("%{}%", query.trim());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, role, text, at_ms FROM chat_session_messages
+             WHERE text LIKE ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |row| {
+                Ok(MatchedChatMessage {
+                    session_id: row.get(0)?,
+                    role: row.get(1)?,
+                    text: row.get(2)?,
+                    at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn chat_session_messages(
         &self,
         session_id: i64,
@@ -876,6 +915,36 @@ mod tests {
         // A broad match returns newest-activity-first.
         let all = s.chat_sessions_matching("", 10).unwrap();
         assert_eq!(all.iter().map(|x| x.id).collect::<Vec<_>>(), vec![b, a]);
+    }
+
+    #[test]
+    fn chat_messages_matching_returns_the_lines_newest_first() {
+        let s = store();
+        let a = s.chat_session_create(1_000).unwrap();
+        let b = s.chat_session_create(2_000).unwrap();
+        s.chat_append_exchange(a, "find me a carbonara recipe", "Here is one.", 3_000)
+            .unwrap();
+        s.chat_append_exchange(b, "a recipe for lasagne please", "Sure.", 4_000)
+            .unwrap();
+        s.chat_append_exchange(b, "what's my ip", "203.0.113.7", 5_000)
+            .unwrap();
+        // Case-insensitive, matches the message text itself, newest first,
+        // each row carrying its session.
+        let hits = s.chat_messages_matching("RECIPE", 10).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|m| (m.session_id, m.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (b, "a recipe for lasagne please"),
+                (a, "find me a carbonara recipe"),
+            ]
+        );
+        assert_eq!(hits[0].role, "user");
+        assert_eq!(hits[0].at_ms, 4_000);
+        // Limit pages from the newest side; a miss is honestly empty.
+        assert_eq!(s.chat_messages_matching("recipe", 1).unwrap().len(), 1);
+        assert!(s.chat_messages_matching("gnocchi", 10).unwrap().is_empty());
     }
 
     #[test]

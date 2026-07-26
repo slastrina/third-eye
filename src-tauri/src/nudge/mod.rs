@@ -290,6 +290,19 @@ pub struct NudgeState {
     last_error: Mutex<Option<LlmError>>,
     suppressed: SuppressionCounters,
     persist_error: Mutex<Option<String>>,
+    /// The screenshot taken when the last nudge was shown, keyed by that
+    /// payload's `captured_at_ms` so a summon can only ever fetch the frame
+    /// belonging to the nudge it is grounding in. In-memory only, one frame,
+    /// superseded by the next show and dropped on disable — never persisted
+    /// (R011 spirit: transient vision context, not a stored capture).
+    retained_frame: Mutex<Option<RetainedFrame>>,
+}
+
+/// The nudge-time screenshot parked for a later summon-from-nudge chat.
+struct RetainedFrame {
+    /// `captured_at_ms` of the [`NudgePayload`] this frame belongs to.
+    payload_captured_at_ms: i64,
+    base64_png: String,
 }
 
 impl Default for NudgeState {
@@ -301,6 +314,7 @@ impl Default for NudgeState {
             last_error: Mutex::new(None),
             suppressed: SuppressionCounters::default(),
             persist_error: Mutex::new(None),
+            retained_frame: Mutex::new(None),
         }
     }
 }
@@ -340,6 +354,50 @@ impl NudgeState {
         *self.active.lock().unwrap() = Some(payload);
         *self.last_nudge_at_ms.lock().unwrap() = Some(at_ms);
         *self.last_error.lock().unwrap() = None;
+        // The previous nudge's frame must never be served for this payload —
+        // clear now; the show path's capture repopulates moments later.
+        *self.retained_frame.lock().unwrap() = None;
+    }
+
+    /// Park the screenshot taken when a nudge was shown, keyed by that
+    /// payload's `captured_at_ms`. A stale store (the active nudge changed
+    /// while the capture was in flight) is dropped rather than mis-keyed.
+    pub fn store_frame(&self, payload_captured_at_ms: i64, base64_png: String) {
+        let current = self
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.captured_at_ms);
+        // After an auto-timeout the nudge is no longer active but its frame
+        // is exactly what a later summon grounds in — only a DIFFERENT
+        // active nudge invalidates this capture.
+        if current.is_some_and(|at| at != payload_captured_at_ms) {
+            log::debug!("nudge: dropping frame for superseded nudge");
+            return;
+        }
+        *self.retained_frame.lock().unwrap() = Some(RetainedFrame {
+            payload_captured_at_ms,
+            base64_png,
+        });
+    }
+
+    /// The retained nudge-time screenshot, if it belongs to the payload
+    /// stamped `payload_captured_at_ms`. Health-as-value: absent or
+    /// mismatched (a different nudge's frame) is `None`, never an error.
+    pub fn frame_for(&self, payload_captured_at_ms: i64) -> Option<String> {
+        self.retained_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|f| f.payload_captured_at_ms == payload_captured_at_ms)
+            .map(|f| f.base64_png.clone())
+    }
+
+    /// Drop the retained frame (nudges disabled — the user withdrew consent
+    /// for proactive captures, so the parked one goes too).
+    pub fn clear_frame(&self) {
+        *self.retained_frame.lock().unwrap() = None;
     }
 
     /// The active nudge went away (auto-dismiss, summon, disable, hide).
@@ -662,6 +720,7 @@ fn show_nudge(app: &AppHandle, payload: NudgePayload) {
                 "nudge: shown (state={}, auto-dismiss in {AUTO_DISMISS_SECS}s)",
                 state.as_str()
             );
+            retain_context_frame(app, payload.captured_at_ms);
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(AUTO_DISMISS_SECS)).await;
@@ -672,6 +731,34 @@ fn show_nudge(app: &AppHandle, payload: NudgePayload) {
             log::warn!("nudge: overlay show failed; dropping nudge: {e}");
         }
     }
+}
+
+/// Take one screenshot the instant a nudge is shown and park it on
+/// [`NudgeState`] for the summon-from-nudge chat to attach — the user then
+/// asks about what the nudge saw even after the banner (and the screen)
+/// have moved on. Best-effort and fully async: privacy mode, a missing
+/// permission, or any capture failure just means the chat grounds in text
+/// alone, exactly as before.
+fn retain_context_frame(app: &AppHandle, payload_captured_at_ms: i64) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let privacy = app
+            .try_state::<crate::capture::PrivacyState>()
+            .map(|p| p.enabled())
+            .unwrap_or(false);
+        let capture = app.state::<crate::capture::commands::CaptureState>();
+        match capture.capture(privacy).await {
+            Ok(frame) => {
+                app.state::<NudgeState>()
+                    .store_frame(payload_captured_at_ms, frame.base64_png);
+                log::debug!("nudge: context frame retained for summon-from-nudge");
+            }
+            Err(e) => log::debug!(
+                "nudge: context frame skipped ({}); summon grounds in text only",
+                e.kind()
+            ),
+        }
+    });
 }
 
 /// The armed auto-dismiss: consult [`auto_dismiss_should_fire`] — only a
@@ -732,6 +819,71 @@ mod tests {
             1_752_900_000_000,
             vec!["User debugged the ingest pipeline in Rust.".into()],
         )
+    }
+
+    // --- retained context frame ---
+
+    #[test]
+    fn frame_round_trips_for_the_matching_payload_stamp() {
+        let state = NudgeState::new();
+        state.record_shown(payload(), 1_000);
+        state.store_frame(payload().captured_at_ms, "UE5H".into());
+        assert_eq!(
+            state.frame_for(payload().captured_at_ms).as_deref(),
+            Some("UE5H")
+        );
+        // A different nudge's stamp never gets this frame.
+        assert_eq!(state.frame_for(payload().captured_at_ms + 1), None);
+    }
+
+    #[test]
+    fn frame_survives_dismissal_but_not_the_next_show() {
+        // The whole point: after the banner auto-times-out the frame stays
+        // fetchable (the user summons late), but a NEW nudge clears it —
+        // its capture must not be served for the new payload.
+        let state = NudgeState::new();
+        state.record_shown(payload(), 1_000);
+        state.store_frame(payload().captured_at_ms, "UE5H".into());
+        state.clear_active();
+        assert!(state.frame_for(payload().captured_at_ms).is_some());
+        let mut next = payload();
+        next.captured_at_ms += 60_000;
+        state.record_shown(next, 2_000);
+        assert_eq!(state.frame_for(payload().captured_at_ms), None);
+    }
+
+    #[test]
+    fn late_capture_for_a_superseded_nudge_is_dropped() {
+        // The show-time capture is async; if a new nudge became active while
+        // it was in flight, storing would mis-attribute the old screen to
+        // the new payload's window of time — it must be dropped.
+        let state = NudgeState::new();
+        let mut next = payload();
+        next.captured_at_ms += 60_000;
+        state.record_shown(next.clone(), 2_000);
+        state.store_frame(payload().captured_at_ms, "b2xk".into());
+        assert_eq!(state.frame_for(payload().captured_at_ms), None);
+        assert_eq!(state.frame_for(next.captured_at_ms), None);
+    }
+
+    #[test]
+    fn late_capture_after_auto_timeout_is_kept() {
+        // No active nudge (timer fired) is NOT supersession — the frame
+        // belongs to the nudge a later summon will ground in.
+        let state = NudgeState::new();
+        state.record_shown(payload(), 1_000);
+        state.clear_active();
+        state.store_frame(payload().captured_at_ms, "UE5H".into());
+        assert!(state.frame_for(payload().captured_at_ms).is_some());
+    }
+
+    #[test]
+    fn clear_frame_drops_the_retained_capture() {
+        let state = NudgeState::new();
+        state.record_shown(payload(), 1_000);
+        state.store_frame(payload().captured_at_ms, "UE5H".into());
+        state.clear_frame();
+        assert_eq!(state.frame_for(payload().captured_at_ms), None);
     }
 
     // --- classification gate ---

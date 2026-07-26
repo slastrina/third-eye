@@ -273,6 +273,7 @@ mod tests {
 
     #[test]
     fn opt_in_on_empty_keystore_yields_no_api_key() {
+        let _keychain = crate::cloud::real_keychain_test_lock();
         let optin = CloudOptIn::new();
         optin.set_enabled(true);
         let ts = TestStore::new("empty");

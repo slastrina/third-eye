@@ -1567,6 +1567,58 @@ pub fn save_command_allowlist(app: &AppHandle, entries: &[String]) -> Result<(),
     Ok(())
 }
 
+/// Store key for the per-tool switchboard (user request 2026-07-26): the
+/// names of built-in tools the user turned OFF in Settings. Absent = all
+/// tools on (the default).
+pub const DISABLED_TOOLS_KEY: &str = "disabledTools";
+
+/// Read the persisted disabled-tools set. Garbage-tolerant like the
+/// command allowlist: non-array values and non-string entries drop with a
+/// warning; unknown tool names are dropped later by the applier.
+pub fn load_disabled_tools(app: &AppHandle) -> Vec<String> {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        log::error!(
+            "config: failed to open settings store at {}",
+            store_path(app)
+        );
+        return Vec::new();
+    };
+    let Some(value) = store.get(DISABLED_TOOLS_KEY) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        log::warn!("config: {DISABLED_TOOLS_KEY} holds a non-array value; treating as empty");
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item.as_str() {
+            Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => {
+                log::warn!("config: {DISABLED_TOOLS_KEY} entry is not a usable string; dropped");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Persist the disabled-tools set (already sorted by the caller).
+pub fn save_disabled_tools(app: &AppHandle, names: &[String]) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(DISABLED_TOOLS_KEY, serde_json::json!(names));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {DISABLED_TOOLS_KEY} to {path}: {e}"))?;
+    log::info!(
+        "config: persisted {DISABLED_TOOLS_KEY} ({} entries) to {path}",
+        names.len()
+    );
+    Ok(())
+}
+
 /// The retention window in milliseconds; `None` for "forever" (never prune)
 /// AND for out-of-contract values — garbage must never widen deletion.
 pub fn memory_retention_window_ms(retention: &str) -> Option<i64> {

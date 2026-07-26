@@ -50,6 +50,7 @@ mod tests {
             InputAction::TypeText { text: "hi".into() },
             InputAction::KeyPress {
                 key: "return".into(),
+                modifiers: None,
             },
         ];
         for action in actions {

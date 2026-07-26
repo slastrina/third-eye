@@ -349,6 +349,57 @@ export function setNudgesEnabled(enable: boolean): Promise<NudgeStatus> {
   return invoke<NudgeStatus>("set_nudges_enabled", { enable });
 }
 
+// ---------------------------------------------------------------------------
+// Per-tool switchboard IPC — contract in src-tauri/src/tool_toggles.rs
+// ---------------------------------------------------------------------------
+
+/** One built-in tool row in Settings (camelCase serde of ToolToggleRow). */
+export interface ToolToggleRow {
+  name: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+}
+
+/** The `tool_toggles_status` / `set_tool_enabled` shape — health-as-value. */
+export interface ToolTogglesStatus {
+  tools: ToolToggleRow[];
+  persistError: string | null;
+}
+
+export function toolTogglesStatus(): Promise<ToolTogglesStatus> {
+  return invoke<ToolTogglesStatus>("tool_toggles_status");
+}
+
+/** Flip one tool. Never rejects backend-side — a persist failure rides
+ *  `persistError` on the returned authoritative status. */
+export function setToolEnabled(name: string, enable: boolean): Promise<ToolTogglesStatus> {
+  return invoke<ToolTogglesStatus>("set_tool_enabled", { name, enable });
+}
+
+/** The screenshot taken when the nudge stamped `capturedAtMs` was shown
+ *  (base64 PNG), or null when none was retained (privacy mode, capture
+ *  failure, superseded by a newer nudge). */
+export function nudgeContextFrame(capturedAtMs: number): Promise<string | null> {
+  return invoke<string | null>("nudge_context_frame", { capturedAtMs });
+}
+
+/** How long a dismissed nudge's context keeps grounding the next question.
+ *  The banner auto-dismisses after ~12s, but the user often summons chat
+ *  well after that — within this window the summon still knows what the
+ *  nudge was about; past it, a new chat starts clean rather than dragging
+ *  in a stale screen. */
+export const NUDGE_PRELOAD_FRESH_MS = 5 * 60_000;
+
+/** The staged preload if it is still fresh at submit time, else null. */
+export function freshNudgePreload(
+  preload: NudgePayload | null,
+  nowMs: number,
+): NudgePayload | null {
+  if (preload === null) return null;
+  return nowMs - preload.capturedAtMs <= NUDGE_PRELOAD_FRESH_MS ? preload : null;
+}
+
 export function onNudgeShow(cb: (payload: NudgePayload) => void): Promise<UnlistenFn> {
   return listen<NudgePayload>(NUDGE_SHOW_EVENT, (e) => cb(e.payload));
 }
@@ -468,9 +519,12 @@ export const HID_APPROVAL_RESOLVED_EVENT = "hid://approval-resolved";
 export type ActionKind =
   | "mouse-move"
   | "mouse-click"
+  | "mouse-drag"
+  | "scroll"
   | "type-text"
   | "key-press"
   | "focus-app"
+  | "clipboard"
   | "run-command";
 
 /** The `hid://approval-request` payload — the serde camelCase serialization of
@@ -996,15 +1050,25 @@ export function stripFailedTail(messages: UiMessage[]): UiMessage[] {
 /** The prepended system message grounding a summon-from-nudge chat in the
  *  triggering screen context and the memories fetched at classification
  *  time (no new IPC on the hotkey path — everything rode `nudge://show`). */
-export function nudgeContextMessage(payload: NudgePayload): ChatMessage {
+export function nudgeContextMessage(
+  payload: NudgePayload,
+  hasScreenshot = false,
+): ChatMessage {
   const parts = [
-    `The user pressed the hotkey on a proactive nudge: "${payload.message}". ` +
-      "Ground your answers in the screen context below.",
+    `Third Eye just showed the user a proactive nudge: "${payload.message}". ` +
+      "The user opened chat to follow up on it — ground your answers in the " +
+      "screen context below (the screen may have changed since).",
     `Screen text at the time${payload.appContext ? ` (frontmost app: ${payload.appContext})` : ""}:\n${payload.screenText}`,
   ];
   if (payload.memoryContext.length > 0) {
     parts.push(
       `Relevant stored memories:\n${payload.memoryContext.map((m) => `- ${m}`).join("\n")}`,
+    );
+  }
+  if (hasScreenshot) {
+    parts.push(
+      "A screenshot taken when the nudge appeared is attached to the user's " +
+        "message — look at it for anything the text above misses.",
     );
   }
   return { role: "system", content: parts.join("\n\n") };
@@ -1020,9 +1084,10 @@ export function composeMessages(
   question: string,
   attachments: Attachment[] = [],
   preload: NudgePayload | null = null,
+  preloadScreenshot = false,
 ): ChatMessage[] {
   const history: ChatMessage[] = [];
-  if (preload) history.push(nudgeContextMessage(preload));
+  if (preload) history.push(nudgeContextMessage(preload, preloadScreenshot));
   for (const m of messages) {
     if (m.role === "user") history.push({ role: "user", content: m.text });
     else if (m.status === "done") history.push({ role: "assistant", content: m.text });
@@ -1299,9 +1364,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         nudge: null,
-        // "summoned" hands the banner's context to the upcoming chat; every
-        // other reason (auto-timeout, disabled, hidden) just clears.
-        nudgePreload: action.reason === "summoned" ? state.nudge : state.nudgePreload,
+        // Every dismissal except a disable stages the context: the user
+        // often summons chat AFTER the 12s auto-timeout took the banner
+        // down, and "what was that nudge about" must still be answerable.
+        // Freshness is enforced at submit time (freshNudgePreload), so a
+        // stale stage never grounds an unrelated later chat. "disabled"
+        // clears — the user turned the feature off.
+        nudgePreload: action.reason === "disabled" ? null : state.nudge,
       };
     }
     case "run-state":

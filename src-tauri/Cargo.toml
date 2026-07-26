@@ -36,6 +36,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process", 
 # and the pipeline is unit-tested cross-platform with synthetic pixels.
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Redaction engine (privacy/, D028): pure Rust, no C — safe for the Windows
 # msvc cross-check and the Linux container check.
 regex = "1"

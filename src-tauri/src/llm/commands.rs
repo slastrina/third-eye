@@ -799,8 +799,14 @@ pub async fn chat(
         match memory.store() {
             Some(store) => {
                 executors.push(Box::new(MemorySearchTool::new(
-                    store,
+                    store.clone(),
                     memory.embedder(client.endpoint()),
+                )));
+                // Verbatim recall over past chat transcripts (same store) —
+                // "what did I ask you about X before" is answerable only
+                // from the actual messages, not the distilled memories.
+                executors.push(Box::new(crate::llm::toolloop::ChatHistorySearchTool::new(
+                    store,
                 )));
             }
             None => {
@@ -880,6 +886,33 @@ pub async fn chat(
         // commandsEnabled setting (default OFF) and per-command approved
         // through the SAME prompt/whitelist plumbing as HID — the overlay
         // shows the exact command line. No auto-run mode exists for commands.
+        // Screenshot (self-evaluation): the model can SEE the screen to
+        // verify outcomes. Privacy-mode gated like every capture; the image
+        // is a transient vision turn, never stored.
+        {
+            let privacy_app = task_app.clone();
+            executors.push(Box::new(
+                crate::capture::screenshot_tool::ScreenshotTool::new(
+                    task_app
+                        .state::<crate::capture::commands::CaptureState>()
+                        .backend(),
+                    Box::new(move || {
+                        privacy_app
+                            .state::<crate::capture::PrivacyState>()
+                            .enabled()
+                    }),
+                ),
+            ));
+        }
+        // Clipboard (HID-extensions): same Off/Ask/AutoRun path, kind
+        // Clipboard — reading is user data, so it prompts like input does.
+        executors.push(Box::new(crate::clipboard_tool::ClipboardTool::new(
+            mode,
+            approval.whitelist(),
+            approver.clone(),
+        )));
+        // Wait (ungated): a bounded settle pause touches nothing.
+        executors.push(Box::new(crate::clipboard_tool::WaitTool));
         executors.push(Box::new(crate::command_runner::RunCommandTool::new(
             task_app
                 .state::<Arc<crate::command_runner::CommandState>>()
@@ -927,6 +960,18 @@ pub async fn chat(
                 log::info!("llm: request {id} runs without MCP tools (no server peer injected)");
             }
         }
+        // Per-tool switchboard (Settings): every built-in executor rides the
+        // toggle gate — a disabled tool is never offered and refuses typed.
+        let toggles = task_app.state::<std::sync::Arc<crate::tool_toggles::ToolToggles>>();
+        let executors: Vec<Box<dyn crate::llm::toolloop::ToolExecutor>> = executors
+            .into_iter()
+            .map(|inner| {
+                Box::new(crate::tool_toggles::ToggleGatedExecutor::new(
+                    inner,
+                    std::sync::Arc::clone(&toggles),
+                )) as Box<dyn crate::llm::toolloop::ToolExecutor>
+            })
+            .collect();
         let executor = CompositeExecutor::new(executors);
         // Chat-ingest capture (M008 S01): the ask is the last user turn,
         // cloned NOW — `messages` gains system-turn inserts below and then

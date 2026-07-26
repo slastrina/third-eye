@@ -15,6 +15,12 @@ use async_trait::async_trait;
 use super::{ScreenElement, ScreenQuery, ScreenQueryError};
 use crate::ocr::macos::{extract_elements_blocking, TextElement};
 
+/// Capture cap for on-demand screen queries. Near-native (4096 covers most
+/// Retina panels without downscaling): the OCR boxes ARE the click targets,
+/// and every downscale pixel of quantization becomes points of click error.
+/// The continuous watcher keeps the cheaper crate::ocr::OCR_MAX_DIMENSION.
+pub const SCREEN_QUERY_MAX_DIMENSION: u32 = 4096;
+
 /// The live macOS backend: one capture of the primary display per `query`,
 /// recognized with Apple Vision and returned with per-element pixel boxes.
 pub struct MacosScreenQuery {
@@ -37,6 +43,8 @@ impl From<TextElement> for ScreenElement {
             y: el.y,
             width: el.width,
             height: el.height,
+            cx: el.cx,
+            cy: el.cy,
             app: el.app,
         }
     }
@@ -71,6 +79,8 @@ mod tests {
             y: 2,
             width: 3,
             height: 4,
+            cx: 0,
+            cy: 0,
             app: Some("Zed".into()),
         };
         let se: ScreenElement = te.into();
@@ -82,6 +92,8 @@ mod tests {
                 y: 2,
                 width: 3,
                 height: 4,
+                cx: 0,
+                cy: 0,
                 app: Some("Zed".into())
             }
         );
@@ -94,7 +106,7 @@ mod tests {
     #[ignore = "requires Screen Recording permission and a live display (slice UAT)"]
     async fn real_screen_query_smoke() {
         let backend: Arc<dyn ScreenQuery> =
-            Arc::new(MacosScreenQuery::new(crate::ocr::OCR_MAX_DIMENSION));
+            Arc::new(MacosScreenQuery::new(SCREEN_QUERY_MAX_DIMENSION));
         match backend.query().await {
             Ok(elements) => {
                 println!(

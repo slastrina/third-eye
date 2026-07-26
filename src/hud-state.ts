@@ -89,8 +89,32 @@ export function describeCall(name: string, rawArguments: string): {
     switch (action) {
       case "mouse-move":
         return { label: target ? `move · ${x}, ${y}` : "move the mouse", input: true, target };
-      case "mouse-click":
-        return { label: target ? `click · ${x}, ${y}` : "click", input: true, target };
+      case "mouse-click": {
+        const count = typeof args.clicks === "number" ? args.clicks : 1;
+        const verb = count === 3 ? "triple-click" : count === 2 ? "double-click" : "click";
+        return { label: target ? `${verb} · ${x}, ${y}` : verb, input: true, target };
+      }
+      case "mouse-drag": {
+        const toX = typeof args.toX === "number" ? args.toX : null;
+        const toY = typeof args.toY === "number" ? args.toY : null;
+        const fromX = typeof args.fromX === "number" ? args.fromX : null;
+        const fromY = typeof args.fromY === "number" ? args.fromY : null;
+        const dragTarget = toX !== null && toY !== null ? { x: toX, y: toY } : null;
+        return {
+          label:
+            fromX !== null && toX !== null
+              ? `drag · ${fromX}, ${fromY} → ${toX}, ${toY}`
+              : "drag",
+          input: true,
+          target: dragTarget,
+        };
+      }
+      case "scroll": {
+        const dy = typeof args.deltaY === "number" ? args.deltaY : 0;
+        const dx = typeof args.deltaX === "number" ? args.deltaX : 0;
+        const dir = dy > 0 ? "down" : dy < 0 ? "up" : dx > 0 ? "right" : "left";
+        return { label: `scroll · ${dir}`, input: true, target };
+      }
       case "type-text": {
         const text = typeof args.text === "string" ? args.text : "";
         const shown = text.length > 24 ? `${text.slice(0, 24)}…` : text;
@@ -98,7 +122,11 @@ export function describeCall(name: string, rawArguments: string): {
       }
       case "key-press": {
         const key = typeof args.key === "string" ? args.key : "";
-        return { label: key ? `press · ${key}` : "press a key", input: true, target: null };
+        const mods = Array.isArray(args.modifiers)
+          ? (args.modifiers as unknown[]).filter((m): m is string => typeof m === "string")
+          : [];
+        const combo = mods.length > 0 ? `${mods.join("+")}+${key}` : key;
+        return { label: combo ? `press · ${combo}` : "press a key", input: true, target: null };
       }
       default:
         return { label: "input action", input: true, target: null };
@@ -111,10 +139,33 @@ export function describeCall(name: string, rawArguments: string): {
     // shows while they run (they act on the machine like input does).
     return { label: shown ? `run · ${shown}` : "run a command", input: true, target: null };
   }
+  if (name === "clipboard") {
+    const op = typeof args.op === "string" ? args.op : "";
+    return {
+      label: op === "write" ? "clipboard · write" : "clipboard · read",
+      input: true,
+      target: null,
+    };
+  }
+  if (name === "wait") {
+    const ms = typeof args.ms === "number" ? args.ms : 500;
+    return { label: `wait · ${ms}ms`, input: false, target: null };
+  }
+  if (name === "take_screenshot") {
+    return { label: "look at the screen", input: false, target: null };
+  }
   if (name === "screen_query") return { label: "read the screen", input: false, target: null };
   if (name === "memory_search") {
     const query = typeof args.query === "string" ? args.query : "";
     return { label: query ? `recall · “${query}”` : "search memory", input: false, target: null };
+  }
+  if (name === "chat_history_search") {
+    const query = typeof args.query === "string" ? args.query : "";
+    return {
+      label: query ? `past chats · “${query}”` : "search past chats",
+      input: false,
+      target: null,
+    };
   }
   if (name === "focus_app") {
     const app = typeof args.name === "string" ? args.name : "";
@@ -196,6 +247,92 @@ export function hudReducer(state: HudViewState, action: HudAction): HudViewState
     default:
       return state;
   }
+}
+
+/** One sampled point of the real cursor's recent path, for the canvas's
+ *  motion trail (the design's ghost-cursor streak). */
+export interface TrailPoint {
+  x: number;
+  y: number;
+  /** Sample time (ms epoch) — drives the fade-out. */
+  t: number;
+}
+
+/** How long a trail point stays visible. */
+export const TRAIL_MAX_AGE_MS = 550;
+
+/** Hard cap on retained trail points (a long slow glide must not grow an
+ *  unbounded list between prunes). */
+export const TRAIL_MAX_POINTS = 32;
+
+/** Fold one cursor sample into the trail: identical consecutive samples are
+ *  skipped (an idle cursor leaves no streak), expired points fall off, and
+ *  the list is capped. Pure — the canvas calls it on every poll tick. */
+export function appendTrailPoint(
+  points: TrailPoint[],
+  sample: TrailPoint,
+): TrailPoint[] {
+  const last = points[points.length - 1];
+  const next =
+    last && last.x === sample.x && last.y === sample.y
+      ? points
+      : [...points, sample];
+  return pruneTrail(next, sample.t);
+}
+
+/** Drop expired points and enforce the cap (newest kept). */
+export function pruneTrail(points: TrailPoint[], nowMs: number): TrailPoint[] {
+  const alive = points.filter((p) => nowMs - p.t <= TRAIL_MAX_AGE_MS);
+  return alive.length > TRAIL_MAX_POINTS ? alive.slice(alive.length - TRAIL_MAX_POINTS) : alive;
+}
+
+/** A trail point's opacity at `nowMs`: 1 fresh → 0 at expiry. */
+export function trailOpacity(point: TrailPoint, nowMs: number): number {
+  const age = nowMs - point.t;
+  if (age <= 0) return 1;
+  if (age >= TRAIL_MAX_AGE_MS) return 0;
+  return 1 - age / TRAIL_MAX_AGE_MS;
+}
+
+/** Whether an entry is a mouse click (single/double/triple) — the actions
+ *  that burst a ripple at their target when they settle. */
+export function isClickEntry(entry: HudEntry): boolean {
+  return entry.name === "input_action" && /^(double-|triple-)?click/.test(entry.label);
+}
+
+/** One click-ripple burst parked on the canvas until its animation ends. */
+export interface ClickRipple {
+  callId: string;
+  x: number;
+  y: number;
+  /** Failed clicks ripple in the failure color — honesty in the animation. */
+  ok: boolean;
+}
+
+/** Diff two entry lists and return the clicks that JUST settled (running →
+ *  ok/failed) with a known target — each becomes one ripple burst. Pure so
+ *  the double-fire risk (StrictMode, replayed events) is testable. */
+export function settledClickRipples(
+  prev: HudEntry[],
+  next: HudEntry[],
+): ClickRipple[] {
+  const wasRunning = new Set(
+    prev.filter((e) => e.status === "running").map((e) => e.callId),
+  );
+  return next
+    .filter(
+      (e) =>
+        e.status !== "running" &&
+        wasRunning.has(e.callId) &&
+        isClickEntry(e) &&
+        e.target !== null,
+    )
+    .map((e) => ({
+      callId: e.callId,
+      x: e.target!.x,
+      y: e.target!.y,
+      ok: e.status === "ok",
+    }));
 }
 
 /** Whether any approval is parked — the pill must surface these even when

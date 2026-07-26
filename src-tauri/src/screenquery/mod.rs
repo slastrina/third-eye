@@ -50,6 +50,10 @@ pub struct ScreenElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Server-computed click target: the box center at full precision. The
+    /// model clicks THIS — no arithmetic on its side.
+    pub cx: i32,
+    pub cy: i32,
     /// The localized name of the app owning the on-screen window this element's
     /// center falls inside — `None` when no attributable window covers it (the
     /// desktop, a menu bar extra, or the primary display's own chrome). Lets the
@@ -177,6 +181,8 @@ mod tests {
                 y: 20,
                 width: 30,
                 height: 40,
+                cx: 0,
+                cy: 0,
                 app: Some("Finder".to_string()),
             }])
         }
@@ -210,6 +216,8 @@ mod tests {
             y: 2,
             width: 3,
             height: 4,
+            cx: 0,
+            cy: 0,
             app: Some("Zed".into()),
         };
         let v = serde_json::to_value(&el).unwrap();
@@ -227,6 +235,8 @@ mod tests {
             y: 0,
             width: 1,
             height: 1,
+            cx: 0,
+            cy: 0,
             app: None,
         };
         assert!(serde_json::to_value(&bare).unwrap()["app"].is_null());

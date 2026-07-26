@@ -25,6 +25,7 @@ pub mod encode;
 pub mod fallback;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod screenshot_tool;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;

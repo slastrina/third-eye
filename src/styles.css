@@ -493,6 +493,85 @@ body,
   user-select: text;
 }
 
+/* Assistant markdown (2026-07-26): the model writes GFM — render it instead
+   of showing raw asterisks. Tuned for chat bubbles: tight vertical rhythm,
+   zero outer margins so a one-line answer sits exactly like plain text. */
+.chat-markdown {
+  display: block;
+}
+.chat-markdown > :first-child {
+  margin-top: 0;
+}
+.chat-markdown > :last-child {
+  margin-bottom: 0;
+}
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown blockquote,
+.chat-markdown pre,
+.chat-markdown table {
+  margin: 0.45em 0;
+}
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4 {
+  margin: 0.7em 0 0.3em;
+  font-size: 1.02em;
+  font-weight: 700;
+}
+.chat-markdown ul,
+.chat-markdown ol {
+  padding-left: 1.3em;
+}
+.chat-markdown li {
+  margin: 0.15em 0;
+}
+.chat-markdown code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.92em;
+  background: rgba(255, 255, 255, 0.09);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+.chat-markdown pre {
+  background: rgba(2, 8, 24, 0.55);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+.chat-markdown pre code {
+  background: none;
+  padding: 0;
+}
+.chat-markdown blockquote {
+  border-left: 3px solid rgba(255, 255, 255, 0.25);
+  padding-left: 0.8em;
+  opacity: 0.85;
+}
+.chat-markdown a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: default;
+}
+.chat-markdown table {
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+.chat-markdown th,
+.chat-markdown td {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 3px 8px;
+  text-align: left;
+}
+.chat-markdown hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+  margin: 0.6em 0;
+}
+
 .chat-user {
   align-self: flex-end;
   max-width: 85%;
@@ -850,6 +929,15 @@ body,
 .settings-row-label {
   color: rgba(255, 255, 255, 0.85);
   text-transform: capitalize;
+}
+
+/* Secondary line under a row label (Tools pane blurbs). */
+.settings-row-sub {
+  display: block;
+  font-size: 11px;
+  opacity: 0.6;
+  font-weight: 400;
+  margin-top: 2px;
 }
 
 .settings-select {

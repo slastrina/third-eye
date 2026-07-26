@@ -54,6 +54,8 @@ pub const MAX_TOOL_ROUNDS: usize = 40;
 /// and the UI's memory-consulted check (T04).
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 
+pub const CHAT_HISTORY_SEARCH_TOOL: &str = "chat_history_search";
+
 /// The HID tool S01 ships (M005). One tool with a tagged `action` argument
 /// (mirroring [`InputAction`]'s serde tag) keeps the composite's
 /// dispatch-by-name simple and the model's tool list short.
@@ -84,14 +86,24 @@ exact pixel coordinates), and input_action (move/click the mouse, type text, pre
 To operate any app, follow this order every time:\n\
 1. Call focus_app with the app name (e.g. \"Google Chrome\") to open it / bring it to the front.\n\
 2. Call screen_query to see what is on screen and get the real pixel coordinates of the element \
-you want. Each element gives x,y for its top-left corner plus width and height; aim at its centre \
-(x + width/2, y + height/2).\n\
-3. To click a target, call input_action with action \"mouse-click\" and pass the x,y you computed \
-from that screen_query result — the click moves to that point and clicks it in one step.\n\
+you want. Each element carries cx,cy — its exact centre, precomputed for you. That pair IS the \
+click target; never do your own arithmetic on x/width.\n\
+3. To click a target, call input_action with action \"mouse-click\" and pass that element's cx as \
+x and cy as y verbatim — the click moves to that point and clicks it in one step.\n\
 4. Use action \"type-text\" or \"key-press\" to enter text. Typing goes into whatever you last \
 clicked, so ALWAYS mouse-click the exact field you want to fill before you type. To search the \
 web: focus_app the browser, screen_query, mouse-click its address bar, type-text the search \
 words, then key-press \"return\".\n\n\
+More vocabulary: mouse-click with clicks 2 double-clicks (open a file, select a word) and \
+clicks 3 selects a whole line; mouse-drag (fromX,fromY -> toX,toY) selects text ranges and \
+drags things — both endpoints are cx,cy pairs from screen_query; scroll with deltaY (positive = further down \
+the page) reaches content that is off screen — scroll then screen_query again to read what \
+appeared; key-press with modifiers gives shortcuts: [\"cmd\"]+\"a\" select all, [\"cmd\"]+\"c\" \
+copy, [\"cmd\"]+\"v\" paste. Prefer keyboard shortcuts over pixel work when both can do the \
+job (cmd+a beats drag-selecting a whole document). For LONG text, clipboard write + click the \
+field + cmd+v beats type-text; to extract text from an app: select it, cmd+c, clipboard read. \
+After opening an app or triggering an animation, call wait (default 500ms) before the next \
+screen_query instead of retrying a stale read.\n\n\
 Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click \
 or move to a coordinate you did not read from screen_query will be refused. After you focus_app the \
 screen changes, so call screen_query again before you click.\n\n\
@@ -103,7 +115,10 @@ Every input_action result carries a `verified` block — what ACTUALLY happened,
 OS after the action: `cursor` is where the mouse really ended up, `focus` names the app and UI \
 element that now holds keyboard focus (its role, title, and current value), and for type-text \
 `textEntered` reports whether your text was really observed in the focused field. VALIDATE every \
-action against it before moving on: after clicking a text field, verified.focus should name that \
+action against it before moving on: after a mouse-click, verified.clickedElement names the UI \
+element that was actually under the click (its role and title) — if it is not the thing you aimed \
+at (wrong title, role AXGroup instead of the link/button you wanted), the click landed off target: \
+screen_query again and re-aim at a better element. After clicking a text field, verified.focus should name that \
 field in the app you focused; after type-text, verified.textEntered should be true and \
 verified.focus.value should contain what you typed. If verified contradicts your intent — the \
 focused app is wrong, textEntered is false, the value is missing your text — the action landed in \
@@ -114,12 +129,26 @@ re-aim, retry.\n\n\
 Report tool results honestly, using the `verified` evidence: only claim an action worked when its \
 verified block confirms it. If a tool call returns an error, tell the user it failed and why — \
 never claim an action succeeded when the tool reported a failure.\n\n\
+EVALUATE THE GOAL before finishing: after the last action of any on-screen task, take_screenshot \
+(or screen_query) and CHECK the screen actually shows what the user asked for — the result state, \
+not just your last action's success. If focus_app reports visibleWindows 0, the app is frontmost \
+but the user sees NOTHING — open a window (key-press \"n\" with modifiers [\"cmd\"]) and verify \
+again, or say plainly that the app has no window open. Only declare the task done when the final \
+look confirms it; otherwise describe what you see and what is still missing. take_screenshot does \
+NOT save a file unless you pass save: true (Desktop by default, `directory` for a user-named \
+folder) — when the user asks to save a screenshot pass save: true and quote the exact saved path \
+from the result; never claim a screenshot was saved anywhere else.\n\n\
 You also have find_programs (search what is installed on this machine — GUI apps and terminal \
 tools) and run_command (run one shell command; the user approves each one). For simple machine \
 facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk space (`df -h`), \
 battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. \
 Check find_programs before claiming an app or tool is or is not installed, and before running a \
 CLI tool you are not sure exists.\n\n\
+You CAN recall the past: memory_search finds distilled memories of the user's activity and \
+earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. \
+When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
+about?\"), call chat_history_search with a short keyword (e.g. \"recipe\") and answer from the \
+matches — never claim you have no access to past conversations without searching first.\n\n\
 To open a website or run a web search, prefer ONE run_command with `open` and the full URL — \
 e.g. `open \"https://www.google.com/search?q=lasagne+recipes\"` — the browser opens and loads it \
 directly, with no clicking or typing. Only drive the browser with screen_query/input_action for \
@@ -169,6 +198,24 @@ pub const VERIFICATION_FAILED_KIND: &str = "verification-failed";
 /// (some targets never echo text; the model sees it in `verified`).
 pub fn verify_against_intent(report: &ActionReport, focused: Option<&str>) -> Option<String> {
     let focused = focused?;
+    // A click's hit-test is the sharper signal: links and buttons often take
+    // no keyboard focus, so `focus` stays silent while `clicked_element`
+    // names exactly what was under the mousedown. Same positive-evidence
+    // rule: only a DIFFERENT app fails it.
+    if let Some(hit) = report
+        .clicked_element
+        .as_ref()
+        .and_then(|e| e.app.as_deref())
+    {
+        if !hit.eq_ignore_ascii_case(focused) {
+            return Some(format!(
+                "the click was synthesized, but the element under it belongs to {hit:?}, not the \
+                 focused app {focused:?} — the click hit the wrong app's window (or the desktop). \
+                 Call screen_query to re-read the screen, then re-aim; do not assume this step \
+                 worked."
+            ));
+        }
+    }
     let observed = report.focus.as_ref()?.app.as_deref()?;
     if observed.eq_ignore_ascii_case(focused) {
         return None;
@@ -414,6 +461,10 @@ pub struct ToolOutcome {
     pub mode: Option<SearchMode>,
     /// Typed failure kind when `ok` is false.
     pub failure: Option<String>,
+    /// Screenshot payload (take_screenshot): tool-role messages are
+    /// text-only in the chat API, so the loop injects this as a follow-up
+    /// vision user turn. Transient model context — never stored (R011).
+    pub attachment_png: Option<String>,
 }
 
 impl ToolOutcome {
@@ -425,6 +476,7 @@ impl ToolOutcome {
             result_count: None,
             mode: None,
             failure: None,
+            attachment_png: None,
         }
     }
 
@@ -438,6 +490,7 @@ impl ToolOutcome {
             result_count: None,
             mode: None,
             failure: Some(kind.to_string()),
+            attachment_png: None,
         }
     }
 }
@@ -472,9 +525,12 @@ impl MemorySearchTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: MEMORY_SEARCH_TOOL.into(),
-            description: "Search the user's stored activity memories (summaries of what they \
-                          were doing on this computer, with app names and time spans). Call \
-                          this when the user asks about their earlier work or activity."
+            description: "Search the user's stored memories: summaries of their on-screen \
+                          activity (app names, time spans) AND distilled one-liners from past \
+                          chat conversations with you. Call this when the user asks about \
+                          their earlier work, activity, or things discussed before. For exact \
+                          quotes of past questions/answers, chat_history_search searches the \
+                          verbatim transcripts."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -545,12 +601,159 @@ impl ToolExecutor for MemorySearchTool {
                     result_count: Some(outcome.results.len()),
                     mode: Some(outcome.mode),
                     failure: None,
+                    attachment_png: None,
                 }
             }
             // Store failure: typed to model and UI, stream keeps going —
             // the model can still answer from context.
             Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
         }
+    }
+}
+
+/// Verbatim recall over stored chat transcripts (computer-control I3 made
+/// the sessions; this exposes them to the model). "What recipes have I
+/// asked about?" is answerable only from the actual past messages — the
+/// distilled memories may have dropped the detail. Read-only over the same
+/// store the Settings transcript search uses; no gate needed (it discloses
+/// the user's own chat history to the user's own assistant).
+pub struct ChatHistorySearchTool {
+    store: Arc<MemoryStore>,
+}
+
+/// Cap on messages returned per search — the tool result enters model
+/// context, so a broad query must page, not flood.
+const CHAT_HISTORY_MAX_RESULTS: usize = 20;
+const CHAT_HISTORY_DEFAULT_RESULTS: usize = 8;
+
+/// Cap on one matched message's text in the result (long assistant replies
+/// would blow the context for no recall value — the match is what matters).
+const CHAT_HISTORY_EXCERPT_CHARS: usize = 280;
+
+impl ChatHistorySearchTool {
+    pub fn new(store: Arc<MemoryStore>) -> Self {
+        Self { store }
+    }
+
+    pub fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: CHAT_HISTORY_SEARCH_TOOL.into(),
+            description: "Search the user's PAST chat conversations with you — the stored \
+                          verbatim transcripts of earlier sessions. Call this when the user \
+                          asks what they asked or discussed before (e.g. \"what recipes have I \
+                          asked you about?\" -> query \"recipe\"). Returns matching messages \
+                          (who said it, when) newest first. Search a short keyword, not a \
+                          whole sentence."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to find in past messages, e.g. \"recipe\""
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum messages to return (optional)",
+                        "minimum": 1,
+                        "maximum": CHAT_HISTORY_MAX_RESULTS
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+}
+
+/// Head excerpt on a char boundary, `…`-suffixed when truncated.
+fn head_excerpt(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatHistorySearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[async_trait]
+impl ToolExecutor for ChatHistorySearchTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name != CHAT_HISTORY_SEARCH_TOOL {
+            return ToolOutcome::failure(
+                "unknown-tool",
+                format!(
+                    "unknown tool: {} (available: {CHAT_HISTORY_SEARCH_TOOL})",
+                    call.name
+                ),
+            );
+        }
+        let args: ChatHistorySearchArgs = match serde_json::from_str(&call.arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return ToolOutcome::failure(
+                    "invalid-arguments",
+                    format!("invalid {CHAT_HISTORY_SEARCH_TOOL} arguments: {e}"),
+                )
+            }
+        };
+        if args.query.trim().is_empty() {
+            return ToolOutcome::failure(
+                "invalid-arguments",
+                "query must not be empty — search a keyword like \"recipe\"",
+            );
+        }
+        let limit = args
+            .limit
+            .unwrap_or(CHAT_HISTORY_DEFAULT_RESULTS)
+            .clamp(1, CHAT_HISTORY_MAX_RESULTS);
+        match self.store.chat_messages_matching(&args.query, limit) {
+            Ok(rows) => {
+                let shaped: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "sessionId": m.session_id,
+                            "role": m.role,
+                            "text": head_excerpt(&m.text, CHAT_HISTORY_EXCERPT_CHARS),
+                            "at": format_at_ms(m.at_ms),
+                        })
+                    })
+                    .collect();
+                let count = shaped.len();
+                let content = serde_json::to_string(&shaped).unwrap_or_else(|e| {
+                    format!(r#"{{"error":"result serialization failed: {e}"}}"#)
+                });
+                ToolOutcome {
+                    content,
+                    ok: true,
+                    result_count: Some(count),
+                    mode: None,
+                    failure: None,
+                    attachment_png: None,
+                }
+            }
+            Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
+        }
+    }
+}
+
+/// Epoch ms → local "YYYY-MM-DD HH:MM" — the model reasons about "last
+/// Tuesday", not epoch integers.
+fn format_at_ms(at_ms: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(at_ms) {
+        chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        _ => at_ms.to_string(),
     }
 }
 
@@ -598,16 +801,19 @@ impl InputTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: INPUT_ACTION_TOOL.into(),
-            description: "Drive this computer's mouse and keyboard: click the mouse (optionally \
-                          moving to a target first), move the mouse, type text, or press a single \
-                          key. Coordinates are absolute screen pixels and MUST come from a \
+            description: "Drive this computer's mouse and keyboard: click (single, double, or \
+                          triple), drag (press-glide-release — select text, move things), scroll \
+                          the wheel, move the mouse, type text, or press a key with optional \
+                          modifiers (cmd/ctrl/alt/shift — e.g. cmd+c to copy, cmd+a to select all). Coordinates are absolute screen pixels and MUST come from a \
                           screen_query result — never guess an x/y. To click something: call \
                           focus_app to bring the app to the front, then screen_query to read its \
-                          on-screen elements and their exact coordinates, then mouse-click with the \
-                          x,y of the target (the click moves there and clicks in one step). A click \
+                          on-screen elements, then mouse-click passing the target element's cx,cy \
+                          verbatim as x,y (the click moves there and clicks in one step). A click \
                           or move to a guessed coordinate is refused. Every result includes a \
                           `verified` block measured from the OS AFTER the action: `cursor` (where \
-                          the mouse really is), `focus` (the app and UI element that now holds \
+                          the mouse really is), for clicks `clickedElement` (the UI element that \
+                          was under the click — check its role/title matches what you aimed at), \
+                          `focus` (the app and UI element that now holds \
                           keyboard focus), and for type-text `textEntered` (whether the typed text \
                           was observed in the focused field). ALWAYS check `verified` before your \
                           next step: if it does not match what you intended (wrong app in focus, \
@@ -619,25 +825,54 @@ impl InputTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["mouse-move", "mouse-click", "type-text", "key-press"],
+                        "enum": ["mouse-move", "mouse-click", "mouse-drag", "scroll", "type-text", "key-press"],
                         "description": "Which HID action to perform."
                     },
                     "x": {
                         "type": "integer",
-                        "description": "mouse-move / mouse-click: absolute screen X coordinate in \
-                                        pixels, from a screen_query element. For mouse-click, pass \
-                                        x and y together to move to the target then click it."
+                        "description": "mouse-move / mouse-click: absolute screen X — pass the \
+                                        target element's cx from screen_query verbatim. For \
+                                        mouse-click, pass x and y together to move to the target \
+                                        then click it."
                     },
                     "y": {
                         "type": "integer",
-                        "description": "mouse-move / mouse-click: absolute screen Y coordinate in \
-                                        pixels, from a screen_query element. For mouse-click, pass \
-                                        x and y together to move to the target then click it."
+                        "description": "mouse-move / mouse-click: absolute screen Y — pass the \
+                                        target element's cy from screen_query verbatim. For \
+                                        mouse-click, pass x and y together to move to the target \
+                                        then click it."
                     },
                     "button": {
                         "type": "string",
                         "enum": ["left", "right", "middle"],
-                        "description": "mouse-click: which mouse button to click (default left)."
+                        "description": "mouse-click / mouse-drag: which mouse button (default left)."
+                    },
+                    "clicks": {
+                        "type": "integer",
+                        "enum": [1, 2, 3],
+                        "description": "mouse-click: 2 double-clicks (open a file, select a word), \
+                                        3 triple-clicks (select a whole line). Default 1."
+                    },
+                    "fromX": { "type": "integer", "description": "mouse-drag: drag start X — the start element's cx from screen_query." },
+                    "fromY": { "type": "integer", "description": "mouse-drag: drag start Y — the start element's cy from screen_query." },
+                    "toX": { "type": "integer", "description": "mouse-drag: drag end X — the end element's cx from screen_query." },
+                    "toY": { "type": "integer", "description": "mouse-drag: drag end Y — the end element's cy from screen_query." },
+                    "deltaX": {
+                        "type": "integer",
+                        "description": "scroll: horizontal wheel lines (positive scrolls right)."
+                    },
+                    "deltaY": {
+                        "type": "integer",
+                        "description": "scroll: vertical wheel lines — positive scrolls the content \
+                                        DOWN (to see further), negative scrolls back up. Use with \
+                                        optional x/y to aim the pane first."
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["cmd", "ctrl", "alt", "shift"] },
+                        "description": "key-press: modifiers held while pressing the key — e.g. \
+                                        [\"cmd\"] with key \"c\" copies, [\"cmd\"] + \"a\" selects all, \
+                                        [\"cmd\"] + \"v\" pastes."
                     },
                     "text": {
                         "type": "string",
@@ -731,6 +966,7 @@ impl ToolExecutor for InputTool {
                         result_count: None,
                         mode: None,
                         failure: Some(VERIFICATION_FAILED_KIND.to_string()),
+                        attachment_png: None,
                     };
                 }
                 ToolOutcome {
@@ -744,6 +980,7 @@ impl ToolExecutor for InputTool {
                     result_count: None,
                     mode: None,
                     failure: None,
+                    attachment_png: None,
                 }
             }
             // Typed InputError → same kind tag the UI matches on; the model sees
@@ -793,10 +1030,11 @@ impl ScreenQueryTool {
         ToolDefinition {
             name: SCREEN_QUERY_TOOL.into(),
             description: "Return the text currently visible on this computer's screen, each \
-                          element with its absolute screen-pixel coordinates (x, y for the \
-                          top-left corner, plus width and height). Call this to see what is on \
-                          screen and to get the coordinates to pass to input_action to move or \
-                          click the mouse on a target."
+                          element with its absolute screen coordinates: cx, cy is the element's \
+                          exact centre — the ready-made click target — plus x, y (top-left \
+                          corner), width and height for context. To click an element, pass its \
+                          cx as x and cy as y to input_action verbatim; do not compute your own \
+                          coordinates."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -882,6 +1120,7 @@ impl ToolExecutor for ScreenQueryTool {
                     result_count: Some(elements.len()),
                     mode: None,
                     failure: None,
+                    attachment_png: None,
                 }
             }
             // Typed ScreenQueryError → same kind tag the UI matches on; the model
@@ -971,17 +1210,24 @@ impl ToolExecutor for FocusAppTool {
         match self.backend.focus(&args.app).await {
             Ok(focused) => ToolOutcome {
                 // `launched` lets the model say "opened" vs "switched to"
-                // truthfully; the gate reads only `focused`, so it is additive.
+                // truthfully; `visibleWindows` is the "frontmost but nothing
+                // on screen" detector — 0 means the app has NO open window
+                // and the user sees nothing until one is opened (cmd+n).
                 content: serde_json::json!({
                     "ok": true,
                     "focused": focused.app,
                     "launched": focused.launched,
+                    "visibleWindows": focused.visible_windows,
+                    "warning": if focused.visible_windows == Some(0) {
+                        Some("the app is frontmost but has ZERO visible windows — the user sees nothing; open a window (key-press \"n\" with modifiers [\"cmd\"]) or tell the user")
+                    } else { None },
                 })
                 .to_string(),
                 ok: true,
                 result_count: None,
                 mode: None,
                 failure: None,
+                attachment_png: None,
             },
             // A not-found carries the running-app candidates back to the model so
             // it can retry against a real name; other typed errors ride their
@@ -999,6 +1245,7 @@ impl ToolExecutor for FocusAppTool {
                 result_count: None,
                 mode: None,
                 failure: Some("not-found".to_string()),
+                attachment_png: None,
             },
             Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
         }
@@ -1148,13 +1395,36 @@ impl ApprovalGate {
     fn summary(action: &InputAction) -> String {
         match action {
             InputAction::MouseMove { x, y } => format!("Move the mouse to ({x}, {y})"),
+            InputAction::MouseDrag {
+                button,
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => format!(
+                "Drag the {} mouse button from ({from_x}, {from_y}) to ({to_x}, {to_y})",
+                button_name(*button)
+            ),
+            InputAction::Scroll {
+                delta_x, delta_y, ..
+            } => format!(
+                "Scroll the page (deltaX {}, deltaY {})",
+                delta_x.unwrap_or(0),
+                delta_y.unwrap_or(0)
+            ),
             InputAction::MouseClick {
                 button,
                 x: Some(x),
                 y: Some(y),
+                clicks,
             } => {
+                let times = match clicks.unwrap_or(1) {
+                    2 => "Double-click",
+                    3 => "Triple-click",
+                    _ => "Click",
+                };
                 format!(
-                    "Click the {} mouse button at ({x}, {y})",
+                    "{times} the {} mouse button at ({x}, {y})",
                     button_name(*button)
                 )
             }
@@ -1162,7 +1432,12 @@ impl ApprovalGate {
                 format!("Click the {} mouse button", button_name(*button))
             }
             InputAction::TypeText { text } => format!("Type {}", quote_preview(text)),
-            InputAction::KeyPress { key } => format!("Press the {key} key"),
+            InputAction::KeyPress { key, modifiers } => match modifiers {
+                Some(mods) if !mods.is_empty() => {
+                    format!("Press {}+{}", mods.join("+"), key)
+                }
+                _ => format!("Press the {key} key"),
+            },
         }
     }
 
@@ -1379,7 +1654,7 @@ impl ToolExecutor for ApprovalGate {
                         "({ax}, {ay}) is not inside any element screen_query returned — that spot \
                          is empty desktop, and clicking it hides the user's windows instead of \
                          doing what they asked. Pick one of the elements from the most recent \
-                         screen_query and aim at its centre (x + width/2, y + height/2). If the \
+                         screen_query and pass its cx,cy verbatim as the click's x,y. If the \
                          target is not among them, call screen_query again (or focus_app then \
                          screen_query) — never invent a coordinate."
                     ),
@@ -1625,6 +1900,17 @@ pub async fn run_tool_loop_with_stop(
 
             // Second half of the round-trip: the tool-role answer.
             messages.push(ChatMessage::tool_result(&call.id, result.content));
+            // A screenshot rides as a follow-up vision user turn — the chat
+            // API's tool role is text-only. Marked so the model knows the
+            // image answers its own call, not a new user question.
+            if let Some(base64_png) = result.attachment_png {
+                messages.push(
+                    ChatMessage::user(
+                        "[the screenshot your take_screenshot call captured — look at it]",
+                    )
+                    .with_attachments(vec![crate::llm::Attachment { base64_png }]),
+                );
+            }
         }
     }
     unreachable!("the tools-stripped final round always returns")
@@ -1752,6 +2038,60 @@ mod tests {
                 detail: "down".into(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn chat_history_search_returns_matching_past_messages() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let session = store.chat_session_create(1_000).unwrap();
+        store
+            .chat_append_exchange(
+                session,
+                "find me a good carbonara recipe",
+                &format!("Here is RecipeTinEats carbonara. {}", "x".repeat(400)),
+                1_753_500_000_000,
+            )
+            .unwrap();
+        let tool = ChatHistorySearchTool::new(Arc::new(store));
+        let outcome = tool
+            .execute(&ToolCall {
+                id: "c1".into(),
+                name: CHAT_HISTORY_SEARCH_TOOL.into(),
+                arguments: r#"{"query":"recipe"}"#.into(),
+            })
+            .await;
+        assert!(outcome.ok, "{:?}", outcome.failure);
+        assert_eq!(outcome.result_count, Some(2));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&outcome.content).unwrap();
+        // Newest first: the long assistant reply is excerpted, the user
+        // question verbatim; both carry a readable local timestamp.
+        assert_eq!(rows[1]["role"], "user");
+        assert_eq!(rows[1]["text"], "find me a good carbonara recipe");
+        assert!(rows[0]["text"].as_str().unwrap().ends_with('…'));
+        assert!(rows[0]["text"].as_str().unwrap().chars().count() <= 281);
+        assert!(rows[0]["at"].as_str().unwrap().starts_with("20"));
+
+        // A miss is an honest empty result, not an error.
+        let miss = tool
+            .execute(&ToolCall {
+                id: "c2".into(),
+                name: CHAT_HISTORY_SEARCH_TOOL.into(),
+                arguments: r#"{"query":"gnocchi"}"#.into(),
+            })
+            .await;
+        assert!(miss.ok);
+        assert_eq!(miss.result_count, Some(0));
+
+        // Empty/blank query is a typed refusal.
+        let blank = tool
+            .execute(&ToolCall {
+                id: "c3".into(),
+                name: CHAT_HISTORY_SEARCH_TOOL.into(),
+                arguments: r#"{"query":"  "}"#.into(),
+            })
+            .await;
+        assert!(!blank.ok);
+        assert_eq!(blank.failure.as_deref(), Some("invalid-arguments"));
     }
 
     fn seeded_tool() -> MemorySearchTool {
@@ -2296,6 +2636,7 @@ mod tests {
                     value: None,
                 }),
                 text_entered: None,
+                clicked_element: None,
             })
         }
     }
@@ -2458,6 +2799,32 @@ mod tests {
         let detail = verify_against_intent(&observed("Third Eye"), Some("Google Chrome"))
             .expect("a wrong-app readback must contradict");
         assert!(detail.contains("Third Eye") && detail.contains("Google Chrome"));
+    }
+
+    #[test]
+    fn verify_against_intent_checks_the_click_hit_test_first() {
+        let hit = |app: Option<&str>| ActionReport {
+            clicked_element: Some(FocusReport {
+                app: app.map(Into::into),
+                role: Some("AXLink".into()),
+                ..FocusReport::default()
+            }),
+            ..ActionReport::default()
+        };
+        // The element under the click belongs to another app → contradiction,
+        // even though keyboard focus reported nothing (links take no focus).
+        let detail = verify_against_intent(&hit(Some("Finder")), Some("Google Chrome"))
+            .expect("a wrong-app hit-test must contradict");
+        assert!(detail.contains("Finder") && detail.contains("Google Chrome"));
+        // Same app (any casing) or an unattributed hit → inert.
+        assert_eq!(
+            verify_against_intent(&hit(Some("google chrome")), Some("Google Chrome")),
+            None
+        );
+        assert_eq!(
+            verify_against_intent(&hit(None), Some("Google Chrome")),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2689,6 +3056,8 @@ mod tests {
                     y: 200,
                     width: 60,
                     height: 24,
+                    cx: 0,
+                    cy: 0,
                     app: None,
                 }]),
             }
@@ -2711,6 +3080,8 @@ mod tests {
                         y: 2,
                         width: 3,
                         height: 4,
+                        cx: 0,
+                        cy: 0,
                         app: app.map(str::to_owned),
                     })
                     .collect()),
@@ -2783,6 +3154,8 @@ mod tests {
                 y: 0,
                 width: 1,
                 height: 1,
+                cx: 0,
+                cy: 0,
                 app: Some("Chrome".into()),
             },
             ScreenElement {
@@ -2791,6 +3164,8 @@ mod tests {
                 y: 0,
                 width: 1,
                 height: 1,
+                cx: 0,
+                cy: 0,
                 app: None,
             },
         ];
@@ -2811,6 +3186,8 @@ mod tests {
                 y: 0,
                 width: 1,
                 height: 1,
+                cx: 0,
+                cy: 0,
                 app: Some("google chrome".into()),
             },
             ScreenElement {
@@ -2819,6 +3196,8 @@ mod tests {
                 y: 0,
                 width: 1,
                 height: 1,
+                cx: 0,
+                cy: 0,
                 app: Some("Finder".into()),
             },
             ScreenElement {
@@ -2827,6 +3206,8 @@ mod tests {
                 y: 0,
                 width: 1,
                 height: 1,
+                cx: 0,
+                cy: 0,
                 app: None,
             },
         ]);
@@ -3035,6 +3416,7 @@ mod tests {
             Ok(crate::appfocus::FocusedApp {
                 app: app_name.to_string(),
                 launched: false,
+                visible_windows: None,
             })
         }
 
@@ -3657,6 +4039,7 @@ mod tests {
                 r#"{"action":"key-press","key":"return"}"#,
                 InputAction::KeyPress {
                     key: "return".into(),
+                    modifiers: None,
                 },
             ),
         ] {

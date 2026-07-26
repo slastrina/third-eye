@@ -11,6 +11,8 @@ import {
   chatReducer,
   composeMessages,
   initialChatState,
+  freshNudgePreload,
+  NUDGE_PRELOAD_FRESH_MS,
   nudgeContextMessage,
   nextProbeDelay,
   showStopButton,
@@ -927,11 +929,29 @@ describe("chatReducer nudge lifecycle", () => {
     expect(s.nudgePreload).toBeNull();
   });
 
-  it("auto-timeout dismiss clears the banner without staging a preload", () => {
+  it("auto-timeout dismiss clears the banner but STAGES the preload", () => {
+    // The user often summons chat after the 12s banner timeout — the nudge's
+    // context must survive the dismissal (freshness is enforced at submit).
     let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
     s = chatReducer(s, { type: "nudge-dismissed", reason: "auto-timeout" });
     expect(s.nudge).toBeNull();
+    expect(s.nudgePreload).toEqual(nudge);
+  });
+
+  it("disabled dismiss clears the banner AND any staged preload", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "auto-timeout" });
+    s = chatReducer(s, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "disabled" });
+    expect(s.nudge).toBeNull();
     expect(s.nudgePreload).toBeNull();
+  });
+
+  it("freshNudgePreload passes a recent stage and drops a stale one", () => {
+    const now = nudge.capturedAtMs + NUDGE_PRELOAD_FRESH_MS;
+    expect(freshNudgePreload(nudge, now)).toEqual(nudge);
+    expect(freshNudgePreload(nudge, now + 1)).toBeNull();
+    expect(freshNudgePreload(null, now)).toBeNull();
   });
 
   it("summoned dismiss stages the banner's payload as the chat preload", () => {
@@ -980,6 +1000,17 @@ describe("nudge context preload composition", () => {
   it("composes without a system message when no preload is staged", () => {
     const wire = composeMessages([], "hi", [], null);
     expect(wire).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  it("tells the model about the attached nudge-time screenshot only when one rides", () => {
+    const withShot = nudgeContextMessage(nudge, true);
+    expect(withShot.content).toContain("screenshot taken when the nudge appeared");
+    const without = nudgeContextMessage(nudge, false);
+    expect(without.content).not.toContain("screenshot");
+    // composeMessages threads the flag through to the system message.
+    const wire = composeMessages([], "what was that about?", [{ base64Png: "UE5H" }], nudge, true);
+    expect(wire[0].content).toContain("screenshot");
+    expect(wire[1].attachments).toEqual([{ base64Png: "UE5H" }]);
   });
 
   it("omits the memory block and app label when the payload has neither", () => {

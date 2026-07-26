@@ -54,12 +54,45 @@ pub enum InputAction {
         x: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         y: Option<i32>,
+        /// Click count: 1 (default), 2 (double-click — open / select word),
+        /// or 3 (triple-click — select line/paragraph).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clicks: Option<u8>,
+    },
+    /// Press the button at (fromX, fromY), glide to (toX, toY), release —
+    /// text selection, drag-and-drop, sliders. Both endpoints are absolute
+    /// screen coordinates and must be grounded like any aimed action.
+    MouseDrag {
+        button: MouseButton,
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    /// Scroll the wheel, optionally after moving to (x, y) first so the
+    /// scroll lands on the intended pane. Deltas are wheel lines: positive
+    /// `deltaY` scrolls content DOWN (toward the end), positive `deltaX`
+    /// scrolls right. At least one delta must be non-zero.
+    Scroll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_x: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_y: Option<i32>,
     },
     /// Type a run of Unicode text as keystrokes.
     TypeText { text: String },
     /// Press (and release) a single named key — e.g. `return`, `tab`, `escape`,
-    /// or a one-character string for a literal key.
-    KeyPress { key: String },
+    /// or a one-character string for a literal key — optionally while holding
+    /// modifiers ("cmd", "ctrl", "alt", "shift"): Cmd+C, Cmd+Shift+T, ….
+    KeyPress {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
+    },
 }
 
 impl InputAction {
@@ -71,6 +104,8 @@ impl InputAction {
         match self {
             InputAction::MouseMove { .. } => ActionKind::MouseMove,
             InputAction::MouseClick { .. } => ActionKind::MouseClick,
+            InputAction::MouseDrag { .. } => ActionKind::MouseDrag,
+            InputAction::Scroll { .. } => ActionKind::Scroll,
             InputAction::TypeText { .. } => ActionKind::TypeText,
             InputAction::KeyPress { .. } => ActionKind::KeyPress,
         }
@@ -82,6 +117,8 @@ impl InputAction {
         match self {
             InputAction::MouseMove { .. } => "mouse-move",
             InputAction::MouseClick { .. } => "mouse-click",
+            InputAction::MouseDrag { .. } => "mouse-drag",
+            InputAction::Scroll { .. } => "scroll",
             InputAction::TypeText { .. } => "type-text",
             InputAction::KeyPress { .. } => "key-press",
         }
@@ -95,6 +132,7 @@ impl InputAction {
             button,
             x: None,
             y: None,
+            clicks: None,
         }
     }
 
@@ -106,6 +144,7 @@ impl InputAction {
             button,
             x: Some(x),
             y: Some(y),
+            clicks: None,
         }
     }
 
@@ -121,6 +160,12 @@ impl InputAction {
                 y: Some(y),
                 ..
             } => Some((*x, *y)),
+            InputAction::MouseDrag { from_x, from_y, .. } => Some((*from_x, *from_y)),
+            InputAction::Scroll {
+                x: Some(x),
+                y: Some(y),
+                ..
+            } => Some((*x, *y)),
             _ => None,
         }
     }
@@ -130,12 +175,45 @@ impl InputAction {
     /// reaches the backend (so a half-specified aim never silently clicks at the
     /// cursor). Returns the offending field name for the error detail.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if let InputAction::MouseClick { x, y, .. } = self {
-            match (x, y) {
-                (Some(_), None) => return Err("mouse-click has x but no y"),
-                (None, Some(_)) => return Err("mouse-click has y but no x"),
-                _ => {}
+        match self {
+            InputAction::MouseClick { x, y, clicks, .. } => {
+                match (x, y) {
+                    (Some(_), None) => return Err("mouse-click has x but no y"),
+                    (None, Some(_)) => return Err("mouse-click has y but no x"),
+                    _ => {}
+                }
+                if let Some(c) = clicks {
+                    if !(1..=3).contains(c) {
+                        return Err("mouse-click clicks must be 1, 2, or 3");
+                    }
+                }
             }
+            InputAction::Scroll {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                match (x, y) {
+                    (Some(_), None) => return Err("scroll has x but no y"),
+                    (None, Some(_)) => return Err("scroll has y but no x"),
+                    _ => {}
+                }
+                if delta_x.unwrap_or(0) == 0 && delta_y.unwrap_or(0) == 0 {
+                    return Err("scroll needs a non-zero deltaX or deltaY");
+                }
+            }
+            InputAction::KeyPress {
+                modifiers: Some(modifiers),
+                ..
+            } => {
+                for m in modifiers {
+                    if !matches!(m.as_str(), "cmd" | "ctrl" | "alt" | "shift") {
+                        return Err("key-press modifiers must be cmd, ctrl, alt, or shift");
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -151,6 +229,10 @@ impl InputAction {
 pub enum ActionKind {
     MouseMove,
     MouseClick,
+    /// Press-glide-release (`mouse-drag`): selection and drag-and-drop.
+    MouseDrag,
+    /// Wheel scrolling (`scroll`), optionally aimed first.
+    Scroll,
     TypeText,
     KeyPress,
     /// Bring a running app to the front — the `focus_app` tool's action kind
@@ -158,6 +240,10 @@ pub enum ActionKind {
     /// enigo event), but it is HID-class: gated through the same `ApprovalGate`
     /// and grantable ("Always allow this kind") via the session whitelist.
     FocusApp,
+    /// Read or write the system clipboard — the `clipboard` tool's action
+    /// kind. No InputAction payload (not an enigo event); gated on the same
+    /// HidRunMode path (reading clipboard contents is user data).
+    Clipboard,
     /// Execute a terminal command — the `run_command` tool's action kind
     /// (computer-control I2). No [`InputAction`] payload (not an enigo
     /// event) and gated by its OWN structural switch (`commandsEnabled`,
@@ -302,6 +388,13 @@ pub struct ActionReport {
     /// (some targets never echo text), but `Some(true)` is proof of success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_entered: Option<bool>,
+    /// Clicks only: the UI element that was under the cursor at click time
+    /// (AX hit-test at the committed point, taken just before the button
+    /// event). This is what the click actually hit — a link click that
+    /// reads back the wrong title or another app's element landed off
+    /// target, even when the cursor position itself is exactly right.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clicked_element: Option<FocusReport>,
 }
 
 /// An absolute cursor position in logical screen points (top-left origin) —
@@ -432,6 +525,59 @@ impl InputControl for KeyboardFocusYield {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn new_action_vocabulary_parses_and_validates() {
+        // Drag: kebab tag + camelCase fields.
+        let drag: InputAction = serde_json::from_str(
+            r#"{"action":"mouse-drag","button":"left","fromX":10,"fromY":20,"toX":30,"toY":40}"#,
+        )
+        .unwrap();
+        assert_eq!(drag.kind(), ActionKind::MouseDrag);
+        assert_eq!(drag.aim_target(), Some((10, 20)));
+        assert!(drag.validate().is_ok());
+
+        // Scroll: coordless is fine, but needs a delta; aimed needs the pair.
+        let scroll: InputAction =
+            serde_json::from_str(r#"{"action":"scroll","deltaY":5}"#).unwrap();
+        assert_eq!(scroll.kind(), ActionKind::Scroll);
+        assert_eq!(scroll.aim_target(), None);
+        assert!(scroll.validate().is_ok());
+        let dead: InputAction = serde_json::from_str(r#"{"action":"scroll"}"#).unwrap();
+        assert!(dead.validate().is_err());
+        let half: InputAction =
+            serde_json::from_str(r#"{"action":"scroll","x":5,"deltaY":1}"#).unwrap();
+        assert!(half.validate().is_err());
+
+        // Click counts clamp to the 1..=3 contract.
+        let double: InputAction = serde_json::from_str(
+            r#"{"action":"mouse-click","button":"left","x":1,"y":2,"clicks":2}"#,
+        )
+        .unwrap();
+        assert!(double.validate().is_ok());
+        let silly: InputAction =
+            serde_json::from_str(r#"{"action":"mouse-click","button":"left","clicks":9}"#).unwrap();
+        assert!(silly.validate().is_err());
+
+        // Modifier vocabulary is closed.
+        let combo: InputAction =
+            serde_json::from_str(r#"{"action":"key-press","key":"c","modifiers":["cmd"]}"#)
+                .unwrap();
+        assert!(combo.validate().is_ok());
+        let bad: InputAction =
+            serde_json::from_str(r#"{"action":"key-press","key":"c","modifiers":["hyper"]}"#)
+                .unwrap();
+        assert!(bad.validate().is_err());
+
+        // Wire compat: the pre-extension payloads still parse.
+        let old_click: InputAction =
+            serde_json::from_str(r#"{"action":"mouse-click","button":"left","x":1,"y":2}"#)
+                .unwrap();
+        assert_eq!(old_click, InputAction::click_at(MouseButton::Left, 1, 2));
+        let old_key: InputAction =
+            serde_json::from_str(r#"{"action":"key-press","key":"return"}"#).unwrap();
+        assert!(old_key.validate().is_ok());
+    }
     use super::*;
     use std::sync::Arc;
 
@@ -615,6 +761,12 @@ mod tests {
                 value: Some("farts".into()),
             }),
             text_entered: Some(true),
+            clicked_element: Some(FocusReport {
+                app: Some("Google Chrome".into()),
+                role: Some("AXLink".into()),
+                title: Some("Quick and Easy Carbonara".into()),
+                value: None,
+            }),
         };
         let v = serde_json::to_value(&full).unwrap();
         assert_eq!(v["cursor"]["x"], 640);
@@ -624,6 +776,8 @@ mod tests {
         assert_eq!(v["focus"]["title"], "Address and search bar");
         assert_eq!(v["focus"]["value"], "farts");
         assert_eq!(v["textEntered"], true, "camelCase is the wire contract");
+        assert_eq!(v["clickedElement"]["role"], "AXLink");
+        assert_eq!(v["clickedElement"]["title"], "Quick and Easy Carbonara");
     }
 
     #[test]
@@ -648,6 +802,7 @@ mod tests {
             },
             InputAction::KeyPress {
                 key: "return".into(),
+                modifiers: None,
             },
         ];
         for action in actions {
@@ -714,6 +869,7 @@ mod tests {
             (
                 InputAction::KeyPress {
                     key: "return".into(),
+                    modifiers: None,
                 },
                 ActionKind::KeyPress,
                 "key-press",
@@ -804,6 +960,7 @@ mod tests {
         backend
             .perform(InputAction::KeyPress {
                 key: "return".into(),
+                modifiers: None,
             })
             .await
             .unwrap();

@@ -29,6 +29,7 @@ describe("SECTION_GROUPS", () => {
         "privacy",
         "programs",
         "status",
+        "tools",
         "watcher",
       ].sort(),
     );

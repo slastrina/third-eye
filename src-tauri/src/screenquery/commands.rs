@@ -30,7 +30,7 @@ impl ScreenQueryState {
         #[cfg(target_os = "macos")]
         {
             Self::new(Arc::new(super::macos::MacosScreenQuery::new(
-                crate::ocr::OCR_MAX_DIMENSION,
+                super::macos::SCREEN_QUERY_MAX_DIMENSION,
             )))
         }
         #[cfg(not(target_os = "macos"))]
@@ -66,6 +66,8 @@ mod tests {
                 y: 6,
                 width: 7,
                 height: 8,
+                cx: 0,
+                cy: 0,
                 app: None,
             }])
         }

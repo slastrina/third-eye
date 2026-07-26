@@ -50,6 +50,9 @@ pub fn apply_nudges_enabled(app: &AppHandle, desired: bool, via: &str) -> NudgeS
 
     if !state.enabled() {
         dismiss_active(app, DismissReason::Disabled);
+        // Disabling withdraws consent for proactive captures — the parked
+        // nudge-time screenshot goes too, even if no nudge was active.
+        state.clear_frame();
     }
 
     let status = state.status();
@@ -112,6 +115,22 @@ pub fn nudge_status(state: State<'_, NudgeState>) -> NudgeStatus {
         status.persist_error
     );
     status
+}
+
+/// The screenshot taken when the nudge stamped `captured_at_ms` was shown,
+/// as base64 PNG — fetched by the overlay when a summon-from-nudge submit
+/// grounds a chat in that nudge, and attached to the outgoing question so
+/// the model can SEE what the nudge saw. Health-as-value: `None` when no
+/// frame was retained (privacy mode, capture failure, a different nudge
+/// superseded it) — the chat then grounds in the payload's text alone.
+#[tauri::command]
+pub fn nudge_context_frame(state: State<'_, NudgeState>, captured_at_ms: i64) -> Option<String> {
+    let frame = state.frame_for(captured_at_ms);
+    log::debug!(
+        "nudge: context frame requested (capturedAtMs={captured_at_ms}, present={})",
+        frame.is_some()
+    );
+    frame
 }
 
 #[cfg(test)]

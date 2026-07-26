@@ -36,13 +36,16 @@ const healthyStatus: MockNudgeStatus = {
   persistError: null,
 };
 
-/** A representative pixel-free nudge://show payload (camelCase serde shape). */
+/** A representative pixel-free nudge://show payload (camelCase serde shape).
+ *  Stamped at spec-eval time: real payloads carry a just-captured timestamp,
+ *  and a summit only grounds in a preload still inside the freshness window
+ *  (freshNudgePreload) — a fixed 2023 stamp would be dropped as stale. */
 const nudgePayload = {
   kind: "nudge",
   message: "Looks like a stack trace — want a hand?",
   screenText: "TypeError: cannot read properties of undefined (reading 'map')",
   appContext: "VS Code",
-  capturedAtMs: 1_700_000_000_000,
+  capturedAtMs: Date.now(),
   memoryContext: ["You fixed a similar TypeError in chat.ts last week"],
 };
 
@@ -268,7 +271,7 @@ test("a summoned dismiss grounds exactly the next question, consume-once", async
   expect(second[second.length - 1]).toEqual({ role: "user", content: "and a follow-up" });
 });
 
-test("a non-summon dismiss stages no preload", async ({ page }) => {
+test("an auto-timeout dismiss still grounds the next question (late summon)", async ({ page }) => {
   await installNudgeIpcMock(page);
   await page.goto("/");
   await waitForListener(page, "nudge://dismiss");
@@ -276,8 +279,38 @@ test("a non-summon dismiss stages no preload", async ({ page }) => {
   await emit(page, "nudge://show", nudgePayload);
   await emit(page, "overlay://state-changed", "visible-idle");
   await expect(page.locator(".nudge-banner")).toBeVisible();
-  // The nudge times out unanswered; the user opens chat later on their own.
+  // The nudge times out unanswered; the user summons chat AFTER the banner
+  // is gone — the fix for "when I asked it didn't have any context": the
+  // context survives the timeout and grounds the first question.
   await emit(page, "nudge://dismiss", "auto-timeout");
+  await emit(page, "overlay://state-changed", "hidden");
+  await emit(page, "overlay://state-changed", "visible-focused");
+
+  const input = page.getByLabel("Overlay input");
+  await input.fill("what were those file sizes?");
+  await input.press("Enter");
+  await expect(page.locator(".chat-message.chat-user")).toHaveText("what were those file sizes?");
+
+  const calls = await page.evaluate(() => (window as any).__mockNudge.chatCalls());
+  expect(calls).toHaveLength(1);
+  const first = calls[0] as Array<{ role: string; content: string }>;
+  expect(first).toHaveLength(2);
+  expect(first[0].role).toBe("system");
+  expect(first[0].content).toContain('proactive nudge: "Looks like a stack trace — want a hand?"');
+  expect(first[1]).toEqual({ role: "user", content: "what were those file sizes?" });
+});
+
+test("a disabled dismiss stages no preload", async ({ page }) => {
+  await installNudgeIpcMock(page);
+  await page.goto("/");
+  await waitForListener(page, "nudge://dismiss");
+
+  await emit(page, "nudge://show", nudgePayload);
+  await emit(page, "overlay://state-changed", "visible-idle");
+  await expect(page.locator(".nudge-banner")).toBeVisible();
+  // The user turns nudges off while one is parked — its context must not
+  // ground anything afterwards.
+  await emit(page, "nudge://dismiss", "disabled");
   await emit(page, "overlay://state-changed", "hidden");
   await emit(page, "overlay://state-changed", "visible-focused");
 

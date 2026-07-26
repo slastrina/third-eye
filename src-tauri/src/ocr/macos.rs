@@ -149,6 +149,12 @@ pub struct TextElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// The box center, computed server-side at FULL precision during the
+    /// pixel→point mapping (never re-derived from the rounded x/width —
+    /// double rounding costs a point, and small models doing x+w/2 cost
+    /// more). This is the coordinate a click should aim at.
+    pub cx: i32,
+    pub cy: i32,
     /// The localized name of the app whose on-screen window covers this
     /// element's center, or `None` when no window is attributable (M005). Set by
     /// [`attribute_app`] against the capture's [`WindowAppRect`] list; lets the
@@ -247,6 +253,10 @@ fn recognize_text_with_bounds(
                     y,
                     width,
                     height,
+                    // Pixel-space seed; to_screen_points recomputes at full
+                    // precision during the point mapping.
+                    cx: x + width / 2,
+                    cy: y + height / 2,
                     app,
                 });
             }
@@ -301,12 +311,21 @@ fn to_screen_points(el: TextElement, geom: CaptureGeometry) -> TextElement {
     }
     let sx = geom.point_w / geom.pixel_w as f64;
     let sy = geom.point_h / geom.pixel_h as f64;
+    // Center at FULL precision before any rounding: x, width round
+    // independently for display, but the click target must not inherit
+    // their combined error (up to a point each way).
+    let fx = el.x as f64 * sx;
+    let fy = el.y as f64 * sy;
+    let fw = el.width as f64 * sx;
+    let fh = el.height as f64 * sy;
     TextElement {
         text: el.text,
-        x: (el.x as f64 * sx).round() as i32,
-        y: (el.y as f64 * sy).round() as i32,
-        width: (el.width as f64 * sx).round() as i32,
-        height: (el.height as f64 * sy).round() as i32,
+        x: fx.round() as i32,
+        y: fy.round() as i32,
+        width: fw.round() as i32,
+        height: fh.round() as i32,
+        cx: (fx + fw / 2.0).round() as i32,
+        cy: (fy + fh / 2.0).round() as i32,
         app: el.app,
     }
 }
@@ -482,10 +501,14 @@ mod tests {
             y: 480,
             width: 800,
             height: 80,
+            cx: 0,
+            cy: 0,
             app: Some("Google Chrome".into()),
         };
         let pt = to_screen_points(el, geom);
         assert_eq!((pt.x, pt.y, pt.width, pt.height), (840, 240, 400, 40));
+        // The click target is the box centre, computed server-side.
+        assert_eq!((pt.cx, pt.cy), (1040, 260));
         assert_eq!(pt.app.as_deref(), Some("Google Chrome"));
     }
 
@@ -505,6 +528,8 @@ mod tests {
             y: 200,
             width: 60,
             height: 24,
+            cx: 130,
+            cy: 212,
             app: None,
         };
         let pt = to_screen_points(el.clone(), geom);
@@ -526,9 +551,44 @@ mod tests {
             y: 6,
             width: 7,
             height: 8,
+            cx: 0,
+            cy: 0,
             app: None,
         };
         assert_eq!(to_screen_points(el.clone(), geom), el);
+    }
+
+    #[test]
+    fn to_screen_points_center_is_computed_before_rounding() {
+        // The reason cx/cy exist: rounding x and width independently and THEN
+        // taking x + width/2 (what the model used to do) accumulates both
+        // errors. At scale 0.75, a 2x2 box at pixel (2, 2) maps to 1.5..2.25 —
+        // true centre 2.25 → 2, while the rounded-box arithmetic gives
+        // 2 + 2/2 = 3, a full point off.
+        let geom = CaptureGeometry {
+            pixel_w: 2048,
+            pixel_h: 2048,
+            point_w: 1536.0,
+            point_h: 1536.0,
+        };
+        let el = TextElement {
+            text: "x".into(),
+            x: 2,
+            y: 2,
+            width: 2,
+            height: 2,
+            cx: 0,
+            cy: 0,
+            app: None,
+        };
+        let pt = to_screen_points(el, geom);
+        assert_eq!((pt.x, pt.width), (2, 2));
+        assert_eq!((pt.cx, pt.cy), (2, 2));
+        assert_ne!(
+            pt.cx,
+            pt.x + pt.width / 2 + 1,
+            "naive arithmetic lands at 3"
+        );
     }
 
     #[test]

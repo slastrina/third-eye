@@ -4,7 +4,7 @@
 // the ghost target ring. Both fold the SAME global llm:// broadcasts through
 // hud-state; only the pill drives show_hud/hide_hud (single driver — the
 // canvas is passive, hud.rs contract).
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   onHidApprovalRequest,
@@ -22,6 +22,7 @@ import {
   type McpApprovalVerdict,
 } from "./chat";
 import {
+  appendTrailPoint,
   currentEntry,
   ghostTarget,
   hudApprovalsPending,
@@ -30,7 +31,12 @@ import {
   hudReducer,
   hudVisible,
   initialHudState,
+  isClickEntry,
+  pruneTrail,
+  settledClickRipples,
+  trailOpacity,
 } from "./hud-state";
+import type { TrailPoint, ClickRipple } from "./hud-state";
 import { ActionTrail } from "./ui/ActionTrail";
 import { GhostIndicator } from "./ui/GhostIndicator";
 import { HudPill } from "./ui/HudPill";
@@ -207,6 +213,57 @@ interface HudCanvasFit {
 export function HudCanvasView() {
   const hud = useHudState();
   const target = ghostTarget(hud);
+  // The follower badge rides the REAL cursor while Third Eye holds input —
+  // the design's ghost-cursor companion. Fed by a light cursor_position
+  // poll (~30Hz) only while a live run has input activity.
+  const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
+  // The motion trail: recent real-cursor samples, fading out (the design's
+  // ghost-cursor streak). Folded on every poll tick with the pure helpers.
+  const [trail, setTrail] = useState<TrailPoint[]>([]);
+  const followerActive =
+    hud.phase === "live" && hud.entries.some((entry) => entry.input);
+  useEffect(() => {
+    if (!followerActive) {
+      setCursor(null);
+      setTrail([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      invoke<{ x: number; y: number } | null>("cursor_position").then(
+        (point) => {
+          if (cancelled) return;
+          setCursor(point);
+          const now = Date.now();
+          setTrail((points) =>
+            point ? appendTrailPoint(points, { x: point.x, y: point.y, t: now }) : pruneTrail(points, now),
+          );
+        },
+        () => {},
+      );
+    }, 33);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [followerActive]);
+  // Click ripples: burst at the exact target the moment a click settles —
+  // green-lit amber for ok, failure color for a failed click. Diffed with
+  // the pure helper so replayed events cannot double-burst.
+  const [ripples, setRipples] = useState<ClickRipple[]>([]);
+  const prevEntriesRef = useRef<typeof hud.entries>([]);
+  useEffect(() => {
+    const burst = settledClickRipples(prevEntriesRef.current, hud.entries);
+    prevEntriesRef.current = hud.entries;
+    if (burst.length === 0) return;
+    setRipples((r) => [...r, ...burst]);
+    const ids = burst.map((b) => b.callId);
+    const timer = window.setTimeout(
+      () => setRipples((r) => r.filter((x) => !ids.includes(x.callId))),
+      700,
+    );
+    return () => window.clearTimeout(timer);
+  }, [hud.entries]);
   const [origin, setOrigin] = useReducer(
     (_prev: HudCanvasFit, next: HudCanvasFit) => next,
     { originX: 0, originY: 0 },
@@ -223,16 +280,52 @@ export function HudCanvasView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey]);
 
-  if (!target) return null;
   const entry = currentEntry(hud);
-  const isClick = entry?.name === "input_action" && entry.label.startsWith("click");
+  if (!target && !cursor && ripples.length === 0 && trail.length === 0) return null;
+  const isClick = entry !== null && isClickEntry(entry);
+  const now = Date.now();
   return (
     <div className="hud-canvas-root">
-      <GhostIndicator
-        x={target.x - origin.originX}
-        y={target.y - origin.originY}
-        click={isClick}
-      />
+      {trail.map((point) => (
+        <span
+          key={`${point.x},${point.y},${point.t}`}
+          className="hud-trail-dot"
+          style={{
+            left: point.x - origin.originX,
+            top: point.y - origin.originY,
+            opacity: trailOpacity(point, now),
+          }}
+          aria-hidden="true"
+        />
+      ))}
+      {ripples.map((ripple) => (
+        <span
+          key={ripple.callId}
+          className="hud-click-ripple"
+          data-failed={ripple.ok ? undefined : "true"}
+          style={{ left: ripple.x - origin.originX, top: ripple.y - origin.originY }}
+          aria-hidden="true"
+        />
+      ))}
+      {target && (
+        <GhostIndicator
+          x={target.x - origin.originX}
+          y={target.y - origin.originY}
+          click={isClick}
+        />
+      )}
+      {cursor && (
+        <div
+          className="hud-follower"
+          style={{ left: cursor.x - origin.originX, top: cursor.y - origin.originY }}
+          aria-hidden="true"
+        >
+          <span className="hud-follower-dot" />
+          <span className="hud-follower-badge">
+            {entry ? entry.label : "Third Eye"}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

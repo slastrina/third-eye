@@ -42,6 +42,11 @@ impl CaptureState {
         Self { backend }
     }
 
+    /// The capture backend, shared with the take_screenshot tool.
+    pub fn backend(&self) -> Arc<dyn ScreenCapture> {
+        self.backend.clone()
+    }
+
     /// State bound to this platform's live backend: ScreenCaptureKit on
     /// macOS, the typed-unsupported fallback everywhere else.
     pub fn with_platform_backend() -> Self {

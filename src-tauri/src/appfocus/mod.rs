@@ -51,6 +51,11 @@ use serde::Serialize;
 pub struct FocusedApp {
     pub app: String,
     pub launched: bool,
+    /// On-screen, layer-0 window count for the fronted app at verification
+    /// time. `Some(0)` is the "frontmost but nothing visible" trap (app
+    /// running with all windows closed) the model must react to; `None`
+    /// when the platform can't count (fallback, or the list call failed).
+    pub visible_windows: Option<usize>,
 }
 
 /// The full app-focus failure taxonomy (R007). Serialized with a `kind` tag
@@ -176,6 +181,7 @@ mod tests {
                 Some(app) => Ok(FocusedApp {
                     app: app.clone(),
                     launched: false,
+                    visible_windows: None,
                 }),
                 None => Err(AppFocusError::NotFound {
                     requested: app_name.to_string(),
@@ -225,6 +231,7 @@ mod tests {
         let f = FocusedApp {
             app: "Google Chrome".into(),
             launched: true,
+            visible_windows: None,
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["app"], "Google Chrome");

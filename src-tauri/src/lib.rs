@@ -5,6 +5,8 @@ pub mod appfocus;
 pub mod autostart;
 pub mod capture;
 #[cfg(desktop)]
+pub mod clipboard_tool;
+#[cfg(desktop)]
 pub mod cloud;
 #[cfg(desktop)]
 pub mod command_runner;
@@ -29,6 +31,7 @@ pub mod overlay;
 pub mod privacy;
 pub mod screenquery;
 pub mod settings_window;
+pub mod tool_toggles;
 #[cfg(desktop)]
 pub mod tray;
 #[cfg(desktop)]
@@ -112,6 +115,8 @@ pub fn run() {
     // The detector loop and persisted-toggle apply run from setup().
     #[cfg(desktop)]
     let builder = builder.manage(nudge::NudgeState::new());
+    // Per-tool switchboard — managed as Arc so chat runs share the live set.
+    let builder = builder.manage(std::sync::Arc::new(tool_toggles::ToolToggles::new()));
     // Cloud keystore (M004 S02): key bytes live in the OS credential store;
     // the managed state only ever serializes presence booleans outbound.
     #[cfg(desktop)]
@@ -178,6 +183,7 @@ pub fn run() {
             hud::show_hud,
             hud::hide_hud,
             hud::fit_hud_canvas,
+            input::commands::cursor_position,
             #[cfg(desktop)]
             tray::hide_tray_panel,
             overlay::show_overlay,
@@ -248,6 +254,9 @@ pub fn run() {
             inventory::refresh_inventory,
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
+            nudge::commands::nudge_context_frame,
+            tool_toggles::tool_toggles_status,
+            tool_toggles::set_tool_enabled,
             settings_window::show_settings_window,
             memory_window::show_memory_window,
             memory_window::hide_memory_window,
@@ -337,6 +346,7 @@ pub fn run() {
             // first round already sees the user's choice.
             #[cfg(desktop)]
             nudge::commands::apply_persisted_nudges_enabled(app.handle());
+            tool_toggles::apply_persisted_tool_toggles(app.handle());
 
             // Persisted cloud opt-in (M004 S03): a present settings.json key
             // restores the user's choice; absent keeps the safe default (off).

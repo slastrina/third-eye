@@ -61,6 +61,7 @@ mod tests {
             Ok(FocusedApp {
                 app: "TARGET".into(),
                 launched: false,
+                visible_windows: None,
             })
         }
 

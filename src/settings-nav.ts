@@ -17,6 +17,7 @@ export type SectionId =
   | "memory"
   | "input"
   | "mcp"
+  | "tools"
   | "nudges"
   | "overlay"
   | "programs"
@@ -60,6 +61,7 @@ export const SECTION_GROUPS: SectionGroup[] = [
     entries: [
       { id: "input", label: "Input Control", keywords: "hid mouse keyboard click type" },
       { id: "mcp", label: "MCP Servers", keywords: "tools external stdio http json" },
+      { id: "tools", label: "Tools", keywords: "builtin toggle disable screenshot clipboard terminal recall" },
       { id: "nudges", label: "Nudges", keywords: "hint suggestion" },
     ],
   },

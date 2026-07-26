@@ -128,6 +128,94 @@ pub fn installed_apps(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
     apps
 }
 
+/// Count the app's on-screen, layer-0 windows via CGWindowList — the
+/// evidence for the "frontmost but nothing visible" trap (an app running
+/// with every window closed fronts nothing; the model must open a window
+/// or say so). `None` when the list call fails; needs no permission.
+fn visible_window_count(pid: i32) -> Option<usize> {
+    #[repr(C)]
+    struct __CFArray(std::ffi::c_void);
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> *const __CFArray;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const __CFArray) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const __CFArray, idx: isize) -> *const std::ffi::c_void;
+        fn CFDictionaryGetValue(
+            dict: *const std::ffi::c_void,
+            key: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFNumberGetValue(
+            number: *const std::ffi::c_void,
+            the_type: i32,
+            value_ptr: *mut std::ffi::c_void,
+        ) -> bool;
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+    const OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+    const NULL_WINDOW_ID: u32 = 0;
+    const K_CF_NUMBER_SINT32: i32 = 3;
+    use objc2_core_foundation::CFString;
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(OPTION_ON_SCREEN_ONLY, NULL_WINDOW_ID);
+        if list.is_null() {
+            return None;
+        }
+        let owner_key = CFString::from_str("kCGWindowOwnerPID");
+        let layer_key = CFString::from_str("kCGWindowLayer");
+        let mut count = 0usize;
+        for i in 0..CFArrayGetCount(list) {
+            let dict = CFArrayGetValueAtIndex(list, i);
+            let read_i32 = |key: &CFString| -> Option<i32> {
+                let value =
+                    CFDictionaryGetValue(dict, key as *const CFString as *const std::ffi::c_void);
+                if value.is_null() {
+                    return None;
+                }
+                let mut out: i32 = 0;
+                CFNumberGetValue(
+                    value,
+                    K_CF_NUMBER_SINT32,
+                    &mut out as *mut i32 as *mut std::ffi::c_void,
+                )
+                .then_some(out)
+            };
+            if read_i32(&owner_key) == Some(pid) && read_i32(&layer_key) == Some(0) {
+                count += 1;
+            }
+        }
+        CFRelease(list as *mut std::ffi::c_void);
+        Some(count)
+    }
+}
+
+/// Pid of a running app by localized name (for the window count readback).
+fn pid_for_app_name(name: &str) -> Option<i32> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let apps = workspace.runningApplications();
+    for app in apps.iter() {
+        if app.localizedName().map(|n| n.to_string()).as_deref() == Some(name) {
+            return Some(app.processIdentifier());
+        }
+    }
+    None
+}
+
+/// Assemble the verified report: the fronted name plus the visible-window
+/// evidence (the "frontmost but nothing on screen" trap detector).
+fn focused_report(app: String, launched: bool) -> FocusedApp {
+    let visible_windows = pid_for_app_name(&app).and_then(visible_window_count);
+    if visible_windows == Some(0) {
+        log::warn!("focus_app: {app:?} is frontmost with ZERO visible windows");
+    }
+    FocusedApp {
+        app,
+        launched,
+        visible_windows,
+    }
+}
 /// Snapshot the localized names of the currently running apps. Apps without a
 /// localized name (rare background helpers) are skipped — they are never a
 /// user-visible target the model would name.
@@ -294,10 +382,7 @@ impl AppFocus for MacosAppFocus {
                 if accepted {
                     if let Some(front) = verify_fronted(&matched, ACTIVATE_VERIFY_MS).await {
                         log::info!("focus_app: activated {front:?}");
-                        return Ok(FocusedApp {
-                            app: front,
-                            launched: false,
-                        });
+                        return Ok(focused_report(front, false));
                     }
                 }
                 // The OS refused, quietly dropped the request (cooperative
@@ -312,10 +397,7 @@ impl AppFocus for MacosAppFocus {
                 {
                     Ok(front) => {
                         log::info!("focus_app: fronted {front:?} via reopen");
-                        Ok(FocusedApp {
-                            app: front,
-                            launched: false,
-                        })
+                        Ok(focused_report(front, false))
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };
@@ -343,10 +425,7 @@ impl AppFocus for MacosAppFocus {
                 match open_and_verify(OpenTarget::Bundle(&path), &name, LAUNCH_VERIFY_MS).await {
                     Ok(front) => {
                         log::info!("focus_app: launched and fronted {front:?}");
-                        Ok(FocusedApp {
-                            app: front,
-                            launched: true,
-                        })
+                        Ok(focused_report(front, true))
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };

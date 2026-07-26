@@ -882,6 +882,7 @@ impl AppFocus for RecordingFocus {
         Ok(FocusedApp {
             app: app_name.to_string(),
             launched: false,
+            visible_windows: None,
         })
     }
     async fn running_apps(&self) -> Vec<String> {
@@ -904,6 +905,8 @@ impl ScreenQuery for FixedScreen {
             y: 220,
             width: 400,
             height: 40,
+            cx: 0,
+            cy: 0,
             app: Some("Google Chrome".into()),
         }])
     }

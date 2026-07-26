@@ -169,6 +169,7 @@ fn map_call_result(result: CallToolResult) -> ToolOutcome {
             result_count: None,
             mode: None,
             failure: Some(MCP_TOOL_ERROR_KIND.to_string()),
+            attachment_png: None,
         }
     } else {
         ToolOutcome {
@@ -177,6 +178,7 @@ fn map_call_result(result: CallToolResult) -> ToolOutcome {
             result_count: None,
             mode: None,
             failure: None,
+            attachment_png: None,
         }
     }
 }

@@ -10,6 +10,8 @@ import {
   chatReducer,
   completeFirstRun,
   composeMessages,
+  freshNudgePreload,
+  nudgeContextFrame,
   firstRunStatus,
   hotkeyStatus,
   initialChatState,
@@ -61,6 +63,7 @@ import {
 } from "./tour-state";
 import { Tour } from "./Tour";
 import { EyeIcon } from "./ui/EyeIcon";
+import { Markdown } from "./ui/Markdown";
 import { Toast } from "./ui/Toast";
 import { ApprovalCard } from "./ui/ApprovalCard";
 import {
@@ -1023,19 +1026,28 @@ function App() {
     // The staged frame rides this message; the submit action consumes it, so
     // a retry after a failure re-asks the question without the screenshot.
     const staged = chatRef.current.attachment;
-    // A summon-from-nudge preload grounds exactly this question; the submit
-    // action consumes it reducer-side.
-    const history = composeMessages(
-      base,
-      trimmed,
-      staged ? [{ base64Png: staged.base64Png }] : [],
-      chatRef.current.nudgePreload,
-    );
+    // A nudge preload grounds exactly this question when still fresh — the
+    // banner may have auto-timed-out minutes ago; the submit action consumes
+    // the stage reducer-side either way (stale stages are simply dropped).
+    const preload = freshNudgePreload(chatRef.current.nudgePreload, Date.now());
     dispatchChat({ type: "submit", question: trimmed, retry });
-    sendChat(history).then(
-      (requestId) => dispatchChat({ type: "request-started", requestId }),
-      (err) => dispatchChat({ type: "request-failed", detail: String(err) }),
-    );
+    // The nudge-time screenshot (if the backend retained one) rides the
+    // outgoing turn so the model can SEE what the nudge saw. Fetch failure
+    // or absence degrades to text-only grounding — never blocks the send.
+    const framePromise: Promise<string | null> = preload
+      ? nudgeContextFrame(preload.capturedAtMs).catch(() => null)
+      : Promise.resolve(null);
+    framePromise.then((nudgeFrame) => {
+      const attachments = [
+        ...(staged ? [{ base64Png: staged.base64Png }] : []),
+        ...(nudgeFrame ? [{ base64Png: nudgeFrame }] : []),
+      ];
+      const history = composeMessages(base, trimmed, attachments, preload, nudgeFrame !== null);
+      sendChat(history).then(
+        (requestId) => dispatchChat({ type: "request-started", requestId }),
+        (err) => dispatchChat({ type: "request-failed", detail: String(err) }),
+      );
+    });
   };
 
   const onSubmit = (event: React.FormEvent) => {
@@ -1144,7 +1156,13 @@ function App() {
                       {run.preview && <pre className="chat-terminal-out">{run.preview}</pre>}
                     </div>
                   ))}
-                <span className="chat-text">{message.text}</span>
+                {message.role === "assistant" ? (
+                  <div className="chat-text chat-markdown">
+                    <Markdown text={message.text} />
+                  </div>
+                ) : (
+                  <span className="chat-text">{message.text}</span>
+                )}
                 {message.role === "user" && message.attached && (
                   <span className="chat-attached-tag" title="A screenshot rode this message">
                     screen

@@ -1196,3 +1196,24 @@ mod tests {
         }
     }
 }
+
+/// Live cursor position in logical screen points — the HUD canvas
+/// follower's feed. `null` off macOS or when the read fails. Cheap enough
+/// to poll (~30Hz) from the canvas webview.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CursorPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[tauri::command]
+pub fn cursor_position() -> Option<CursorPoint> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::current_cursor().map(|(x, y)| CursorPoint { x, y })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}

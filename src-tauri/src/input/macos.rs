@@ -209,6 +209,12 @@ struct CGPointRaw {
     y: f64,
 }
 
+/// Public read of the live cursor for the HUD follower (no permission
+/// needed — CGEventCreate(nil) is a plain read).
+pub fn current_cursor() -> Option<(f64, f64)> {
+    cursor_location().ok()
+}
+
 /// Current cursor position in top-left-origin logical points.
 fn cursor_location() -> Result<(f64, f64), InputError> {
     // Safety: CGEventCreate(nil) returns a retained event whose location is the
@@ -242,6 +248,12 @@ extern "C" {
         value: *mut *mut std::ffi::c_void,
     ) -> i32;
     fn AXUIElementGetPid(element: *mut std::ffi::c_void, pid: *mut i32) -> i32;
+    fn AXUIElementCopyElementAtPosition(
+        application: *mut std::ffi::c_void,
+        x: f32,
+        y: f32,
+        element: *mut *mut std::ffi::c_void,
+    ) -> i32;
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -314,6 +326,46 @@ fn read_focused_element() -> Option<FocusReport> {
             title,
             value,
         })
+    }
+}
+
+/// The UI element under `(x, y)` in logical screen points — the AX hit-test
+/// answering "what will this click actually hit". Same report shape and
+/// redaction rules as the focus readback. `None` when nothing is there (bare
+/// desktop), the hit-test fails, or the app under the point exposes no AX
+/// tree — evidence-gathering only, never fails the action.
+fn element_at_point(x: i32, y: i32) -> Option<FocusReport> {
+    unsafe {
+        let system_wide = AXUIElementCreateSystemWide();
+        if system_wide.is_null() {
+            return None;
+        }
+        let mut el: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = AXUIElementCopyElementAtPosition(system_wide, x as f32, y as f32, &mut el);
+        CFRelease(system_wide);
+        if err != 0 || el.is_null() {
+            return None;
+        }
+        let mut pid: i32 = 0;
+        let app = (AXUIElementGetPid(el, &mut pid) == 0)
+            .then(|| app_name_for_pid(pid))
+            .flatten();
+        let role = copy_string_attr(el, "AXRole");
+        let title = copy_string_attr(el, "AXTitle")
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| copy_string_attr(el, "AXDescription"));
+        let value = if role.as_deref() == Some("AXSecureTextField") {
+            None
+        } else {
+            copy_string_attr(el, "AXValue")
+        };
+        CFRelease(el);
+        Some(redact_focus(FocusReport {
+            app,
+            role,
+            title,
+            value,
+        }))
     }
 }
 
@@ -438,6 +490,94 @@ fn wait_for_cursor_commit(x: i32, y: i32) -> Result<CursorPosition, InputError> 
 /// by the caller's preflight, and a construction failure here after a passing
 /// preflight is a genuine synthesis fault, not a permission one. Observation
 /// failures never fail a performed action: they just leave report fields empty.
+/// Glide the cursor from wherever it is to `(x, y)` in eased steps instead
+/// of teleporting. Purely visual pacing (~190ms worst case): the user asked
+/// to SEE the assistant's pointer travel — an instant jump reads as the
+/// cursor "appearing" somewhere, a glide reads as an action they can follow
+/// (the HUD's follower badge tracks the real cursor, so it rides along).
+/// Ease-in-out so departure and arrival are legible. A missing readback of
+/// the start point degrades to a direct move — the glide is never the
+/// reason an action fails.
+fn glide_cursor_to(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), InputError> {
+    const STEPS: i32 = 16;
+    const STEP_MS: u64 = 11;
+    if let Ok((sx, sy)) = cursor_location() {
+        let (sx, sy) = (sx.round() as i32, sy.round() as i32);
+        let far = (x - sx).abs().max((y - sy).abs()) > 4;
+        if far {
+            for step in 1..=STEPS {
+                // Smoothstep easing: t² · (3 − 2t).
+                let t = step as f64 / STEPS as f64;
+                let eased = t * t * (3.0 - 2.0 * t);
+                let gx = sx + ((x - sx) as f64 * eased).round() as i32;
+                let gy = sy + ((y - sy) as f64 * eased).round() as i32;
+                enigo
+                    .move_mouse(gx, gy, Coordinate::Abs)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("glide move failed: {e}"),
+                    })?;
+                std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
+            }
+            return Ok(());
+        }
+    }
+    enigo
+        .move_mouse(x, y, Coordinate::Abs)
+        .map_err(|e| InputError::InputFailed {
+            detail: format!("move_mouse failed: {e}"),
+        })
+}
+
+/// How much text still gets the visible per-character typing rhythm. Past
+/// this it is paste-length content — animating it would take many seconds
+/// for no legibility gain, so it goes out in one burst.
+const TYPE_ANIMATE_MAX_CHARS: usize = 200;
+
+/// Ceiling on the whole animated entry, so a near-threshold text never
+/// crawls: the per-char delay shrinks as the text grows.
+const TYPE_ANIMATE_TOTAL_MS: u64 = 1600;
+
+/// Fastest per-char cadence worth animating at all.
+const TYPE_CHAR_MS_MAX: u64 = 26;
+
+/// The per-character cadence for `count` characters, or `None` when the
+/// text should burst instead (empty, or paste-length past the animate cap).
+/// Pure — the pacing policy is testable without a keyboard.
+fn paced_char_delay(count: usize) -> Option<std::time::Duration> {
+    if count == 0 || count > TYPE_ANIMATE_MAX_CHARS {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(
+        (TYPE_ANIMATE_TOTAL_MS / count as u64).min(TYPE_CHAR_MS_MAX),
+    ))
+}
+
+/// Synthesize text entry with a visible typing rhythm (the user asked to
+/// SEE the assistant type, not have text pop in): short texts go out one
+/// character at a time with a bounded cadence; anything past
+/// [`TYPE_ANIMATE_MAX_CHARS`] is paste-length and is entered in one burst.
+/// Each character is a real `enigo.text` call, so the entered content is
+/// byte-identical to the burst path — only the pacing differs.
+fn type_text_paced(enigo: &mut Enigo, text: &str) -> Result<(), InputError> {
+    let Some(delay) = paced_char_delay(text.chars().count()) else {
+        return enigo.text(text).map_err(|e| InputError::InputFailed {
+            detail: format!("text entry failed: {e}"),
+        });
+    };
+    let mut buf = [0u8; 4];
+    for (i, ch) in text.chars().enumerate() {
+        if i > 0 && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        enigo
+            .text(ch.encode_utf8(&mut buf))
+            .map_err(|e| InputError::InputFailed {
+                detail: format!("text entry failed at char {i}: {e}"),
+            })?;
+    }
+    Ok(())
+}
+
 fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
     // Don't prompt on the action path — permission was already verified, and a
     // prompt here would violate health-as-value.
@@ -451,11 +591,7 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
 
     let report = match action {
         InputAction::MouseMove { x, y } => {
-            enigo
-                .move_mouse(x, y, Coordinate::Abs)
-                .map_err(|e| InputError::InputFailed {
-                    detail: format!("move_mouse failed: {e}"),
-                })?;
+            glide_cursor_to(&mut enigo, x, y)?;
             // Completing only once the cursor readback matches means a
             // follow-up coordless click (the model's move-then-click pattern,
             // milliseconds apart in one tool turn) fires at the committed
@@ -466,27 +602,42 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
                 ..ActionReport::default()
             }
         }
-        InputAction::MouseClick { button, x, y } => {
+        InputAction::MouseClick {
+            button,
+            x,
+            y,
+            clicks,
+        } => {
             // A coordinate-bearing click moves to the target first (the model's
             // "click at (x,y)"); a coordless click fires at the cursor. Both
             // x and y are validated present-together upstream, so `if let`
             // on the pair is enough here.
             if let (Some(x), Some(y)) = (x, y) {
-                enigo
-                    .move_mouse(x, y, Coordinate::Abs)
-                    .map_err(|e| InputError::InputFailed {
-                        detail: format!("move before click failed: {e}"),
-                    })?;
+                glide_cursor_to(&mut enigo, x, y)?;
                 // enigo's button() clicks at the SYSTEM cursor, not at (x,y) —
                 // without this wait the click fires at the stale pre-move
                 // position (see wait_for_cursor_commit docs).
                 wait_for_cursor_commit(x, y)?;
             }
-            enigo
-                .button(map_button(button), Direction::Click)
-                .map_err(|e| InputError::InputFailed {
-                    detail: format!("button click failed: {e}"),
-                })?;
+            // Hit-test BEFORE the button events: this is the element the
+            // mousedown will hit, read while it still exists (a link click
+            // navigates the page away moments later).
+            let clicked_element = cursor_location()
+                .ok()
+                .and_then(|(px, py)| element_at_point(px.round() as i32, py.round() as i32));
+            // Multi-click (validated 1..=3 upstream): rapid same-position
+            // clicks inside the system double-click interval register as
+            // double/triple clicks.
+            for i in 0..clicks.unwrap_or(1).max(1) {
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+                enigo
+                    .button(map_button(button), Direction::Click)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("button click failed: {e}"),
+                    })?;
+            }
             // Evidence: where the click really landed, and what took keyboard
             // focus — a click on a text field should read back that field.
             let cursor = cursor_location().ok().map(|(px, py)| CursorPosition {
@@ -497,30 +648,137 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
                 cursor,
                 focus: observe_focus_settled(),
                 text_entered: None,
+                clicked_element,
+            }
+        }
+        InputAction::MouseDrag {
+            button,
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        } => {
+            // Press at the origin, glide in steps (apps track motion, and an
+            // instant teleport breaks drag recognition), release at the
+            // destination. Each waypoint is a real synthesized move.
+            enigo
+                .move_mouse(from_x, from_y, Coordinate::Abs)
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("move to drag origin failed: {e}"),
+                })?;
+            wait_for_cursor_commit(from_x, from_y)?;
+            enigo
+                .button(map_button(button), Direction::Press)
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("drag press failed: {e}"),
+                })?;
+            const STEPS: i32 = 14;
+            let mut glide_error = None;
+            for step in 1..=STEPS {
+                let gx = from_x + (to_x - from_x) * step / STEPS;
+                let gy = from_y + (to_y - from_y) * step / STEPS;
+                if let Err(e) = enigo.move_mouse(gx, gy, Coordinate::Abs) {
+                    glide_error = Some(format!("drag glide failed: {e}"));
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(12));
+            }
+            // The button is DOWN: release unconditionally, even on a glide
+            // failure — a stuck pressed button would hold the user's mouse.
+            let released = enigo.button(map_button(button), Direction::Release);
+            if let Some(detail) = glide_error {
+                return Err(InputError::InputFailed { detail });
+            }
+            released.map_err(|e| InputError::InputFailed {
+                detail: format!("drag release failed: {e}"),
+            })?;
+            let cursor = wait_for_cursor_commit(to_x, to_y)?;
+            ActionReport {
+                cursor: Some(cursor),
+                focus: observe_focus_settled(),
+                text_entered: None,
+                clicked_element: None,
+            }
+        }
+        InputAction::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            if let (Some(x), Some(y)) = (x, y) {
+                enigo
+                    .move_mouse(x, y, Coordinate::Abs)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("move before scroll failed: {e}"),
+                    })?;
+                wait_for_cursor_commit(x, y)?;
+            }
+            let dy = delta_y.unwrap_or(0);
+            let dx = delta_x.unwrap_or(0);
+            if dy != 0 {
+                enigo
+                    .scroll(dy, enigo::Axis::Vertical)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("vertical scroll failed: {e}"),
+                    })?;
+            }
+            if dx != 0 {
+                enigo
+                    .scroll(dx, enigo::Axis::Horizontal)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("horizontal scroll failed: {e}"),
+                    })?;
+            }
+            let cursor = cursor_location().ok().map(|(px, py)| CursorPosition {
+                x: px.round() as i32,
+                y: py.round() as i32,
+            });
+            ActionReport {
+                cursor,
+                focus: None,
+                text_entered: None,
+                clicked_element: None,
             }
         }
         InputAction::TypeText { text } => {
-            enigo.text(&text).map_err(|e| InputError::InputFailed {
-                detail: format!("text entry failed: {e}"),
-            })?;
+            type_text_paced(&mut enigo, &text)?;
             let (focus, text_entered) = observe_text_entry(&text);
             ActionReport {
                 cursor: None,
                 focus,
                 text_entered,
+                clicked_element: None,
             }
         }
-        InputAction::KeyPress { key } => {
+        InputAction::KeyPress { key, modifiers } => {
             let k = key_from_str(&key)?;
-            enigo
-                .key(k, Direction::Click)
-                .map_err(|e| InputError::InputFailed {
-                    detail: format!("key press failed: {e}"),
-                })?;
+            let held: Vec<Key> = modifiers
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|m| modifier_key(m))
+                .collect::<Result<_, _>>()?;
+            // Hold modifiers, click the key, release in reverse — Cmd+C etc.
+            for m in &held {
+                enigo
+                    .key(*m, Direction::Press)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("modifier press failed: {e}"),
+                    })?;
+            }
+            let pressed = enigo.key(k, Direction::Click);
+            for m in held.iter().rev() {
+                let _ = enigo.key(*m, Direction::Release);
+            }
+            pressed.map_err(|e| InputError::InputFailed {
+                detail: format!("key press failed: {e}"),
+            })?;
             ActionReport {
                 cursor: None,
                 focus: observe_focus_settled(),
                 text_entered: None,
+                clicked_element: None,
             }
         }
     };
@@ -546,6 +804,20 @@ fn map_button(button: MouseButton) -> Button {
 
 /// Resolve a `key` string from the wire contract to an enigo [`Key`]. Named keys
 /// (case-insensitive) map to the corresponding special key; a single-character
+/// Map a validated modifier name to its enigo key. Validation upstream
+/// guarantees the vocabulary; unknown still errors typed, never panics.
+fn modifier_key(name: &str) -> Result<Key, InputError> {
+    match name {
+        "cmd" => Ok(Key::Meta),
+        "ctrl" => Ok(Key::Control),
+        "alt" => Ok(Key::Alt),
+        "shift" => Ok(Key::Shift),
+        other => Err(InputError::InputFailed {
+            detail: format!("unknown modifier {other:?} (cmd|ctrl|alt|shift)"),
+        }),
+    }
+}
+
 /// string maps to `Key::Unicode`. Anything else is a typed `input-failed` so the
 /// model gets an actionable error instead of a silent no-op (R007).
 fn key_from_str(key: &str) -> Result<Key, InputError> {
@@ -586,6 +858,23 @@ fn _assert_backend_is_dyn_compatible() -> std::sync::Arc<dyn InputControl> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn typing_pace_animates_short_text_and_bursts_long_text() {
+        // Empty and paste-length inputs burst (no pacing at all).
+        assert_eq!(paced_char_delay(0), None);
+        assert_eq!(paced_char_delay(TYPE_ANIMATE_MAX_CHARS + 1), None);
+        // Short text gets the full visible cadence…
+        assert_eq!(
+            paced_char_delay(10),
+            Some(std::time::Duration::from_millis(TYPE_CHAR_MS_MAX))
+        );
+        // …and the cadence compresses near the cap so the whole entry stays
+        // inside the total budget instead of crawling.
+        let at_cap = paced_char_delay(TYPE_ANIMATE_MAX_CHARS).unwrap();
+        assert!(at_cap.as_millis() as u64 * TYPE_ANIMATE_MAX_CHARS as u64 <= TYPE_ANIMATE_TOTAL_MS);
+        assert!(!at_cap.is_zero());
+    }
 
     #[test]
     fn preflight_is_side_effect_free_and_stable() {
@@ -904,6 +1193,7 @@ mod tests {
                 button: MouseButton::Left,
                 x: Some(ax),
                 y: Some(ay),
+                clicks: None,
             })
             .await
             .expect("click");
@@ -959,6 +1249,7 @@ mod tests {
         let return_report = backend
             .perform(InputAction::KeyPress {
                 key: "return".into(),
+                modifiers: None,
             })
             .await
             .expect("return");
