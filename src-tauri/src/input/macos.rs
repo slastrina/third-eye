@@ -482,14 +482,69 @@ fn wait_for_cursor_commit(x: i32, y: i32) -> Result<CursorPosition, InputError> 
     })
 }
 
-/// The per-action blocking stage: build a throwaway `Enigo`, synthesize the one
-/// action, drop the handle — then read back what the OS observed (cursor
-/// position, focused element) into the [`ActionReport`]. Runs on a
-/// `spawn_blocking` thread. Every enigo failure (construction or event post)
-/// collapses onto `InputFailed` — the permission-denied case is already handled
-/// by the caller's preflight, and a construction failure here after a passing
-/// preflight is a genuine synthesis fault, not a permission one. Observation
-/// failures never fail a performed action: they just leave report fields empty.
+// libdispatch: hop keyboard synthesis onto the main thread. HIToolbox's
+// Text Services Manager (reached by enigo's layout-dependent keycode
+// resolution for Key::Unicode — every letter shortcut like cmd+C) asserts
+// the main queue on its cache-miss path since recent macOS; calling it from
+// a tokio blocking worker is the crash class behind the 2026-07-26/27
+// SIGTRAP reports (dispatch_assert_queue_fail in islGetInputSourceList…).
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    static _dispatch_main_q: std::ffi::c_void;
+    fn dispatch_async_f(
+        queue: *const std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
+    fn pthread_main_np() -> std::ffi::c_int;
+}
+
+/// How long a main-thread keyboard hop may wait before failing typed. In
+/// the running app the main run loop services GCD within milliseconds; the
+/// timeout only fires in headless contexts (test harnesses) where blocking
+/// forever — or crashing like before — are the alternatives.
+const MAIN_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `f` on the main thread and return its result. Keyboard synthesis
+/// ONLY — mouse events have no main-thread requirement and their glide
+/// sleeps must stay off the main run loop. On timeout the action fails
+/// typed (`input-failed`) instead of crashing the process the way the
+/// off-main TSM call did; if the hop then fires late its result is
+/// discarded harmlessly (dead channel).
+fn on_main_keyboard<T, F>(f: F) -> Result<T, InputError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if unsafe { pthread_main_np() } == 1 {
+        return Ok(f());
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<T>();
+    type Job = Box<dyn FnOnce() + Send>;
+    let job: Job = Box::new(move || {
+        let _ = tx.send(f());
+    });
+    extern "C" fn trampoline(context: *mut std::ffi::c_void) {
+        // Re-box exactly what was leaked below; runs once on the main queue.
+        let job = unsafe { Box::from_raw(context as *mut Box<dyn FnOnce() + Send>) };
+        job();
+    }
+    let context = Box::into_raw(Box::new(job)) as *mut std::ffi::c_void;
+    unsafe {
+        dispatch_async_f(
+            &_dispatch_main_q as *const std::ffi::c_void,
+            context,
+            trampoline,
+        );
+    }
+    rx.recv_timeout(MAIN_HOP_TIMEOUT)
+        .map_err(|_| InputError::InputFailed {
+            detail: "main-thread keyboard dispatch timed out (no run loop?) — the key event was \
+                     not synthesized"
+                .into(),
+        })
+}
+
 /// Glide the cursor from wherever it is to `(x, y)` in eased steps instead
 /// of teleporting. Purely visual pacing (~190ms worst case): the user asked
 /// to SEE the assistant's pointer travel — an instant jump reads as the
@@ -552,32 +607,14 @@ fn paced_char_delay(count: usize) -> Option<std::time::Duration> {
     ))
 }
 
-/// Synthesize text entry with a visible typing rhythm (the user asked to
-/// SEE the assistant type, not have text pop in): short texts go out one
-/// character at a time with a bounded cadence; anything past
-/// [`TYPE_ANIMATE_MAX_CHARS`] is paste-length and is entered in one burst.
-/// Each character is a real `enigo.text` call, so the entered content is
-/// byte-identical to the burst path — only the pacing differs.
-fn type_text_paced(enigo: &mut Enigo, text: &str) -> Result<(), InputError> {
-    let Some(delay) = paced_char_delay(text.chars().count()) else {
-        return enigo.text(text).map_err(|e| InputError::InputFailed {
-            detail: format!("text entry failed: {e}"),
-        });
-    };
-    let mut buf = [0u8; 4];
-    for (i, ch) in text.chars().enumerate() {
-        if i > 0 && !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        enigo
-            .text(ch.encode_utf8(&mut buf))
-            .map_err(|e| InputError::InputFailed {
-                detail: format!("text entry failed at char {i}: {e}"),
-            })?;
-    }
-    Ok(())
-}
-
+/// The per-action blocking stage: build a throwaway `Enigo`, synthesize the one
+/// action, drop the handle — then read back what the OS observed (cursor
+/// position, focused element) into the [`ActionReport`]. Runs on a
+/// `spawn_blocking` thread. Every enigo failure (construction or event post)
+/// collapses onto `InputFailed` — the permission-denied case is already handled
+/// by the caller's preflight, and a construction failure here after a passing
+/// preflight is a genuine synthesis fault, not a permission one. Observation
+/// failures never fail a performed action: they just leave report fields empty.
 fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
     // Don't prompt on the action path — permission was already verified, and a
     // prompt here would violate health-as-value.
@@ -742,7 +779,44 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
             }
         }
         InputAction::TypeText { text } => {
-            type_text_paced(&mut enigo, &text)?;
+            // Keyboard synthesis happens ON THE MAIN THREAD (TSM assert —
+            // see on_main_keyboard); the pacing sleeps stay here, off-main,
+            // so the UI never freezes for the typing rhythm.
+            match paced_char_delay(text.chars().count()) {
+                None => {
+                    if !text.is_empty() {
+                        let burst = text.clone();
+                        on_main_keyboard(move || {
+                            let mut e = Enigo::new(&Settings {
+                                open_prompt_to_get_permissions: false,
+                                ..Settings::default()
+                            })
+                            .map_err(|e| format!("enigo init failed: {e}"))?;
+                            e.text(&burst)
+                                .map_err(|e| format!("text entry failed: {e}"))
+                        })?
+                        .map_err(|detail| InputError::InputFailed { detail })?;
+                    }
+                }
+                Some(delay) => {
+                    for (i, ch) in text.chars().enumerate() {
+                        if i > 0 && !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        on_main_keyboard(move || {
+                            let mut e = Enigo::new(&Settings {
+                                open_prompt_to_get_permissions: false,
+                                ..Settings::default()
+                            })
+                            .map_err(|e| format!("enigo init failed: {e}"))?;
+                            let mut buf = [0u8; 4];
+                            e.text(ch.encode_utf8(&mut buf))
+                                .map_err(|e| format!("text entry failed at char {i}: {e}"))
+                        })?
+                        .map_err(|detail| InputError::InputFailed { detail })?;
+                    }
+                }
+            }
             let (focus, text_entered) = observe_text_entry(&text);
             ActionReport {
                 cursor: None,
@@ -759,21 +833,27 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
                 .iter()
                 .map(|m| modifier_key(m))
                 .collect::<Result<_, _>>()?;
-            // Hold modifiers, click the key, release in reverse — Cmd+C etc.
-            for m in &held {
-                enigo
-                    .key(*m, Direction::Press)
-                    .map_err(|e| InputError::InputFailed {
-                        detail: format!("modifier press failed: {e}"),
-                    })?;
-            }
-            let pressed = enigo.key(k, Direction::Click);
-            for m in held.iter().rev() {
-                let _ = enigo.key(*m, Direction::Release);
-            }
-            pressed.map_err(|e| InputError::InputFailed {
-                detail: format!("key press failed: {e}"),
-            })?;
+            // The whole hold-click-release sequence runs on the main thread:
+            // resolving a Key::Unicode (any letter shortcut) walks the TSM
+            // keyboard layout, which asserts the main queue (the crash-log
+            // class this replaces). No sleeps inside — the hop is brief.
+            on_main_keyboard(move || {
+                let mut e = Enigo::new(&Settings {
+                    open_prompt_to_get_permissions: false,
+                    ..Settings::default()
+                })
+                .map_err(|e| format!("enigo init failed: {e}"))?;
+                for m in &held {
+                    e.key(*m, Direction::Press)
+                        .map_err(|e| format!("modifier press failed: {e}"))?;
+                }
+                let pressed = e.key(k, Direction::Click);
+                for m in held.iter().rev() {
+                    let _ = e.key(*m, Direction::Release);
+                }
+                pressed.map_err(|e| format!("key press failed: {e}"))
+            })?
+            .map_err(|detail| InputError::InputFailed { detail })?;
             ActionReport {
                 cursor: None,
                 focus: observe_focus_settled(),

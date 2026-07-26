@@ -65,6 +65,13 @@
   padding: 12px 14px;
   width: 380px;
   max-width: 100%;
+  /* The pill window is a fixed 600x360 — the trail caps below the pill bar
+     and approval cards and SCROLLS instead of clipping at the window edge.
+     ActionTrail pins the scroll to the newest entry. */
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
   box-sizing: border-box;
   background: var(--te-glass-heavy);
   border: 1px solid var(--te-line-strong);

@@ -336,6 +336,17 @@ export interface NudgeStatus {
   lastError: LlmError | null;
   suppressed: NudgeSuppressedCounts;
   persistError: string | null;
+  /** Live tunables (Settings chips, 2026-07-27). */
+  cooldownSecs: number;
+  autoDismissSecs: number;
+}
+
+/** One shown nudge in the Settings history list (pixel-free). */
+export interface NudgeHistoryEntry {
+  message: string;
+  appContext: string | null;
+  shownAtMs: number;
+  dismissReason: string | null;
 }
 
 /** Current nudge state (health-as-value, like `watcher_status`). */
@@ -347,6 +358,22 @@ export function nudgeStatus(): Promise<NudgeStatus> {
  *  rides `persistError` on the returned authoritative status. */
 export function setNudgesEnabled(enable: boolean): Promise<NudgeStatus> {
   return invoke<NudgeStatus>("set_nudges_enabled", { enable });
+}
+
+/** Set the nudge cooldown (closed choice set backend-side; out-of-set
+ *  values return the unchanged authoritative status). */
+export function setNudgeCooldown(secs: number): Promise<NudgeStatus> {
+  return invoke<NudgeStatus>("set_nudge_cooldown", { secs });
+}
+
+/** Set the banner auto-dismiss window (applies to the next nudge). */
+export function setNudgeAutoDismiss(secs: number): Promise<NudgeStatus> {
+  return invoke<NudgeStatus>("set_nudge_auto_dismiss", { secs });
+}
+
+/** Recently shown nudges, newest first (bounded backend-side). */
+export function nudgeHistory(): Promise<NudgeHistoryEntry[]> {
+  return invoke<NudgeHistoryEntry[]>("nudge_history");
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +566,18 @@ export interface HidApprovalRequest {
 /** The user's answer to an approval prompt — the kebab-case wire strings Rust's
  *  ApprovalVerdict deserializes. "allow-once" performs this one action;
  *  "allow-kind" also whitelists the kind for the session; "deny" refuses. */
-export type ApprovalVerdict = "allow-once" | "allow-kind" | "deny";
+export type ApprovalVerdict = "allow-once" | "allow-kind" | "allow-always" | "deny";
+
+/** The permanently approved action kinds (Settings list; kebab strings). */
+export function approvedActionKinds(): Promise<string[]> {
+  return invoke<string[]>("approved_action_kinds");
+}
+
+/** Withdraw a permanent grant; resolves with the remaining set. Also revokes
+ *  it from the RUNNING session's whitelist, so the next action prompts. */
+export function removeApprovedActionKind(kind: string): Promise<string[]> {
+  return invoke<string[]>("remove_approved_action_kind", { kind });
+}
 
 /** Subscribe to the HID approval-request broadcast (`hid://approval-request`). */
 export function onHidApprovalRequest(
@@ -823,6 +861,22 @@ export interface ChatSessionMessage {
 }
 
 /** Start a fresh chat session; subsequent exchanges append to it. */
+/** Resume a stored session: subsequent exchanges append to it; resolves
+ *  with its ordered transcript for seeding the view. */
+export function chatResumeSession(id: number): Promise<ChatSessionMessage[]> {
+  return invoke<ChatSessionMessage[]>("chat_resume_session", { id });
+}
+
+/** Delete one stored session and its transcript (purge, 2026-07-27). */
+export function chatSessionDelete(id: number): Promise<void> {
+  return invoke<void>("chat_session_delete", { id });
+}
+
+/** Delete every stored session; resolves with how many went. */
+export function chatSessionsWipe(): Promise<number> {
+  return invoke<number>("chat_sessions_wipe");
+}
+
 export function chatNewSession(): Promise<number> {
   return invoke<number>("chat_new_session");
 }
@@ -996,6 +1050,9 @@ export type ChatAction =
   // snapshots (routing, permissions, privacy, nudge) — they describe the
   // machine, not the conversation.
   | { type: "new-chat" }
+  // Resume a stored session: seed the transcript from its saved messages
+  // (all settled — nothing was streaming when it was stored).
+  | { type: "resume-chat"; messages: { role: string; text: string }[] }
   // Approval prompts (gate ↔ overlay): a request parks an action until its
   // verdict; answered removes it (the IPC reply itself is fired by the view).
   | { type: "hid-approval"; request: HidApprovalRequest }
@@ -1207,6 +1264,26 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         runPhase: state.runPhase,
         // A run (and its parked approvals) outlives the transcript reset —
         // dropping these would hang the gate until its timeout denies.
+        hidApprovals: state.hidApprovals,
+        mcpApprovals: state.mcpApprovals,
+      };
+    case "resume-chat":
+      return {
+        ...initialChatState,
+        // Stored transcripts only hold user/assistant lines; anything else
+        // (a future role) is dropped rather than rendered as a wrong bubble.
+        messages: action.messages
+          .filter((m) => m.role === "user" || m.role === "assistant")
+          .map((m) => ({
+            role: m.role as "user" | "assistant",
+            text: m.text,
+            status: "done" as const,
+          })),
+        modelInfo: state.modelInfo,
+        capturePermission: state.capturePermission,
+        privacy: state.privacy,
+        nudge: state.nudge,
+        runPhase: state.runPhase,
         hidApprovals: state.hidApprovals,
         mcpApprovals: state.mcpApprovals,
       };

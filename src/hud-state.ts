@@ -155,6 +155,7 @@ export function describeCall(name: string, rawArguments: string): {
     return { label: "look at the screen", input: false, target: null };
   }
   if (name === "screen_query") return { label: "read the screen", input: false, target: null };
+  if (name === "read_page") return { label: "read the page", input: false, target: null };
   if (name === "memory_search") {
     const query = typeof args.query === "string" ? args.query : "";
     return { label: query ? `recall · “${query}”` : "search memory", input: false, target: null };
@@ -333,6 +334,59 @@ export function settledClickRipples(
       y: e.target!.y,
       ok: e.status === "ok",
     }));
+}
+
+/** The hud-canvas fit: the monitor the canvas window currently covers, in
+ *  logical screen points (hud.rs HudCanvasFit, camelCase). */
+export interface CanvasFit {
+  originX: number;
+  originY: number;
+  width: number;
+  height: number;
+}
+
+/** Cursor movement bigger than this between ~33ms samples while NO input
+ *  action is running means a human hand is on the mouse. Small enough to
+ *  catch a gentle nudge, big enough to ignore readback jitter. */
+export const USER_CONTROL_THRESHOLD_PX = 3;
+
+/** Fold one cursor sample into the "the user took the mouse" flag:
+ *  - while an input action is RUNNING, movement is Third Eye's own
+ *    synthesis — the flag clears (Third Eye visibly holds the pointer);
+ *  - between actions, movement beyond the jitter threshold sets it —
+ *    the follower dot/annotation hide until Third Eye acts again.
+ *  Pure so the hand-off policy is testable without a mouse. */
+export function nextUserControl(
+  prev: { x: number; y: number } | null,
+  next: { x: number; y: number },
+  actionRunning: boolean,
+  current: boolean,
+): boolean {
+  if (actionRunning) return false;
+  if (
+    prev !== null &&
+    (Math.abs(next.x - prev.x) > USER_CONTROL_THRESHOLD_PX ||
+      Math.abs(next.y - prev.y) > USER_CONTROL_THRESHOLD_PX)
+  ) {
+    return true;
+  }
+  return current;
+}
+
+/** Whether a global screen point is inside the fitted monitor. A null fit
+ *  (nothing fit yet this mount) or a degenerate one (the backend's
+ *  no-monitor fallback) contains nothing — the caller must (re)fit before
+ *  rendering global coordinates against its origin. This is the
+ *  follower-offset fix: the badge used to subtract a stale/zero origin
+ *  whenever a run had no coordinate target (approval prompts). */
+export function fitContains(fit: CanvasFit | null, x: number, y: number): boolean {
+  if (fit === null || fit.width <= 0 || fit.height <= 0) return false;
+  return (
+    x >= fit.originX &&
+    x < fit.originX + fit.width &&
+    y >= fit.originY &&
+    y < fit.originY + fit.height
+  );
 }
 
 /** Whether any approval is parked — the pill must surface these even when

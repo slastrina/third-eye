@@ -378,6 +378,12 @@ impl SessionWhitelist {
 
     /// Grant `kind` for the rest of this session — the "Always allow this kind"
     /// verdict. Idempotent; the only mutation that adds to the set.
+    /// Withdraw a grant (the Settings "always allowed" remove button —
+    /// revoking a persisted kind must also stop the RUNNING session).
+    pub fn revoke(&mut self, kind: ActionKind) {
+        self.kinds.remove(&kind);
+    }
+
     pub fn allow(&mut self, kind: ActionKind) {
         self.kinds.insert(kind);
     }

@@ -238,6 +238,10 @@ pub fn run() {
             memory::commands::memory_retention,
             memory::commands::set_memory_retention,
             memory::commands::chat_new_session,
+            memory::commands::chat_resume_session,
+            memory::commands::memory_graph,
+            memory::commands::chat_session_delete,
+            memory::commands::chat_sessions_wipe,
             memory::commands::chat_sessions,
             memory::commands::chat_session_messages,
             #[cfg(desktop)]
@@ -255,6 +259,11 @@ pub fn run() {
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
             nudge::commands::nudge_context_frame,
+            nudge::commands::set_nudge_cooldown,
+            nudge::commands::set_nudge_auto_dismiss,
+            nudge::commands::nudge_history,
+            llm::commands::approved_action_kinds,
+            llm::commands::remove_approved_action_kind,
             tool_toggles::tool_toggles_status,
             tool_toggles::set_tool_enabled,
             settings_window::show_settings_window,
@@ -347,6 +356,7 @@ pub fn run() {
             #[cfg(desktop)]
             nudge::commands::apply_persisted_nudges_enabled(app.handle());
             tool_toggles::apply_persisted_tool_toggles(app.handle());
+            llm::commands::apply_persisted_approvals(app.handle());
 
             // Persisted cloud opt-in (M004 S03): a present settings.json key
             // restores the user's choice; absent keeps the safe default (off).

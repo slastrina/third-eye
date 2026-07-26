@@ -247,7 +247,7 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
         let payload = ApprovalRequestPayload {
             approval_id,
             kind,
-            summary,
+            summary: summary.clone(),
         };
         if let Err(e) = self.app.emit(HID_APPROVAL_EVENT, payload) {
             log::warn!("llm: HID approval-request emit failed id={approval_id}: {e}; denying");
@@ -257,6 +257,15 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
         match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
             Ok(Ok(verdict)) => {
                 log::info!("llm: HID approval id={approval_id} verdict={verdict:?}");
+                if verdict == ApprovalVerdict::AllowAlways {
+                    // Persist the permanent grant HERE (the one place with the
+                    // AppHandle, kind, and summary), then downgrade so gate
+                    // logic never changes: HID kinds become a session grant
+                    // (the persisted kind re-seeds every future session at
+                    // boot); run_command becomes allow-once with its first
+                    // token added to the persistent command allowlist.
+                    return persist_always_grant(&self.app, kind, &summary);
+                }
                 verdict
             }
             Ok(Err(_closed)) => {
@@ -726,6 +735,13 @@ pub async fn chat(
         // task, which drops the future and runs this destructor.
         #[cfg(desktop)]
         let _activity = crate::tray::begin_activity(&task_app, crate::tray::ActivityKind::Stream);
+        // Safety restore: a superseded predecessor was ABORTED mid-run and
+        // never reached its own ghost-off — un-ghost unconditionally before
+        // this run starts (idempotent: alpha 1.0 + policy click-through is
+        // the normal resting state).
+        if let Err(err) = crate::overlay::set_hid_ghost(&task_app, false) {
+            log::debug!("llm: request {id} pre-run ghost reset skipped: {err}");
+        }
         let started = Instant::now();
         let first_token_at: Mutex<Option<Instant>> = Mutex::new(None);
         // Chat-ingest capture (M008 S01): every tool event is accumulated so
@@ -771,7 +787,24 @@ pub async fn chat(
         // Tool phases surface as llm://tool-call / llm://tool-result — the
         // UI's memory-consulted indicator (T04). Emission failure is logged,
         // never fatal, same policy as tokens.
+        //
+        // Ghost trigger (2026-07-27, beeping-address-bar bug): the overlay
+        // panel can physically cover the model's click target, and capture
+        // excludes Third Eye's own windows (R008) so the model can never see
+        // that — clicks would hit the panel forever. The FIRST input-driving
+        // call of a run turns the overlay semi-transparent + click-through +
+        // key-yielded; the run's end restores it (below, both exits).
+        let hid_ghosted = std::sync::atomic::AtomicBool::new(false);
         let on_event = |event: &ToolEvent| {
+            if let ToolEvent::Call(e) = event {
+                let drives_input = e.call.name == crate::llm::toolloop::INPUT_ACTION_TOOL
+                    || e.call.name == crate::llm::toolloop::FOCUS_APP_TOOL;
+                if drives_input && !hid_ghosted.swap(true, Ordering::SeqCst) {
+                    if let Err(err) = crate::overlay::set_hid_ghost(&task_app, true) {
+                        log::warn!("llm: request {id} overlay ghost-on failed: {err}");
+                    }
+                }
+            }
             if let Ok(mut events) = tool_events.lock() {
                 events.push(event.clone());
             }
@@ -875,6 +908,13 @@ pub async fn chat(
         executors.push(Box::new(ScreenQueryTool::new(
             screen_state.backend(),
             screen_seen,
+            focused_app.clone(),
+        )));
+        // Page-text continuity (2026-07-27): read the focused app's full
+        // content so follow-ups about an open page are answered by reading
+        // it. Same backend seam and focus intent as screen_query.
+        executors.push(Box::new(crate::llm::toolloop::ReadPageTool::new(
+            screen_state.backend(),
             focused_app,
         )));
         // Machine inventory (computer-control I1): read-only cache search, no
@@ -973,6 +1013,16 @@ pub async fn chat(
             })
             .collect();
         let executor = CompositeExecutor::new(executors);
+        // URL grounding + tab budget (2026-07-27, the one-shot fix made
+        // structural): seed the seen-set from the USER's words; tool results
+        // feed it as they land inside the wrapper.
+        let url_seen = std::sync::Arc::new(crate::llm::toolloop::UrlSeen::new());
+        for m in &messages {
+            if m.role == Role::User {
+                url_seen.harvest(&m.content);
+            }
+        }
+        let executor = crate::llm::toolloop::UrlGroundingExecutor::new(executor, url_seen);
         // Chat-ingest capture (M008 S01): the ask is the last user turn,
         // cloned NOW — `messages` gains system-turn inserts below and then
         // moves into the loop, and `LoopOutcome` does not return it.
@@ -1024,6 +1074,13 @@ pub async fn chat(
             &should_stop,
         )
         .await;
+        // Ghost restore: the run is over — whatever it produced, the overlay
+        // becomes solid and interactive again per its state-machine policy.
+        if hid_ghosted.load(Ordering::SeqCst) {
+            if let Err(err) = crate::overlay::set_hid_ghost(&task_app, false) {
+                log::warn!("llm: request {id} overlay ghost-off failed: {err}");
+            }
+        }
         let total_ms = started.elapsed().as_millis() as u64;
 
         // A user-stopped run ends Stopped; a natural finish or error ends Idle.
@@ -1450,6 +1507,106 @@ pub fn respond_hid_approval(
         );
     }
     delivered
+}
+
+/// Apply an "Always (forever)" approval: persist the grant and return the
+/// downgraded verdict the waiting gate should act on this run.
+fn persist_always_grant(app: &AppHandle, kind: ActionKind, summary: &str) -> ApprovalVerdict {
+    if kind == ActionKind::RunCommand {
+        // The summary is "Run command: <exact command line>" — the grant is
+        // the command's first token via the EXISTING persistent allowlist
+        // (visible and editable in Settings), never a blanket run_command
+        // pass (design: no auto-run mode exists for commands).
+        let token = summary
+            .strip_prefix("Run command: ")
+            .unwrap_or(summary)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if token.is_empty() {
+            log::warn!("llm: always-grant for run_command had no token; treating as allow-once");
+            return ApprovalVerdict::AllowOnce;
+        }
+        let state = app.state::<Arc<crate::command_runner::CommandState>>();
+        let mut entries = state.allowlist();
+        if !entries.contains(&token) {
+            entries.push(token.clone());
+            state.set_allowlist(entries.clone());
+            if let Err(e) = crate::config::save_command_allowlist(app, &entries) {
+                log::error!("llm: persisting command allowlist failed: {e}");
+            } else {
+                log::info!("llm: command token {token:?} permanently allowlisted");
+            }
+        }
+        return ApprovalVerdict::AllowOnce;
+    }
+    let kind_str = serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    let mut kinds = crate::config::load_approved_action_kinds(app);
+    if !kind_str.is_empty() && !kinds.contains(&kind_str) {
+        kinds.push(kind_str.clone());
+        if let Err(e) = crate::config::save_approved_action_kinds(app, &kinds) {
+            log::error!("llm: persisting approved kinds failed: {e}");
+        } else {
+            log::info!("llm: action kind {kind_str:?} permanently approved");
+        }
+    }
+    ApprovalVerdict::AllowKind
+}
+
+/// Seed the session whitelist from the persisted always-approved kinds —
+/// called at boot, so a permanent grant behaves like "Always this session"
+/// in EVERY session. Unknown kind strings (stale after a rename) drop.
+pub fn apply_persisted_approvals(app: &AppHandle) {
+    let state = app.state::<Arc<ApprovalState>>();
+    let kinds = crate::config::load_approved_action_kinds(app);
+    if kinds.is_empty() {
+        return;
+    }
+    let mut whitelist = state.whitelist.lock().unwrap();
+    let mut applied = 0usize;
+    for kind_str in &kinds {
+        match serde_json::from_value::<ActionKind>(serde_json::Value::String(kind_str.clone())) {
+            Ok(kind) => {
+                whitelist.allow(kind);
+                applied += 1;
+            }
+            Err(_) => log::warn!("llm: persisted approved kind {kind_str:?} is unknown; skipped"),
+        }
+    }
+    log::info!("llm: applied {applied} persisted always-approved action kind(s)");
+}
+
+/// The persisted always-approved kinds (Settings list) — kebab strings.
+#[tauri::command]
+pub fn approved_action_kinds(app: AppHandle) -> Vec<String> {
+    crate::config::load_approved_action_kinds(&app)
+}
+
+/// Withdraw a permanent grant: removed from the persisted set AND from the
+/// running session's whitelist, so the next action of that kind prompts
+/// again immediately. Returns the remaining set.
+#[tauri::command]
+pub fn remove_approved_action_kind(
+    app: AppHandle,
+    state: State<'_, Arc<ApprovalState>>,
+    kind: String,
+) -> Vec<String> {
+    let mut kinds = crate::config::load_approved_action_kinds(&app);
+    kinds.retain(|k| k != &kind);
+    if let Err(e) = crate::config::save_approved_action_kinds(&app, &kinds) {
+        log::error!("llm: persisting approved kinds after removal failed: {e}");
+    }
+    if let Ok(parsed) =
+        serde_json::from_value::<ActionKind>(serde_json::Value::String(kind.clone()))
+    {
+        state.whitelist.lock().unwrap().revoke(parsed);
+    }
+    log::info!("llm: action kind {kind:?} permanent approval removed");
+    kinds
 }
 
 /// The one shared MCP run-mode applier (S04 T02) — the MCP twin of

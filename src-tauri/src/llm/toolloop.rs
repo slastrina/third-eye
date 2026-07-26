@@ -56,6 +56,8 @@ pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 
 pub const CHAT_HISTORY_SEARCH_TOOL: &str = "chat_history_search";
 
+pub const READ_PAGE_TOOL: &str = "read_page";
+
 /// The HID tool S01 ships (M005). One tool with a tagged `action` argument
 /// (mirroring [`InputAction`]'s serde tag) keeps the composite's
 /// dispatch-by-name simple and the model's tool list short.
@@ -87,7 +89,9 @@ To operate any app, follow this order every time:\n\
 1. Call focus_app with the app name (e.g. \"Google Chrome\") to open it / bring it to the front.\n\
 2. Call screen_query to see what is on screen and get the real pixel coordinates of the element \
 you want. Each element carries cx,cy — its exact centre, precomputed for you. That pair IS the \
-click target; never do your own arithmetic on x/width.\n\
+click target; never do your own arithmetic on x/width. Elements with a role (AXButton, AXLink, \
+AXTextField, …) are the app's real controls with exact frames — prefer them over plain text \
+when both match what you want to click.\n\
 3. To click a target, call input_action with action \"mouse-click\" and pass that element's cx as \
 x and cy as y verbatim — the click moves to that point and clicks it in one step.\n\
 4. Use action \"type-text\" or \"key-press\" to enter text. Typing goes into whatever you last \
@@ -149,10 +153,21 @@ earlier conversations; chat_history_search finds the verbatim messages of past c
 When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
 about?\"), call chat_history_search with a short keyword (e.g. \"recipe\") and answer from the \
 matches — never claim you have no access to past conversations without searching first.\n\n\
+CONTINUITY: follow-up questions usually refer to what you JUST did and what is on screen right \
+now. A page you opened earlier in this conversation is still open — \"this recipe\", \"the \
+ingredients\", \"read it to me\" mean THAT page. Answer by looking: focus_app the browser if \
+needed, then read_page for the page's full text (or screen_query/take_screenshot for layout). \
+Never claim you cannot see a page you opened — read it.\n\n\
 To open a website or run a web search, prefer ONE run_command with `open` and the full URL — \
 e.g. `open \"https://www.google.com/search?q=lasagne+recipes\"` — the browser opens and loads it \
-directly, with no clicking or typing. Only drive the browser with screen_query/input_action for \
-interactions a URL cannot express (filling forms, pressing page buttons).\n\n\
+directly, with no clicking or typing. NEVER invent specific page URLs (a recipe page, an article, \
+a product) — you do not know they exist, and opening several guessed URLs floods the user's \
+browser with dead tabs. When the user wants you to FIND something (\"find me a lasagne recipe\"), \
+open ONE search-results URL, screen_query the results, pick the best match, and click it — then \
+verify the page loaded before answering. At most one page beyond the search results per task: \
+invented URLs and extra opens are refused (ungrounded-url / too-many-opens) — when that happens, \
+CLICK results on the page you already have instead. Only drive the browser with screen_query/input_action \
+for interactions a URL cannot express (filling forms, pressing page buttons).\n\n\
 When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed`, or any error — \
 the action DID NOT HAPPEN. Tell the user exactly what you completed, what failed, and why \
 (e.g. \"I opened Chrome, but input control is disabled so I could not type the search\"). NEVER \
@@ -506,6 +521,15 @@ pub trait ToolExecutor: Send + Sync {
     /// Execute one call. Never errors — every failure is a typed
     /// [`ToolOutcome`] the model and UI both see (R006).
     async fn execute(&self, call: &ToolCall) -> ToolOutcome;
+    /// Whether this executor is the home of `name` — the composite's routing
+    /// question. Defaults to "advertises it right now", which is correct for
+    /// every plain tool; gates that HIDE a tool from the model but still own
+    /// its refusal (the per-tool switchboard) override this so a call to a
+    /// disabled tool reaches the gate's typed "disabled" answer instead of
+    /// falling through to the composite's generic unknown-tool.
+    fn claims(&self, name: &str) -> bool {
+        self.definitions().iter().any(|d| d.name == name)
+    }
 }
 
 /// `memory_search` over the real S02 store — no new store logic, exactly the
@@ -608,6 +632,201 @@ impl ToolExecutor for MemorySearchTool {
             // the model can still answer from context.
             Err(err) => ToolOutcome::failure(err.kind(), err.to_string()),
         }
+    }
+}
+
+/// The typed refusal an `open <deep-url>` gets when that URL never appeared
+/// in the user's words or a real tool result — the model invented it. The
+/// structural half of the search-then-choose rule (the prose alone did not
+/// hold: the small model kept one-shotting guessed recipe URLs).
+pub const UNGROUNDED_URL_KIND: &str = "ungrounded-url";
+
+/// Per-run set of URLs the model has legitimately SEEN: harvested from the
+/// user's messages at run start and from every tool result as it lands.
+/// The `ScreenSeen` pattern applied to navigation — "never open a URL you
+/// did not read somewhere real."
+#[derive(Default)]
+pub struct UrlSeen(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl UrlSeen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Harvest every URL in `text` into the seen set.
+    pub fn harvest(&self, text: &str) {
+        let mut seen = self.0.lock().unwrap();
+        for url in extract_urls(text) {
+            seen.insert(url);
+        }
+    }
+
+    pub fn contains(&self, normalized: &str) -> bool {
+        self.0.lock().unwrap().contains(normalized)
+    }
+}
+
+/// Pull normalized URLs out of free text (tool results, user messages).
+pub fn extract_urls(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for start in text
+        .match_indices("http")
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>()
+    {
+        let rest = &text[start..];
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            continue;
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || "\"'<>)]}".contains(c))
+            .unwrap_or(rest.len());
+        let raw = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if raw.len() > 10 {
+            out.push(normalize_url(raw));
+        }
+    }
+    out
+}
+
+/// Normalization for grounded-set membership: lowercase scheme+host, strip
+/// one trailing slash. Exact-match beyond that — the model copies URLs
+/// verbatim when it has really seen them.
+pub fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    match trimmed.find("://").map(|i| i + 3) {
+        Some(host_start) => {
+            let host_end = trimmed[host_start..]
+                .find('/')
+                .map(|i| host_start + i)
+                .unwrap_or(trimmed.len());
+            format!(
+                "{}{}",
+                trimmed[..host_end].to_lowercase(),
+                &trimmed[host_end..]
+            )
+        }
+        None => trimmed.to_lowercase(),
+    }
+}
+
+/// URLs that are always openable without grounding: any homepage (no path),
+/// and search-results pages on the major engines — the search-then-choose
+/// flow's entry points.
+pub fn url_is_open_by_default(normalized: &str) -> bool {
+    let Some(host_start) = normalized.find("://").map(|i| i + 3) else {
+        return false;
+    };
+    let after = &normalized[host_start..];
+    let (host, path) = match after.find('/') {
+        Some(i) => (&after[..i], &after[i..]),
+        None => (after, ""),
+    };
+    if path.is_empty() || path == "/" {
+        return true;
+    }
+    let path_only = path.split('?').next().unwrap_or(path);
+    let is_engine = host.ends_with("google.com")
+        || host.ends_with("bing.com")
+        || host.ends_with("duckduckgo.com");
+    is_engine && (path_only == "/search" || path_only == "/html" || path_only == "/")
+}
+
+/// The URL inside an `open …` shell command, if the command is a browser
+/// navigation. Non-`open` commands (curl, etc.) are out of scope — the
+/// one-shot failure mode is guessed browser tabs.
+pub fn open_command_url(command: &str) -> Option<String> {
+    let trimmed = command.trim_start();
+    if trimmed != "open" && !trimmed.starts_with("open ") {
+        return None;
+    }
+    extract_urls(trimmed).into_iter().next()
+}
+
+/// Wraps the whole composite: refuses ungrounded `open <deep-url>` commands
+/// BEFORE they run, and harvests URLs out of every tool result so anything
+/// the model legitimately read becomes openable.
+pub struct UrlGroundingExecutor {
+    inner: CompositeExecutor,
+    seen: Arc<UrlSeen>,
+    /// Successful `open <url>` navigations this run — the tab-flood brake.
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+/// Browser navigations allowed per run: the search page plus one more.
+/// Anything past that is tab flooding — the model should be CLICKING
+/// results and reading the open page, not opening more.
+pub const MAX_OPENS_PER_RUN: usize = 2;
+
+/// The typed refusal further `open <url>` commands get past the budget.
+pub const TOO_MANY_OPENS_KIND: &str = "too-many-opens";
+
+impl UrlGroundingExecutor {
+    pub fn new(inner: CompositeExecutor, seen: Arc<UrlSeen>) -> Self {
+        Self {
+            inner,
+            seen,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for UrlGroundingExecutor {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions()
+    }
+
+    fn claims(&self, name: &str) -> bool {
+        self.inner.claims(name)
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == crate::command_runner::RUN_COMMAND_TOOL {
+            let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from));
+            if let Some(url) = command.as_deref().and_then(open_command_url) {
+                if !url_is_open_by_default(&url) && !self.seen.contains(&url) {
+                    log::warn!("llm: run_command refused — ungrounded url {url:?}");
+                    return ToolOutcome::failure(
+                        UNGROUNDED_URL_KIND,
+                        format!(
+                            "{url} was never given by the user or read from a page — you cannot \
+                             know it exists, and opening guessed URLs floods the browser with \
+                             dead tabs. To FIND something: open ONE search-results URL (e.g. \
+                             https://www.google.com/search?q=…), then screen_query and CLICK \
+                             the result you want. URLs the user typed, or that appeared in a \
+                             tool result, open fine."
+                        ),
+                    );
+                }
+                // The tab-flood brake: past the budget, no more navigations
+                // this run — grounded or not.
+                if self.opens.load(std::sync::atomic::Ordering::SeqCst) >= MAX_OPENS_PER_RUN {
+                    log::warn!("llm: run_command refused — open budget exhausted ({url:?})");
+                    return ToolOutcome::failure(
+                        TOO_MANY_OPENS_KIND,
+                        format!(
+                            "you have already opened {MAX_OPENS_PER_RUN} pages this run — do not \
+                             open more tabs. Work with what is open: focus_app the browser, \
+                             read_page or screen_query it, and CLICK links on the page instead \
+                             of opening new URLs."
+                        ),
+                    );
+                }
+                let outcome = self.inner.execute(call).await;
+                if outcome.ok {
+                    self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.seen.harvest(&outcome.content);
+                return outcome;
+            }
+        }
+        let outcome = self.inner.execute(call).await;
+        // Everything the model just read is now legitimately navigable.
+        self.seen.harvest(&outcome.content);
+        outcome
     }
 }
 
@@ -754,6 +973,84 @@ fn format_at_ms(at_ms: i64) -> String {
     match chrono::Local.timestamp_millis_opt(at_ms) {
         chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M").to_string(),
         _ => at_ms.to_string(),
+    }
+}
+
+/// Read the focused app's full visible text via its accessibility tree —
+/// the continuity primitive (2026-07-27): a page the model opened last
+/// turn is still on screen, and "what are the ingredients in this recipe"
+/// is answered by READING that page, not by claiming no access. Shares the
+/// screen-query backend seam; read-only, no gate (it discloses what is
+/// already on the user's screen to the user's own assistant).
+pub struct ReadPageTool {
+    backend: Arc<dyn ScreenQuery>,
+    focused_app: Arc<FocusedApp>,
+}
+
+impl ReadPageTool {
+    pub fn new(backend: Arc<dyn ScreenQuery>, focused_app: Arc<FocusedApp>) -> Self {
+        Self {
+            backend,
+            focused_app,
+        }
+    }
+
+    pub fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: READ_PAGE_TOOL.into(),
+            description: "Read the FULL text content of the focused app's window (the whole \
+                          page, not just what fits on screen) — recipes, articles, documents. \
+                          Use this whenever the user asks about the content of a page that is \
+                          open ('what are the ingredients', 'summarize this article', 'read it \
+                          to me'), including pages you opened in an earlier turn — they are \
+                          still open. Requires an app to be focused (focus_app first if none \
+                          is). Returns plain text in reading order; it has no coordinates — \
+                          clicking still needs screen_query."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ReadPageTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name != READ_PAGE_TOOL {
+            return ToolOutcome::failure(
+                "unknown-tool",
+                format!("unknown tool: {} (available: {READ_PAGE_TOOL})", call.name),
+            );
+        }
+        let Some(app) = self.focused_app.current() else {
+            return ToolOutcome::failure(
+                "no-focused-app",
+                "no app is focused this run — call focus_app with the app whose page you want \
+                 to read (e.g. the browser), then read_page",
+            );
+        };
+        match self.backend.page_text(&app).await {
+            Some(text) => {
+                let chars = text.chars().count();
+                ToolOutcome::success(format!(
+                    "[text of the frontmost {app} content, {chars} chars]\n{text}"
+                ))
+            }
+            None => ToolOutcome::failure(
+                "no-content",
+                format!(
+                    "{app} exposed no readable text (no accessibility content, or nothing is \
+                     open) — take_screenshot to LOOK at the screen instead"
+                ),
+            ),
+        }
     }
 }
 
@@ -1029,11 +1326,14 @@ impl ScreenQueryTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: SCREEN_QUERY_TOOL.into(),
-            description: "Return the text currently visible on this computer's screen, each \
-                          element with its absolute screen coordinates: cx, cy is the element's \
-                          exact centre — the ready-made click target — plus x, y (top-left \
-                          corner), width and height for context. To click an element, pass its \
-                          cx as x and cy as y to input_action verbatim; do not compute your own \
+            description: "Return the focused app's on-screen elements, each with absolute \
+                          screen coordinates: cx, cy is the element's exact centre — the \
+                          ready-made click target — plus x, y (top-left corner), width and \
+                          height for context. Elements with a `role` (AXButton, AXLink, \
+                          AXTextField, …) are the app's REAL interactive controls with exact \
+                          frames — ALWAYS prefer clicking one of those over plain recognized \
+                          text when both match your target. To click an element, pass its cx as \
+                          x and cy as y to input_action verbatim; do not compute your own \
                           coordinates."
                 .into(),
             parameters: serde_json::json!({
@@ -1094,6 +1394,23 @@ impl ToolExecutor for ScreenQueryTool {
                         elements.len()
                     );
                 }
+                // Accuracy v2: harvest the focused app's REAL interactive
+                // controls from its accessibility tree and put them first —
+                // exact frames, no OCR quantization. OCR lines centered
+                // inside an AX control are that control's label and drop.
+                let elements = match &focused {
+                    Some(app) => {
+                        let ax = self.backend.interactive(app).await;
+                        if !ax.is_empty() {
+                            log::debug!(
+                                "screen_query: merged {} AX element(s) for {app:?}",
+                                ax.len()
+                            );
+                        }
+                        crate::screenquery::merge_ax_and_ocr(ax, elements)
+                    }
+                    None => elements,
+                };
                 // The model now holds real on-screen coordinates — unblock the
                 // mouse-positioning gate AND record the exact boxes it was shown,
                 // so a subsequent coordinate-bearing click is checked against them
@@ -1279,7 +1596,7 @@ impl ToolExecutor for CompositeExecutor {
 
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
         for executor in &self.executors {
-            if executor.definitions().iter().any(|d| d.name == call.name) {
+            if executor.claims(&call.name) {
                 return executor.execute(call).await;
             }
         }
@@ -1308,6 +1625,12 @@ pub enum ApprovalVerdict {
     /// Perform this action and grant its kind for the session — no more prompts
     /// for this kind until the session ends ("Always allow this kind").
     AllowKind,
+    /// Perform this action and grant it PERMANENTLY (user request
+    /// 2026-07-27): the production prompt persists the grant — the action
+    /// kind for HID kinds, the command's first token into the command
+    /// allowlist for `run_command` — then downgrades the verdict before the
+    /// gate sees it, so gate logic never changes. Revocable in Settings.
+    AllowAlways,
     /// Refuse this action — a visible, typed `approval-denied` tool result; the
     /// backend is never touched.
     Deny,
@@ -1492,7 +1815,7 @@ impl ApprovalGate {
                         log::info!("llm: {tool} allowed once kind={kind:?}");
                         run().await
                     }
-                    ApprovalVerdict::AllowKind => {
+                    ApprovalVerdict::AllowAlways | ApprovalVerdict::AllowKind => {
                         self.whitelist.lock().unwrap().allow(kind);
                         log::info!(
                             "llm: {tool} allowed + kind whitelisted for session kind={kind:?}"
@@ -2768,6 +3091,56 @@ mod tests {
     }
 
     #[test]
+    fn url_extraction_normalizes_and_trims_punctuation() {
+        let urls = extract_urls(
+            "see https://RecipeTinEats.com/lasagna/, and (https://a.com/b?q=1) or text.",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://recipetineats.com/lasagna".to_string(),
+                "https://a.com/b?q=1".to_string(),
+            ]
+        );
+        assert!(extract_urls("no urls here, not even http alone").is_empty());
+    }
+
+    #[test]
+    fn open_by_default_is_homepages_and_search_results_only() {
+        assert!(url_is_open_by_default("https://recipetineats.com"));
+        assert!(url_is_open_by_default(
+            "https://www.google.com/search?q=lasagne+recipes"
+        ));
+        assert!(url_is_open_by_default("https://duckduckgo.com/html?q=x"));
+        // Deep content paths need grounding.
+        assert!(!url_is_open_by_default("https://recipetineats.com/lasagna"));
+        assert!(!url_is_open_by_default(
+            "https://www.allrecipes.com/recipe/23600/worlds-best-lasagna"
+        ));
+        // A search-looking path on a random host is still deep.
+        assert!(!url_is_open_by_default("https://evil.com/search?q=x"));
+    }
+
+    #[test]
+    fn open_command_url_scopes_to_open_commands() {
+        assert_eq!(
+            open_command_url("open \"https://a.com/b\""),
+            Some("https://a.com/b".to_string())
+        );
+        assert_eq!(open_command_url("open -a \"Google Chrome\""), None);
+        assert_eq!(open_command_url("curl https://a.com/deep/path"), None);
+        assert_eq!(open_command_url("date"), None);
+    }
+
+    #[test]
+    fn url_seen_grounds_exact_normalized_urls() {
+        let seen = UrlSeen::new();
+        seen.harvest("the page linked https://RecipeTinEats.com/lasagna/ today");
+        assert!(seen.contains("https://recipetineats.com/lasagna"));
+        assert!(!seen.contains("https://recipetineats.com/carbonara"));
+    }
+
+    #[test]
     fn verify_against_intent_fires_only_on_positive_contradiction() {
         let observed = |app: &str| ActionReport {
             focus: Some(FocusReport {
@@ -3059,6 +3432,7 @@ mod tests {
                     cx: 0,
                     cy: 0,
                     app: None,
+                    role: None,
                 }]),
             }
         }
@@ -3083,6 +3457,7 @@ mod tests {
                         cx: 0,
                         cy: 0,
                         app: app.map(str::to_owned),
+                        role: None,
                     })
                     .collect()),
             }
@@ -3157,6 +3532,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: Some("Chrome".into()),
+                role: None,
             },
             ScreenElement {
                 text: "b".into(),
@@ -3167,6 +3543,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: None,
+                role: None,
             },
         ];
         assert_eq!(focused.filter(els.clone()), els);
@@ -3189,6 +3566,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: Some("google chrome".into()),
+                role: None,
             },
             ScreenElement {
                 text: "other".into(),
@@ -3199,6 +3577,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: Some("Finder".into()),
+                role: None,
             },
             ScreenElement {
                 text: "desktop".into(),
@@ -3209,6 +3588,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: None,
+                role: None,
             },
         ]);
         assert_eq!(kept.len(), 1);

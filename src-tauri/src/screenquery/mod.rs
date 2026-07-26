@@ -26,6 +26,8 @@
 //! [`fallback::FallbackScreenQuery`], which returns typed `unsupported` errors
 //! so Windows/Linux builds stay clean (R020).
 
+#[cfg(target_os = "macos")]
+pub mod ax;
 pub mod commands;
 pub mod fallback;
 #[cfg(target_os = "macos")]
@@ -60,6 +62,11 @@ pub struct ScreenElement {
     /// model tell "the Submit button in Chrome" from an identically-labelled one
     /// elsewhere, and pair with `focus_app` to operate the right app (M005).
     pub app: Option<String>,
+    /// The accessibility role for elements sourced from the AX tree
+    /// ("AXButton", "AXLink", …) — the REAL interactive controls, with exact
+    /// frames. `None` for OCR-sourced text (accuracy v2, 2026-07-27).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// The full screen-query failure taxonomy (R007). Serialized with a `kind` tag
@@ -156,12 +163,100 @@ impl std::error::Error for ScreenQueryError {}
 #[async_trait]
 pub trait ScreenQuery: Send + Sync {
     async fn query(&self) -> Result<Vec<ScreenElement>, ScreenQueryError>;
+
+    /// The focused app's interactive elements from its accessibility tree —
+    /// real buttons/links/fields with exact point frames. Best-effort and
+    /// additive: backends without an AX walk (fallback, mocks) return empty
+    /// and the query result stands on OCR alone.
+    async fn interactive(&self, app_name: &str) -> Vec<ScreenElement> {
+        let _ = app_name;
+        Vec::new()
+    }
+
+    /// The readable text of the app's frontmost content in tree order —
+    /// the `read_page` tool's substance ("what does this page say").
+    /// `None` when the backend has no text harvest (fallback, mocks) or
+    /// the app exposes nothing.
+    async fn page_text(&self, app_name: &str) -> Option<String> {
+        let _ = app_name;
+        None
+    }
+}
+
+/// Merge AX-sourced interactive elements with OCR text: AX first (they are
+/// the authoritative frames), then OCR elements whose center does NOT fall
+/// inside any AX element's box — a text line centered inside a button IS
+/// that button's label, and keeping both would offer the model two targets
+/// for one control with slightly different coordinates.
+pub fn merge_ax_and_ocr(ax: Vec<ScreenElement>, ocr: Vec<ScreenElement>) -> Vec<ScreenElement> {
+    let mut merged = ax;
+    let kept: Vec<ScreenElement> = ocr
+        .into_iter()
+        .filter(|el| {
+            !merged.iter().any(|a| {
+                el.cx >= a.x && el.cx < a.x + a.width && el.cy >= a.y && el.cy < a.y + a.height
+            })
+        })
+        .collect();
+    merged.extend(kept);
+    merged
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn el(text: &str, x: i32, y: i32, w: i32, h: i32, role: Option<&str>) -> ScreenElement {
+        ScreenElement {
+            text: text.into(),
+            x,
+            y,
+            width: w,
+            height: h,
+            cx: x + w / 2,
+            cy: y + h / 2,
+            app: Some("Chrome".into()),
+            role: role.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn merge_puts_ax_first_and_drops_ocr_labels_inside_ax_boxes() {
+        let ax = vec![el("Search", 100, 100, 120, 40, Some("AXButton"))];
+        let ocr = vec![
+            // OCR read the button's own label — a duplicate target with
+            // slightly different coordinates; it must drop.
+            el("Search", 110, 112, 100, 16, None),
+            // Unrelated text elsewhere survives.
+            el("Results for carbonara", 100, 300, 300, 20, None),
+        ];
+        let merged = merge_ax_and_ocr(ax, ocr);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|e| (e.text.as_str(), e.role.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("Search", true), ("Results for carbonara", false)]
+        );
+    }
+
+    #[test]
+    fn merge_with_no_ax_elements_is_the_ocr_result_unchanged() {
+        let ocr = vec![el("plain text", 0, 0, 50, 10, None)];
+        assert_eq!(merge_ax_and_ocr(Vec::new(), ocr.clone()), ocr);
+    }
+
+    #[test]
+    fn role_serializes_only_when_present() {
+        let with = serde_json::to_value(el("Go", 0, 0, 10, 10, Some("AXLink"))).unwrap();
+        assert_eq!(with["role"], "AXLink");
+        let without = serde_json::to_value(el("Go", 0, 0, 10, 10, None)).unwrap();
+        assert!(
+            without.get("role").is_none(),
+            "None role must not appear on the wire"
+        );
+    }
 
     /// Minimal in-memory backend proving the trait is implementable and
     /// object-safe — the same shape the T03 tool tests will use.
@@ -184,6 +279,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: Some("Finder".to_string()),
+                role: None,
             }])
         }
     }
@@ -219,6 +315,7 @@ mod tests {
             cx: 0,
             cy: 0,
             app: Some("Zed".into()),
+            role: None,
         };
         let v = serde_json::to_value(&el).unwrap();
         assert_eq!(v["text"], "hi");
@@ -238,6 +335,7 @@ mod tests {
             cx: 0,
             cy: 0,
             app: None,
+            role: None,
         };
         assert!(serde_json::to_value(&bare).unwrap()["app"].is_null());
     }

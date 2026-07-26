@@ -32,6 +32,7 @@ fn screen_element_payload_carries_coordinates() {
         cx: 0,
         cy: 0,
         app: None,
+        role: None,
     };
     let v = serde_json::to_value(&element).unwrap();
     // camelCase, and the coordinates the model reads are all present.

@@ -438,3 +438,14 @@ test("memory window renders its shell with honest empty states outside the app",
   await expect(card.getByLabel("Search your memory")).toBeVisible();
   await expect(card.locator(".memwin-recall-results")).toHaveCount(0);
 });
+
+// ---------------------------------------------------------------------------
+// Graph tab (2026-07-27): the knowledge-graph view
+// ---------------------------------------------------------------------------
+
+test("graph tab renders and degrades to a named unavailable state outside Tauri", async ({ page }) => {
+  await page.goto("/?view=memory");
+  await page.getByRole("tab", { name: "Graph" }).click();
+  // No Tauri runtime: memory_graph rejects → the honest degrade line, no crash.
+  await expect(page.getByText("The memory graph is unavailable outside the app.")).toBeVisible();
+});

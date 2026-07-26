@@ -246,6 +246,12 @@ pub fn monitor_index_containing(monitors: &[MonitorRect], x: f64, y: f64) -> Opt
 pub struct HudCanvasFit {
     pub origin_x: f64,
     pub origin_y: f64,
+    /// The fitted monitor's logical size — lets the canvas webview tell
+    /// whether a later point (the live cursor) is still inside this fit or
+    /// needs a re-fit (the follower-offset bug: rendering global cursor
+    /// coordinates against a stale or never-set origin).
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Move the hud-canvas over the monitor containing the logical screen point
@@ -281,6 +287,8 @@ pub fn fit_hud_canvas(app: AppHandle, x: f64, y: f64) -> Result<HudCanvasFit, St
         return Ok(HudCanvasFit {
             origin_x: 0.0,
             origin_y: 0.0,
+            width: 0.0,
+            height: 0.0,
         });
     };
     let rect = rects[index];
@@ -294,6 +302,8 @@ pub fn fit_hud_canvas(app: AppHandle, x: f64, y: f64) -> Result<HudCanvasFit, St
     Ok(HudCanvasFit {
         origin_x: rect.x,
         origin_y: rect.y,
+        width: rect.width,
+        height: rect.height,
     })
 }
 

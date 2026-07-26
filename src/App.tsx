@@ -1,3 +1,4 @@
+import type { ChatSessionSummary } from "./chat";
 import { useEffect, useReducer, useRef, useState } from "react";
 import {
   bannerDetail,
@@ -7,6 +8,8 @@ import {
   captureErrorTitle,
   captureScreen,
   chatNewSession,
+  chatResumeSession,
+  chatSessions,
   chatReducer,
   completeFirstRun,
   composeMessages,
@@ -987,9 +990,37 @@ function App() {
   // backend starts pointing exchanges at a fresh one, and the transcript
   // clears (environment snapshots survive the reset).
   const startNewChat = () => {
+    setHistoryOpen(false);
     dispatchChat({ type: "new-chat" });
     chatNewSession().catch((err) =>
       console.debug("chat: chat_new_session unavailable:", err),
+    );
+  };
+
+  // Resume (2026-07-27 spec): the History picker lists stored sessions;
+  // choosing one repoints the backend session AND seeds the transcript from
+  // the returned messages in one IPC round-trip.
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySessions, setHistorySessions] = useState<ChatSessionSummary[] | null>(null);
+  const toggleHistory = () => {
+    const next = !historyOpen;
+    setHistoryOpen(next);
+    if (next) {
+      setHistorySessions(null);
+      chatSessions(12).then(
+        (sessions) => setHistorySessions(sessions),
+        (err) => {
+          console.debug("chat: chat_sessions unavailable:", err);
+          setHistorySessions([]);
+        },
+      );
+    }
+  };
+  const resumeSession = (id: number) => {
+    setHistoryOpen(false);
+    chatResumeSession(id).then(
+      (messages) => dispatchChat({ type: "resume-chat", messages }),
+      (err) => console.debug("chat: chat_resume_session failed:", err),
     );
   };
 
@@ -1211,6 +1242,7 @@ function App() {
               summary={request.summary}
               onAllowOnce={() => answerHidApproval(request.approvalId, "allow-once")}
               onAllowAlways={() => answerHidApproval(request.approvalId, "allow-kind")}
+              onAllowForever={() => answerHidApproval(request.approvalId, "allow-always")}
               onDeny={() => answerHidApproval(request.approvalId, "deny")}
             />
           ))}
@@ -1373,6 +1405,40 @@ function App() {
               >
                 ＋ New
               </button>
+            )}
+            <button
+              type="button"
+              className="overlay-new-chat overlay-history"
+              title="Resume a saved chat"
+              aria-expanded={historyOpen}
+              onClick={toggleHistory}
+            >
+              ⤺ History
+            </button>
+            {historyOpen && (
+              <div className="overlay-history-list" role="listbox" aria-label="Saved chats">
+                {historySessions === null && (
+                  <span className="overlay-history-empty">Loading…</span>
+                )}
+                {historySessions !== null && historySessions.length === 0 && (
+                  <span className="overlay-history-empty">No saved chats yet</span>
+                )}
+                {historySessions?.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className="overlay-history-item"
+                    role="option"
+                    aria-selected="false"
+                    onClick={() => resumeSession(session.id)}
+                  >
+                    <span className="overlay-history-title">{session.title || "(untitled)"}</span>
+                    <span className="overlay-history-meta">
+                      {new Date(session.lastAtMs).toLocaleDateString()} · {session.messageCount}
+                    </span>
+                  </button>
+                ))}
+              </div>
             )}
             <span className="overlay-esc-chip" aria-hidden="true">
               esc

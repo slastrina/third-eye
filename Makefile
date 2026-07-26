@@ -13,7 +13,7 @@ TAURI := npm run tauri --
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev tauri-dev build build-web build-tauri run-app preview \
+.PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg preview \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
         clean-web clean-rust
@@ -60,6 +60,13 @@ APP_BUNDLE := src-tauri/target/release/bundle/macos/Third Eye.app
 ## run-app: Build the release app bundle and launch it (stable binary for OS permission grants)
 run-app: build-tauri
 	open "$(APP_BUNDLE)"
+
+# Glob, not a pinned name: the DMG carries the version + arch in its
+# filename (Third Eye_0.1.0_aarch64.dmg) and a bump must not break this.
+# Shell glob expansion keeps the space in "Third Eye" as one word.
+## build-dmg: Build the release bundle and open the installer DMG (does NOT launch the app)
+build-dmg: build-tauri
+	open src-tauri/target/release/bundle/dmg/*.dmg
 
 ## build-web: Type-check and build the frontend (tsc && vite build)
 build-web:
@@ -137,3 +144,9 @@ clean-web:
 ## clean-rust: Remove the Rust build output (src-tauri/target/)
 clean-rust:
 	cd src-tauri && cargo clean
+
+# Behavioural evals for the tool loop (spec 2026-07-27): deterministic
+# scenarios over the real loop + scripted model. Live twin against LM Studio:
+#   cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --ignored --nocapture
+evals:
+	cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --nocapture

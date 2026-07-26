@@ -829,9 +829,14 @@ pub const NUDGES_ENABLED_KEY: &str = "nudgesEnabled";
 pub const NUDGES_ENABLED_DEFAULT: bool = true;
 
 /// Store key holding the nudge cooldown in seconds (D019's configurable
-/// cooldown: a settings.json key read at startup, no UI). Read-only from
-/// the app's perspective — there is deliberately no save fn.
+/// cooldown; Settings chips since 2026-07-27).
 pub const NUDGE_COOLDOWN_SECS_KEY: &str = "nudgeCooldownSecs";
+
+/// Store key holding the nudge banner's auto-dismiss window in seconds.
+pub const NUDGE_AUTO_DISMISS_SECS_KEY: &str = "nudgeAutoDismissSecs";
+
+/// Default for [`NUDGE_AUTO_DISMISS_SECS_KEY`].
+pub const NUDGE_AUTO_DISMISS_SECS_DEFAULT: u64 = 12;
 
 /// Default for [`NUDGE_COOLDOWN_SECS_KEY`]: at most one nudge per 5 min.
 pub const NUDGE_COOLDOWN_SECS_DEFAULT: u64 = 300;
@@ -921,6 +926,54 @@ fn stored_nudge_cooldown_secs(value: &serde_json::Value) -> u64 {
             NUDGE_COOLDOWN_SECS_DEFAULT
         }
     }
+}
+
+/// Persist the nudge cooldown (Settings chips). Same rollback contract as
+/// the nudges toggle: the caller reverts in-memory state on Err.
+pub fn save_nudge_cooldown_secs(app: &AppHandle, secs: u64) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(NUDGE_COOLDOWN_SECS_KEY, serde_json::json!(secs));
+    store.save().map_err(|e| {
+        format!("failed to persist {NUDGE_COOLDOWN_SECS_KEY}={secs} to {path}: {e}")
+    })?;
+    log::info!("config: persisted {NUDGE_COOLDOWN_SECS_KEY}={secs} to {path}");
+    Ok(())
+}
+
+/// Read the persisted auto-dismiss window, falling back to the default for
+/// anything non-positive or non-integer (same trust rule as the cooldown).
+pub fn load_nudge_auto_dismiss_secs(app: &AppHandle) -> u64 {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        log::error!(
+            "config: failed to open settings store at {}",
+            store_path(app)
+        );
+        return NUDGE_AUTO_DISMISS_SECS_DEFAULT;
+    };
+    match store
+        .get(NUDGE_AUTO_DISMISS_SECS_KEY)
+        .and_then(|v| v.as_u64())
+    {
+        Some(secs) if secs > 0 => secs,
+        Some(_) | None => NUDGE_AUTO_DISMISS_SECS_DEFAULT,
+    }
+}
+
+/// Persist the auto-dismiss window (Settings chips).
+pub fn save_nudge_auto_dismiss_secs(app: &AppHandle, secs: u64) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(NUDGE_AUTO_DISMISS_SECS_KEY, serde_json::json!(secs));
+    store.save().map_err(|e| {
+        format!("failed to persist {NUDGE_AUTO_DISMISS_SECS_KEY}={secs} to {path}: {e}")
+    })?;
+    log::info!("config: persisted {NUDGE_AUTO_DISMISS_SECS_KEY}={secs} to {path}");
+    Ok(())
 }
 
 /// Store key holding the overlay presentation config (M006 S04). A single
@@ -1615,6 +1668,57 @@ pub fn save_disabled_tools(app: &AppHandle, names: &[String]) -> Result<(), Stri
     log::info!(
         "config: persisted {DISABLED_TOOLS_KEY} ({} entries) to {path}",
         names.len()
+    );
+    Ok(())
+}
+
+/// Store key for permanently approved HID action kinds (user request
+/// 2026-07-27): kinds granted via the approval card's "Always" seed the
+/// session whitelist at every boot. Kebab-case ActionKind strings.
+pub const APPROVED_ACTION_KINDS_KEY: &str = "approvedActionKinds";
+
+/// Read the persisted always-approved kinds. Garbage-tolerant like the
+/// command allowlist: non-strings drop with a warning; unknown kind names
+/// are dropped by the caller's parse.
+pub fn load_approved_action_kinds(app: &AppHandle) -> Vec<String> {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        log::error!(
+            "config: failed to open settings store at {}",
+            store_path(app)
+        );
+        return Vec::new();
+    };
+    let Some(value) = store.get(APPROVED_ACTION_KINDS_KEY) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        log::warn!(
+            "config: {APPROVED_ACTION_KINDS_KEY} holds a non-array value; treating as empty"
+        );
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| item.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect()
+}
+
+/// Persist the always-approved kinds (already validated by the caller).
+pub fn save_approved_action_kinds(app: &AppHandle, kinds: &[String]) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(APPROVED_ACTION_KINDS_KEY, serde_json::json!(kinds));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {APPROVED_ACTION_KINDS_KEY} to {path}: {e}"))?;
+    log::info!(
+        "config: persisted {APPROVED_ACTION_KINDS_KEY} ({} kinds) to {path}",
+        kinds.len()
     );
     Ok(())
 }

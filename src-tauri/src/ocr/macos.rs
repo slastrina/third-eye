@@ -314,8 +314,10 @@ fn to_screen_points(el: TextElement, geom: CaptureGeometry) -> TextElement {
     // Center at FULL precision before any rounding: x, width round
     // independently for display, but the click target must not inherit
     // their combined error (up to a point each way).
-    let fx = el.x as f64 * sx;
-    let fy = el.y as f64 * sy;
+    // The display's global origin puts secondary-monitor boxes in global
+    // point space — the same space enigo clicks in (multi-display).
+    let fx = geom.origin_x + el.x as f64 * sx;
+    let fy = geom.origin_y + el.y as f64 * sy;
     let fw = el.width as f64 * sx;
     let fh = el.height as f64 * sy;
     TextElement {
@@ -494,6 +496,8 @@ mod tests {
             pixel_h: 2160,
             point_w: 1920.0,
             point_h: 1080.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
         let el = TextElement {
             text: "Search Google or type a URL".into(),
@@ -521,6 +525,8 @@ mod tests {
             pixel_h: 900,
             point_w: 1440.0,
             point_h: 900.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
         let el = TextElement {
             text: "x".into(),
@@ -544,6 +550,8 @@ mod tests {
             pixel_h: 0,
             point_w: 1920.0,
             point_h: 1080.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
         let el = TextElement {
             text: "x".into(),
@@ -559,6 +567,34 @@ mod tests {
     }
 
     #[test]
+    fn to_screen_points_adds_the_display_origin_for_secondary_monitors() {
+        // A 2x display sitting to the RIGHT of the primary (origin 1512, 0):
+        // a captured-pixel box maps into GLOBAL points, so the click lands on
+        // that monitor, not at the same offset on the primary.
+        let geom = CaptureGeometry {
+            pixel_w: 3840,
+            pixel_h: 2160,
+            point_w: 1920.0,
+            point_h: 1080.0,
+            origin_x: 1512.0,
+            origin_y: 0.0,
+        };
+        let el = TextElement {
+            text: "Submit".into(),
+            x: 200,
+            y: 400,
+            width: 100,
+            height: 40,
+            cx: 0,
+            cy: 0,
+            app: None,
+        };
+        let pt = to_screen_points(el, geom);
+        assert_eq!((pt.x, pt.y), (1612, 200));
+        assert_eq!((pt.cx, pt.cy), (1637, 210));
+    }
+
+    #[test]
     fn to_screen_points_center_is_computed_before_rounding() {
         // The reason cx/cy exist: rounding x and width independently and THEN
         // taking x + width/2 (what the model used to do) accumulates both
@@ -570,6 +606,8 @@ mod tests {
             pixel_h: 2048,
             point_w: 1536.0,
             point_h: 1536.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
         let el = TextElement {
             text: "x".into(),

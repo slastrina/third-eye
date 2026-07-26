@@ -192,7 +192,7 @@ fn visible_window_count(pid: i32) -> Option<usize> {
 }
 
 /// Pid of a running app by localized name (for the window count readback).
-fn pid_for_app_name(name: &str) -> Option<i32> {
+pub(crate) fn pid_for_app_name(name: &str) -> Option<i32> {
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
     for app in apps.iter() {

@@ -51,3 +51,9 @@ fn window(app: &AppHandle) -> Result<WebviewWindow, String> {
     app.get_webview_window(OVERLAY_WINDOW_LABEL)
         .ok_or_else(|| format!("overlay window '{OVERLAY_WINDOW_LABEL}' not found"))
 }
+
+/// Ghost mode is a macOS panel behavior; other platforms no-op (the
+/// overlay there is a plain window with no synthesized-input interplay yet).
+pub fn set_ghost(_app: &AppHandle, _on: bool) -> Result<(), String> {
+    Ok(())
+}

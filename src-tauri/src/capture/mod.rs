@@ -212,6 +212,14 @@ pub trait ScreenCapture: Send + Sync {
     /// this process excluded (R008). Never hangs silently: every failure
     /// path resolves to a [`CaptureError`].
     async fn capture_primary(&self) -> Result<CapturedFrame, CaptureError>;
+
+    /// Capture the display containing the frontmost window — the monitor the
+    /// user is actually working on (multi-display, 2026-07-27). Defaults to
+    /// the primary capture for backends without display selection (mocks,
+    /// fallback), so it is always safe to call.
+    async fn capture_frontmost(&self) -> Result<CapturedFrame, CaptureError> {
+        self.capture_primary().await
+    }
 }
 
 /// Current Screen Recording permission state for this platform.

@@ -196,6 +196,19 @@ fn dispatch(app: &AppHandle, event: OverlayEvent) -> Result<OverlayState, String
     Ok(to)
 }
 
+/// Enter/leave HID ghost mode. On restore, the click-through policy for
+/// the CURRENT state is re-applied (a focused overlay becomes interactive
+/// again; an idle one stays click-through) — ghost never leaks a clickable
+/// frame into a state that must not accept clicks.
+pub fn set_hid_ghost(app: &AppHandle, on: bool) -> Result<(), String> {
+    platform::set_ghost(app, on)?;
+    if !on {
+        let state = app.state::<OverlayManager>().current();
+        platform::set_click_through(app, click_through(state))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn show_overlay(app: AppHandle) -> Result<OverlayState, String> {
     dispatch(&app, OverlayEvent::Show)

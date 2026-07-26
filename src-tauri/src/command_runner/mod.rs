@@ -400,7 +400,9 @@ impl ToolExecutor for RunCommandTool {
                 .await;
             match verdict {
                 ApprovalVerdict::AllowOnce => {}
-                ApprovalVerdict::AllowKind => {
+                // AllowAlways is downgraded by the production prompt;
+                // treat a raw one like the session grant defensively.
+                ApprovalVerdict::AllowKind | ApprovalVerdict::AllowAlways => {
                     if let Ok(mut whitelist) = self.whitelist.lock() {
                         whitelist.allow(ActionKind::RunCommand);
                     }

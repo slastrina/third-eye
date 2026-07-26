@@ -986,6 +986,51 @@ describe("chatReducer nudge lifecycle", () => {
   });
 });
 
+describe("resume-chat seeding (2026-07-27)", () => {
+  const modelInfo: ModelInfo = {
+    activeLane: "thin",
+    endpoint: "http://localhost:1234",
+    lanes: [{ name: "thin", modelId: "thin-1b" }],
+  };
+
+  it("seeds the stored transcript as settled bubbles and keeps environment state", () => {
+    let s = chatReducer(initialChatState, { type: "model-info", info: modelInfo });
+    s = chatReducer(s, { type: "submit", question: "in progress" });
+    s = chatReducer(s, {
+      type: "resume-chat",
+      messages: [
+        { role: "user", text: "find me a carbonara recipe" },
+        { role: "assistant", text: "Here is one from RecipeTinEats." },
+        { role: "system", text: "never rendered" },
+      ],
+    });
+    expect(s.messages).toEqual([
+      { role: "user", text: "find me a carbonara recipe", status: "done" },
+      { role: "assistant", text: "Here is one from RecipeTinEats.", status: "done" },
+    ]);
+    // Environment snapshots survive; the in-flight ask does not.
+    expect(s.modelInfo).toEqual(modelInfo);
+    expect(s.awaitingId).toBe(false);
+    expect(s.lastQuestion).toBeNull();
+  });
+
+  it("a resumed transcript rides into the next question's history", () => {
+    let s = chatReducer(initialChatState, {
+      type: "resume-chat",
+      messages: [
+        { role: "user", text: "earlier question" },
+        { role: "assistant", text: "earlier answer" },
+      ],
+    });
+    const wire = composeMessages(s.messages, "follow-up");
+    expect(wire).toEqual([
+      { role: "user", content: "earlier question" },
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: "follow-up" },
+    ]);
+  });
+});
+
 describe("nudge context preload composition", () => {
   it("prepends exactly one system message carrying screen and memory context", () => {
     const wire = composeMessages([], "what does this error mean?", [], nudge);

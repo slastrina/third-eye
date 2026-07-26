@@ -908,6 +908,7 @@ impl ScreenQuery for FixedScreen {
             cx: 0,
             cy: 0,
             app: Some("Google Chrome".into()),
+            role: None,
         }])
     }
 }

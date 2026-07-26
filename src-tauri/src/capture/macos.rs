@@ -93,6 +93,48 @@ impl ScreenCapture for MacosCapture {
         }
         result
     }
+
+    async fn capture_frontmost(&self) -> Result<CapturedFrame, CaptureError> {
+        let start = Instant::now();
+        let result = tokio::task::spawn_blocking(|| {
+            let image = capture_display_image_for_select_blocking(
+                encode::MAX_DIMENSION,
+                DisplaySelect::FrontmostWindow,
+            )?;
+            let (width, height) = (image.width() as u32, image.height() as u32);
+            let rgba = image.rgba_data().map_err(|e| CaptureError::CaptureFailed {
+                detail: format!("pixel render failed: {e}"),
+            })?;
+            encode::encode_rgba_frame(RawRgbaFrame {
+                width,
+                height,
+                rgba,
+            })
+        })
+        .await
+        .map_err(|e| CaptureError::CaptureFailed {
+            detail: format!("capture task panicked: {e}"),
+        })?;
+        match &result {
+            Ok(frame) => log::info!(
+                "capture: frontmost frame {}x{} in {} ms",
+                frame.width,
+                frame.height,
+                start.elapsed().as_millis()
+            ),
+            Err(err) => log::error!("capture: {} ({err})", err.kind()),
+        }
+        result
+    }
+}
+
+/// Image-only capture with an explicit display selection — the
+/// `capture_frontmost` frame path.
+pub fn capture_display_image_for_select_blocking(
+    max_dimension: u32,
+    select: DisplaySelect,
+) -> Result<CGImage, CaptureError> {
+    capture_inner(max_dimension, select).map(|(image, _windows, _geom)| image)
 }
 
 async fn capture_primary_inner() -> Result<CapturedFrame, CaptureError> {
@@ -151,10 +193,17 @@ pub struct CaptureGeometry {
     pub pixel_w: u32,
     /// Captured image height in pixels (the OCR normalization basis on y).
     pub pixel_h: u32,
-    /// Primary display width in logical points (the input backend's x space).
+    /// Captured display width in logical points (the input backend's x space).
     pub point_w: f64,
-    /// Primary display height in logical points (the input backend's y space).
+    /// Captured display height in logical points (the input backend's y space).
     pub point_h: f64,
+    /// The captured display's global origin in logical points — (0, 0) for
+    /// the primary; a secondary monitor's offset otherwise. Added back when
+    /// mapping captured-pixel boxes to global screen points, so a click on
+    /// any monitor lands where the element really is (multi-display,
+    /// 2026-07-27).
+    pub origin_x: f64,
+    pub origin_y: f64,
 }
 
 /// The reusable capture stage: one `CGImage` of the primary display, capped
@@ -172,6 +221,106 @@ pub fn capture_display_image_blocking(max_dimension: u32) -> Result<CGImage, Cap
     capture_display_image_with_windows_blocking(max_dimension).map(|(image, _windows)| image)
 }
 
+/// Which display a capture targets. The watcher stays on the primary (cost:
+/// it runs every few seconds); on-demand eyes — screen_query and
+/// take_screenshot — follow the frontmost window so an app on a secondary
+/// monitor is visible and clickable (multi-display, 2026-07-27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplaySelect {
+    Primary,
+    /// The display containing the frontmost on-screen layer-0 window's
+    /// center; primary when there is none or the lookup fails.
+    FrontmostWindow,
+}
+
+/// Center of the frontmost on-screen, layer-0, non-own-process window in
+/// global logical points. CGWindowListCopyWindowInfo with OnScreenOnly
+/// returns windows front-to-back, so the first qualifying entry IS the
+/// frontmost user window. Needs no permission; `None` on any failure.
+fn frontmost_window_center() -> Option<(f64, f64)> {
+    #[repr(C)]
+    struct __CFArray(std::ffi::c_void);
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> *const __CFArray;
+        fn CGRectMakeWithDictionaryRepresentation(
+            dict: *const std::ffi::c_void,
+            rect: *mut objc2_core_foundation::CGRect,
+        ) -> bool;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const __CFArray) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const __CFArray, idx: isize) -> *const std::ffi::c_void;
+        fn CFDictionaryGetValue(
+            dict: *const std::ffi::c_void,
+            key: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFNumberGetValue(
+            number: *const std::ffi::c_void,
+            the_type: i32,
+            value_ptr: *mut std::ffi::c_void,
+        ) -> bool;
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+    const OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    const NULL_WINDOW_ID: u32 = 0;
+    const K_CF_NUMBER_SINT32: i32 = 3;
+    use objc2_core_foundation::CFString;
+    let own_pid = std::process::id() as i32;
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(
+            OPTION_ON_SCREEN_ONLY | EXCLUDE_DESKTOP_ELEMENTS,
+            NULL_WINDOW_ID,
+        );
+        if list.is_null() {
+            return None;
+        }
+        let owner_key = CFString::from_str("kCGWindowOwnerPID");
+        let layer_key = CFString::from_str("kCGWindowLayer");
+        let bounds_key = CFString::from_str("kCGWindowBounds");
+        let mut found = None;
+        for i in 0..CFArrayGetCount(list) {
+            let dict = CFArrayGetValueAtIndex(list, i);
+            let read_i32 = |key: &CFString| -> Option<i32> {
+                let value =
+                    CFDictionaryGetValue(dict, key as *const CFString as *const std::ffi::c_void);
+                if value.is_null() {
+                    return None;
+                }
+                let mut out: i32 = 0;
+                CFNumberGetValue(
+                    value,
+                    K_CF_NUMBER_SINT32,
+                    &mut out as *mut i32 as *mut std::ffi::c_void,
+                )
+                .then_some(out)
+            };
+            if read_i32(&layer_key) != Some(0) || read_i32(&owner_key) == Some(own_pid) {
+                continue;
+            }
+            let bounds = CFDictionaryGetValue(
+                dict,
+                &*bounds_key as *const CFString as *const std::ffi::c_void,
+            );
+            if bounds.is_null() {
+                continue;
+            }
+            let mut rect = objc2_core_foundation::CGRect::default();
+            if CGRectMakeWithDictionaryRepresentation(bounds, &mut rect) {
+                found = Some((
+                    rect.origin.x + rect.size.width / 2.0,
+                    rect.origin.y + rect.size.height / 2.0,
+                ));
+                break;
+            }
+        }
+        CFRelease(list as *mut std::ffi::c_void);
+        found
+    }
+}
+
 /// The windows-bearing capture that ALSO returns the [`CaptureGeometry`] the
 /// screen_query path needs to convert captured-pixel boxes back to logical
 /// screen points. [`capture_display_image_with_windows_blocking`] is the
@@ -179,7 +328,9 @@ pub fn capture_display_image_blocking(max_dimension: u32) -> Result<CGImage, Cap
 pub fn capture_display_image_with_geometry_blocking(
     max_dimension: u32,
 ) -> Result<(CGImage, Vec<WindowAppRect>, CaptureGeometry), CaptureError> {
-    capture_inner(max_dimension)
+    // The geometry-bearing path IS the screen_query path — follow the
+    // frontmost window so the model reads the monitor the user works on.
+    capture_inner(max_dimension, DisplaySelect::FrontmostWindow)
 }
 
 /// The capture stage plus the on-screen window→app rects in the captured image's
@@ -195,13 +346,15 @@ pub fn capture_display_image_with_geometry_blocking(
 pub fn capture_display_image_with_windows_blocking(
     max_dimension: u32,
 ) -> Result<(CGImage, Vec<WindowAppRect>), CaptureError> {
-    capture_inner(max_dimension).map(|(image, windows, _geom)| (image, windows))
+    capture_inner(max_dimension, DisplaySelect::Primary)
+        .map(|(image, windows, _geom)| (image, windows))
 }
 
 /// The full capture: the `CGImage`, the window→app rects, and the
 /// [`CaptureGeometry`] mapping captured pixels ↔ logical points.
 fn capture_inner(
     max_dimension: u32,
+    select: DisplaySelect,
 ) -> Result<(CGImage, Vec<WindowAppRect>, CaptureGeometry), CaptureError> {
     // Preflight is read-only and cheap; never prompts.
     if !has_permission() {
@@ -220,13 +373,33 @@ fn capture_inner(
             detail: "no shareable displays".into(),
         });
     }
-    // Prefer the primary display (the one hosting the overlay's summon
-    // context); fall back to the first if CGMainDisplayID matches nothing.
+    // Primary by default; for on-demand eyes, the display containing the
+    // frontmost window's center — the monitor the user is actually working
+    // on. Fallback is always the primary.
     let main_id = unsafe { CGMainDisplayID() };
-    let display = displays
+    let primary = displays
         .iter()
         .find(|d| d.display_id() == main_id)
         .unwrap_or(&displays[0]);
+    let display = match select {
+        DisplaySelect::Primary => primary,
+        DisplaySelect::FrontmostWindow => match frontmost_window_center() {
+            Some((cx, cy)) => displays
+                .iter()
+                .find(|d| {
+                    let f = d.frame();
+                    cx >= f.origin.x
+                        && cx < f.origin.x + f.size.width
+                        && cy >= f.origin.y
+                        && cy < f.origin.y + f.size.height
+                })
+                .unwrap_or(primary),
+            None => primary,
+        },
+    };
+    if display.display_id() != primary.display_id() {
+        log::debug!("capture: following frontmost window to a secondary display");
+    }
 
     // R008: exclude every window owned by this process — the overlay panel
     // and any future Third Eye window — by PID, not by label, so nothing can
@@ -303,6 +476,8 @@ fn capture_inner(
         pixel_h: target_h,
         point_w: dpw,
         point_h: dph,
+        origin_x: display_frame.origin.x,
+        origin_y: display_frame.origin.y,
     };
     Ok((image, window_rects, geometry))
 }

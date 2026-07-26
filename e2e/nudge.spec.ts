@@ -25,6 +25,8 @@ interface MockNudgeStatus {
     emptyBatch: number;
   };
   persistError: string | null;
+  cooldownSecs: number;
+  autoDismissSecs: number;
 }
 
 const healthyStatus: MockNudgeStatus = {
@@ -34,6 +36,8 @@ const healthyStatus: MockNudgeStatus = {
   lastError: null,
   suppressed: { disabled: 0, overlayVisible: 0, coolingDown: 0, emptyBatch: 0 },
   persistError: null,
+  cooldownSecs: 300,
+  autoDismissSecs: 12,
 };
 
 /** A representative pixel-free nudge://show payload (camelCase serde shape).
@@ -136,6 +140,31 @@ async function installNudgeIpcMock(
               chatCalls.push(args.messages);
               return Promise.resolve(nextRequestId++);
             }
+            case "chat_sessions":
+              return Promise.resolve([
+                {
+                  id: 7,
+                  startedAtMs: 1_753_500_000_000,
+                  lastAtMs: 1_753_500_060_000,
+                  title: "find me a good carbonara recipe",
+                  messageCount: 2,
+                },
+              ]);
+            case "chat_resume_session":
+              return args.id === 7
+                ? Promise.resolve([
+                    {
+                      role: "user",
+                      text: "find me a good carbonara recipe",
+                      atMs: 1_753_500_000_000,
+                    },
+                    {
+                      role: "assistant",
+                      text: "RecipeTinEats carbonara, 5.0 stars.",
+                      atMs: 1_753_500_060_000,
+                    },
+                  ])
+                : Promise.reject({ kind: "not-found", id: args.id });
             default:
               return Promise.reject(`mock: no such command ${cmd}`);
           }
@@ -404,4 +433,32 @@ test("nudge://state broadcasts sync the toggle and surface classifier errors", a
   const alert = nudgesSection(page).getByRole("alert");
   await expect(alert).toContainText("Local AI offline");
   await expect(alert).toContainText("http://localhost:1234 — connection refused");
+});
+
+// ---------------------------------------------------------------------------
+// Resume past chats (2026-07-27): the History picker in the composer
+// ---------------------------------------------------------------------------
+
+test("History opens the session picker and resuming seeds the transcript", async ({ page }) => {
+  await installNudgeIpcMock(page);
+  await page.goto("/");
+  await waitForListener(page, "nudge://show");
+  await emit(page, "overlay://state-changed", "visible-focused");
+
+  // The popover was invisible once (anchored off-window) — pin visibility.
+  await page.getByRole("button", { name: "⤺ History" }).click();
+  const list = page.getByRole("listbox", { name: "Saved chats" });
+  await expect(list).toBeVisible();
+  const item = list.getByRole("option");
+  await expect(item).toHaveCount(1);
+  await expect(item.first()).toContainText("find me a good carbonara recipe");
+
+  await item.first().click();
+  await expect(list).not.toBeVisible();
+  await expect(page.locator(".chat-message.chat-user")).toHaveText(
+    "find me a good carbonara recipe",
+  );
+  await expect(page.locator(".chat-message.chat-assistant")).toContainText(
+    "RecipeTinEats carbonara, 5.0 stars.",
+  );
 });

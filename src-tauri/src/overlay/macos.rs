@@ -211,6 +211,37 @@ pub fn yield_key_focus(app: &AppHandle) -> Result<(), String> {
         .map_err(|_| "overlay key-focus yield timed out (main thread busy)".to_string())
 }
 
+/// Ghost alpha while the model drives input — visible enough to read,
+/// clearly inert.
+const GHOST_ALPHA: f64 = 0.35;
+
+/// Ghost mode (2026-07-27, the beeping-address-bar bug): while input
+/// actions execute, the overlay must never be a click target — capture
+/// excludes Third Eye's own windows (R008), so the model cannot SEE the
+/// overlay covering its target and would click into it forever. Ghost =
+/// semi-transparent + click-through + key yielded: synthesized clicks and
+/// keystrokes pass to the app underneath while the user still sees the
+/// chat. Off restores full alpha; the caller restores the state-machine
+/// cursor policy.
+pub fn set_ghost(app: &AppHandle, on: bool) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    // Cancel any in-flight fade so a stale stepper can't overwrite the
+    // ghost alpha (or the restore) mid-run.
+    FADE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let addr = ns_window_addr(app)?;
+    if on {
+        set_click_through(app, true)?;
+        // Keystrokes must land in the target app, not the panel.
+        yield_key_focus(app)?;
+        set_alpha(app, addr, GHOST_ALPHA)?;
+        log::debug!("overlay: ghost on (alpha {GHOST_ALPHA}, click-through)");
+    } else {
+        set_alpha(app, addr, 1.0)?;
+        log::debug!("overlay: ghost off");
+    }
+    Ok(())
+}
+
 /// Toggle click-through on the panel. Uses the Tauri window handle (the
 /// panel is the same NSWindow, so `setIgnoresMouseEvents:` applies) — an
 /// idle overlay must never intercept clicks meant for the app underneath.

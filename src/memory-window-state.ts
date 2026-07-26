@@ -8,13 +8,14 @@
 
 import type { MemoryRecord } from "./memory-state";
 
-export type MemoryTab = "timeline" | "learned" | "recall" | "chats";
+export type MemoryTab = "timeline" | "learned" | "recall" | "chats" | "graph";
 
 export const MEMORY_TABS: readonly { id: MemoryTab; label: string }[] = [
   { id: "timeline", label: "Timeline" },
   { id: "learned", label: "Learned" },
   { id: "recall", label: "Recall" },
   { id: "chats", label: "Chats" },
+  { id: "graph", label: "Graph" },
 ];
 
 /** Case-insensitive filter over summary + apps (the header filter input). */

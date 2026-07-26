@@ -5,8 +5,10 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  chatSessionDelete,
   chatSessionMessages,
   chatSessions,
+  chatSessionsWipe,
   memoryRetention,
   type ChatSessionMessage,
   type ChatSessionSummary,
@@ -27,6 +29,7 @@ import {
   timeLabel,
   type MemoryTab,
 } from "./memory-window-state";
+import { MemoryGraphView } from "./MemoryGraphView";
 import { EyeIcon } from "./ui/EyeIcon";
 import { Panel } from "./ui/Panel";
 import "./memory-window.css";
@@ -46,6 +49,15 @@ export function MemoryWindow() {
   const [sessions, setSessions] = useState<ChatSessionSummary[] | null>(null);
   const [openSession, setOpenSession] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<ChatSessionMessage[] | null>(null);
+  // Two-step arm for the bulk purge — one stray click must not erase history.
+  const [wipeArmed, setWipeArmed] = useState(false);
+
+  const deleteSession = (id: number) => {
+    chatSessionDelete(id).then(
+      () => setSessions((current) => current?.filter((s) => s.id !== id) ?? null),
+      (err) => console.debug("memory-window: chat_session_delete failed:", err),
+    );
+  };
 
   const refresh = () => {
     memoryList(PAGE_SIZE, 0).then(
@@ -238,6 +250,7 @@ export function MemoryWindow() {
               </div>
             ))}
 
+          {tab === "graph" && <MemoryGraphView />}
           {tab === "chats" &&
             (openSession !== null ? (
               <div className="memwin-transcript">
@@ -275,22 +288,56 @@ export function MemoryWindow() {
               </p>
             ) : (
               <div className="memwin-timeline">
-                {sessions.map((session) => (
+                <div className="memwin-purge-bar">
                   <button
-                    key={session.id}
                     type="button"
-                    className="memwin-row memwin-session"
-                    onClick={() => openTranscript(session.id)}
+                    className="memwin-purge-all"
+                    data-armed={wipeArmed || undefined}
+                    onClick={() => {
+                      if (!wipeArmed) {
+                        setWipeArmed(true);
+                        return;
+                      }
+                      setWipeArmed(false);
+                      chatSessionsWipe().then(
+                        () => setSessions([]),
+                        (err) =>
+                          console.debug("memory-window: chat_sessions_wipe failed:", err),
+                      );
+                    }}
+                    onBlur={() => setWipeArmed(false)}
                   >
-                    <span className="memwin-row-time">
-                      {new Date(session.lastAtMs).toLocaleDateString()}
-                    </span>
-                    <span className="memwin-row-dot" aria-hidden="true" />
-                    <span className="memwin-row-text">{session.title}</span>
-                    <span className="memwin-row-dur">
-                      {session.messageCount} message{session.messageCount === 1 ? "" : "s"}
-                    </span>
+                    {wipeArmed
+                      ? `Really delete all ${sessions.length} chats?`
+                      : "Delete all chats"}
                   </button>
+                </div>
+                {sessions.map((session) => (
+                  <div key={session.id} className="memwin-row memwin-session">
+                    <button
+                      type="button"
+                      className="memwin-session-open"
+                      onClick={() => openTranscript(session.id)}
+                    >
+                      <span className="memwin-row-time">
+                        {new Date(session.lastAtMs).toLocaleDateString()}
+                      </span>
+                      <span className="memwin-row-dot" aria-hidden="true" />
+                      <span className="memwin-row-text">{session.title}</span>
+                      <span className="memwin-row-dur">
+                        {session.messageCount} message{session.messageCount === 1 ? "" : "s"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="memwin-row-forget"
+                      title="Delete this chat"
+                      aria-label={`Delete chat: ${session.title}`}
+                      onClick={() => deleteSession(session.id)}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             ))}

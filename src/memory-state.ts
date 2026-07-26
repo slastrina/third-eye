@@ -104,6 +104,32 @@ export function memoryWipe(): Promise<number> {
 }
 
 /** Memory health snapshot — never rejects inside a Tauri runtime. */
+/** Knowledge-graph payload (memory_graph IPC, camelCase serde of Rust's
+ *  MemoryGraph in src-tauri/src/memory/graph.rs). */
+export interface MemoryGraphNode {
+  id: number;
+  summary: string;
+  apps: string[];
+  source: "watcher" | "chat";
+  atMs: number;
+}
+
+export interface MemoryGraphEdge {
+  a: number;
+  b: number;
+  weight: number;
+  kind: "semantic" | "keyword" | "app";
+}
+
+export interface MemoryGraphPayload {
+  nodes: MemoryGraphNode[];
+  edges: MemoryGraphEdge[];
+}
+
+export function memoryGraph(limit?: number): Promise<MemoryGraphPayload> {
+  return invoke<MemoryGraphPayload>("memory_graph", { limit });
+}
+
 export function memoryStatus(): Promise<MemoryStatus> {
   return invoke<MemoryStatus>("memory_status");
 }

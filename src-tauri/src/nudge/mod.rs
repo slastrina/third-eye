@@ -285,6 +285,14 @@ struct SuppressionCounters {
 /// persistence and the single-applier live in `commands.rs` (T02).
 pub struct NudgeState {
     enabled: AtomicBool,
+    /// Live-tunable cooldown between nudges (Settings chips, 2026-07-27):
+    /// the detector reads it every round, so a change applies immediately.
+    cooldown_secs: AtomicU64,
+    /// Live-tunable banner auto-dismiss window (the show path's timer).
+    auto_dismiss_secs: AtomicU64,
+    /// Newest-first ring of recently shown nudges (observability: the
+    /// Settings history list). Bounded — memory stays flat.
+    history: Mutex<std::collections::VecDeque<NudgeHistoryEntry>>,
     last_nudge_at_ms: Mutex<Option<i64>>,
     active: Mutex<Option<NudgePayload>>,
     last_error: Mutex<Option<LlmError>>,
@@ -309,6 +317,9 @@ impl Default for NudgeState {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(crate::config::NUDGES_ENABLED_DEFAULT),
+            cooldown_secs: AtomicU64::new(crate::config::NUDGE_COOLDOWN_SECS_DEFAULT),
+            auto_dismiss_secs: AtomicU64::new(crate::config::NUDGE_AUTO_DISMISS_SECS_DEFAULT),
+            history: Mutex::new(std::collections::VecDeque::new()),
             last_nudge_at_ms: Mutex::new(None),
             active: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -347,10 +358,56 @@ impl NudgeState {
         self.active.lock().unwrap().clone()
     }
 
+    pub fn cooldown_secs(&self) -> u64 {
+        self.cooldown_secs.load(Ordering::SeqCst)
+    }
+
+    /// Flip the cooldown; returns the previous value for applier rollback.
+    pub fn set_cooldown_secs(&self, secs: u64) -> u64 {
+        self.cooldown_secs.swap(secs, Ordering::SeqCst)
+    }
+
+    pub fn auto_dismiss_secs(&self) -> u64 {
+        self.auto_dismiss_secs.load(Ordering::SeqCst)
+    }
+
+    pub fn set_auto_dismiss_secs(&self, secs: u64) -> u64 {
+        self.auto_dismiss_secs.swap(secs, Ordering::SeqCst)
+    }
+
+    /// Newest-first history snapshot for the Settings list.
+    pub fn history(&self) -> Vec<NudgeHistoryEntry> {
+        self.history.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Stamp the dismissal reason on the newest still-open history entry
+    /// (the one `record_shown` pushed for the active nudge).
+    pub fn record_history_dismissed(&self, reason: &str) {
+        if let Some(entry) = self
+            .history
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|e| e.dismiss_reason.is_none())
+        {
+            entry.dismiss_reason = Some(reason.to_string());
+        }
+    }
+
     /// A nudge was shown: it becomes the active nudge, stamps the cooldown
     /// clock, and clears any persisted classification error (health rules:
     /// errors stay visible only until a success).
     pub fn record_shown(&self, payload: NudgePayload, at_ms: i64) {
+        {
+            let mut history = self.history.lock().unwrap();
+            history.push_front(NudgeHistoryEntry {
+                message: payload.message.clone(),
+                app_context: payload.app_context.clone(),
+                shown_at_ms: at_ms,
+                dismiss_reason: None,
+            });
+            history.truncate(NUDGE_HISTORY_CAP);
+        }
         *self.active.lock().unwrap() = Some(payload);
         *self.last_nudge_at_ms.lock().unwrap() = Some(at_ms);
         *self.last_error.lock().unwrap() = None;
@@ -445,6 +502,8 @@ impl NudgeState {
                 empty_batch: self.suppressed.empty_batch.load(Ordering::SeqCst),
             },
             persist_error: self.persist_error.lock().unwrap().clone(),
+            cooldown_secs: self.cooldown_secs(),
+            auto_dismiss_secs: self.auto_dismiss_secs(),
         }
     }
 }
@@ -471,6 +530,24 @@ pub struct NudgeStatus {
     pub last_error: Option<LlmError>,
     pub suppressed: SuppressedCounts,
     pub persist_error: Option<String>,
+    /// The live tunables (Settings chips, 2026-07-27).
+    pub cooldown_secs: u64,
+    pub auto_dismiss_secs: u64,
+}
+
+/// Retained entries in the recent-nudges ring.
+pub const NUDGE_HISTORY_CAP: usize = 20;
+
+/// One shown nudge in the Settings history list — pixel-free like the
+/// payload it came from (message, app, timestamps only).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NudgeHistoryEntry {
+    pub message: String,
+    pub app_context: Option<String>,
+    pub shown_at_ms: i64,
+    /// How it went away; `None` while still showing.
+    pub dismiss_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -620,11 +697,15 @@ pub async fn classification_round(
 pub fn spawn(app: &AppHandle) {
     let rx = app.state::<crate::watcher::WatcherState>().subscribe();
     let router = app.state::<crate::llm::commands::LlmState>().router();
-    let cooldown_secs = crate::config::load_nudge_cooldown_secs(app);
+    let state = app.state::<NudgeState>();
+    state.set_cooldown_secs(crate::config::load_nudge_cooldown_secs(app));
+    state.set_auto_dismiss_secs(crate::config::load_nudge_auto_dismiss_secs(app));
     log::info!(
-        "nudge: detector starting (interval {DETECT_INTERVAL_SECS}s, cooldown {cooldown_secs}s)"
+        "nudge: detector starting (interval {DETECT_INTERVAL_SECS}s, cooldown {}s, auto-dismiss {}s)",
+        state.cooldown_secs(),
+        state.auto_dismiss_secs()
     );
-    tauri::async_runtime::spawn(run_loop(app.clone(), rx, router, cooldown_secs));
+    tauri::async_runtime::spawn(run_loop(app.clone(), rx, router));
 }
 
 /// The loop body: buffer observations between interval ticks, then run one
@@ -636,7 +717,6 @@ async fn run_loop(
     app: AppHandle,
     mut rx: broadcast::Receiver<TextObservation>,
     router: Arc<ModelRouter>,
-    cooldown_secs: u64,
 ) {
     let mut batch: Vec<TextObservation> = Vec::new();
     let period = Duration::from_secs(DETECT_INTERVAL_SECS);
@@ -664,6 +744,8 @@ async fn run_loop(
                 let round = std::mem::take(&mut batch);
                 let state = app.state::<NudgeState>();
                 let overlay = app.state::<crate::overlay::OverlayManager>().current();
+                // Live read: a Settings change applies from the next round.
+                let cooldown_secs = state.cooldown_secs();
                 let outcome = classification_round(
                     &state, &router, &round, overlay, now_ms(), cooldown_secs,
                 ).await;
@@ -717,13 +799,15 @@ fn show_nudge(app: &AppHandle, payload: NudgePayload) {
             }
             commands::emit_state(app, nudge_state.status());
             log::info!(
-                "nudge: shown (state={}, auto-dismiss in {AUTO_DISMISS_SECS}s)",
-                state.as_str()
+                "nudge: shown (state={}, auto-dismiss in {}s)",
+                state.as_str(),
+                nudge_state.auto_dismiss_secs()
             );
             retain_context_frame(app, payload.captured_at_ms);
+            let dismiss_secs = nudge_state.auto_dismiss_secs();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(AUTO_DISMISS_SECS)).await;
+                tokio::time::sleep(Duration::from_secs(dismiss_secs)).await;
                 auto_dismiss(&app);
             });
         }
@@ -776,6 +860,7 @@ fn auto_dismiss(app: &AppHandle) {
         return;
     }
     nudge_state.clear_active();
+    nudge_state.record_history_dismissed(DismissReason::AutoTimeout.as_str());
     if let Err(e) = app.emit(DISMISS_EVENT, DismissReason::AutoTimeout) {
         log::warn!("nudge: {DISMISS_EVENT} broadcast failed: {e}");
     }
@@ -819,6 +904,63 @@ mod tests {
             1_752_900_000_000,
             vec!["User debugged the ingest pipeline in Rust.".into()],
         )
+    }
+
+    // --- tunables + history (Settings controls, 2026-07-27) ---
+
+    #[test]
+    fn tunables_default_and_swap_returning_previous() {
+        let state = NudgeState::new();
+        assert_eq!(
+            state.cooldown_secs(),
+            crate::config::NUDGE_COOLDOWN_SECS_DEFAULT
+        );
+        assert_eq!(
+            state.auto_dismiss_secs(),
+            crate::config::NUDGE_AUTO_DISMISS_SECS_DEFAULT
+        );
+        assert_eq!(state.set_cooldown_secs(60), 300);
+        assert_eq!(state.cooldown_secs(), 60);
+        assert_eq!(state.set_auto_dismiss_secs(20), 12);
+        let status = state.status();
+        assert_eq!(status.cooldown_secs, 60);
+        assert_eq!(status.auto_dismiss_secs, 20);
+    }
+
+    #[test]
+    fn history_records_shown_nudges_newest_first_and_stamps_dismissal() {
+        let state = NudgeState::new();
+        state.record_shown(payload(), 1_000);
+        state.record_history_dismissed("auto-timeout");
+        let mut second = payload();
+        second.message = "Second nudge".into();
+        state.record_shown(second, 2_000);
+        let history = state.history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].message, "Second nudge");
+        assert_eq!(history[0].dismiss_reason, None, "still showing");
+        assert_eq!(history[1].dismiss_reason.as_deref(), Some("auto-timeout"));
+        // Stamping targets the newest OPEN entry, not the already-settled one.
+        state.record_history_dismissed("summoned");
+        let history = state.history();
+        assert_eq!(history[0].dismiss_reason.as_deref(), Some("summoned"));
+        assert_eq!(history[1].dismiss_reason.as_deref(), Some("auto-timeout"));
+    }
+
+    #[test]
+    fn history_ring_is_bounded() {
+        let state = NudgeState::new();
+        for i in 0..(NUDGE_HISTORY_CAP + 5) {
+            let mut p = payload();
+            p.message = format!("nudge {i}");
+            state.record_shown(p, i as i64);
+        }
+        let history = state.history();
+        assert_eq!(history.len(), NUDGE_HISTORY_CAP);
+        assert_eq!(
+            history[0].message,
+            format!("nudge {}", NUDGE_HISTORY_CAP + 4)
+        );
     }
 
     // --- retained context frame ---

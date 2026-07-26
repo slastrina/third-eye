@@ -46,6 +46,7 @@ impl From<TextElement> for ScreenElement {
             cx: el.cx,
             cy: el.cy,
             app: el.app,
+            role: None,
         }
     }
 }
@@ -63,6 +64,50 @@ impl ScreenQuery for MacosScreenQuery {
                     detail: format!("screen-query task panicked: {e}"),
                 })??;
         Ok(elements.into_iter().map(ScreenElement::from).collect())
+    }
+    async fn page_text(&self, app_name: &str) -> Option<String> {
+        let pid = crate::appfocus::macos::pid_for_app_name(app_name)?;
+        // Outer timeout above the walk's own deadline: even a SINGLE wedged
+        // AX call (frozen target app) ends this ACTION typed instead of
+        // hanging the run past the stop flag (the app-froze report).
+        let task = tokio::task::spawn_blocking(move || super::ax::page_text_blocking(pid));
+        let text = match tokio::time::timeout(std::time::Duration::from_secs(8), task).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(e)) => {
+                log::warn!("read_page: harvest task failed: {e}");
+                String::new()
+            }
+            Err(_) => {
+                log::warn!("read_page: harvest timed out; the target app's AX tree is wedged");
+                String::new()
+            }
+        };
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    async fn interactive(&self, app_name: &str) -> Vec<ScreenElement> {
+        // Resolve the pid on the async side (NSWorkspace roster is cheap),
+        // walk the AX tree off-runtime (AX IPC is synchronous and can stall
+        // on a busy target).
+        let Some(pid) = crate::appfocus::macos::pid_for_app_name(app_name) else {
+            log::debug!("screen_query: AX harvest skipped — no running app named {app_name:?}");
+            return Vec::new();
+        };
+        let app = app_name.to_string();
+        let task = tokio::task::spawn_blocking(move || {
+            super::ax::interactive_elements_blocking(pid, &app)
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+            Ok(Ok(elements)) => elements,
+            Ok(Err(e)) => {
+                log::warn!("screen_query: AX harvest task failed: {e}");
+                Vec::new()
+            }
+            Err(_) => {
+                log::warn!("screen_query: AX harvest timed out; serving OCR only");
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -94,7 +139,8 @@ mod tests {
                 height: 4,
                 cx: 0,
                 cy: 0,
-                app: Some("Zed".into())
+                app: Some("Zed".into()),
+                role: None
             }
         );
     }

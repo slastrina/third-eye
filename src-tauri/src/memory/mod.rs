@@ -14,6 +14,7 @@
 pub mod chat_ingest;
 pub mod commands;
 pub mod embed;
+pub mod graph;
 pub mod ingest;
 pub mod store;
 
@@ -103,6 +104,24 @@ impl MemoryState {
     pub fn set_current_chat_session(&self, id: i64) {
         self.current_chat_session
             .store(id, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// If `id` is the session new exchanges append to, forget it — the next
+    /// exchange lazily creates a fresh one. Purge-path hygiene: appending
+    /// into a deleted session would be a typed not-found on every exchange.
+    pub fn reset_chat_session_if(&self, id: i64) {
+        let _ = self.current_chat_session.compare_exchange(
+            id,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Forget the current session unconditionally (the wipe-all path).
+    pub fn reset_chat_session(&self) {
+        self.current_chat_session
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the opened store, exactly once. Returns `false` when one is

@@ -6,6 +6,7 @@ import {
   appendTrailPoint,
   currentEntry,
   describeCall,
+  fitContains,
   ghostTarget,
   hudHeadline,
   hudProgress,
@@ -13,6 +14,7 @@ import {
   hudVisible,
   initialHudState,
   isClickEntry,
+  nextUserControl,
   settledClickRipples,
   trailOpacity,
   type HudViewState,
@@ -272,5 +274,41 @@ describe("click ripples (canvas animation)", () => {
     expect(settledClickRipples([move], [{ ...move, status: "ok" as const }])).toEqual([]);
     const bare = { ...clickEntry("b1", "running"), target: null };
     expect(settledClickRipples([bare], [{ ...bare, status: "ok" as const }])).toEqual([]);
+  });
+});
+
+describe("canvas fit containment (follower-offset fix)", () => {
+  const fit = { originX: 1512, originY: 0, width: 1920, height: 1080 };
+
+  it("contains points on the fitted monitor and rejects the rest", () => {
+    expect(fitContains(fit, 1512, 0)).toBe(true);
+    expect(fitContains(fit, 3000, 500)).toBe(true);
+    // Right/bottom edges are exclusive; the primary monitor is outside.
+    expect(fitContains(fit, 1512 + 1920, 500)).toBe(false);
+    expect(fitContains(fit, 700, 400)).toBe(false);
+  });
+
+  it("a missing or degenerate fit contains nothing — forcing a (re)fit", () => {
+    expect(fitContains(null, 100, 100)).toBe(false);
+    expect(fitContains({ originX: 0, originY: 0, width: 0, height: 0 }, 0, 0)).toBe(false);
+  });
+});
+
+describe("user-takes-the-mouse hand-off (follower hiding)", () => {
+  it("movement between actions sets the flag; Third Eye acting clears it", () => {
+    // User nudges the mouse while nothing is running → user control.
+    expect(nextUserControl({ x: 100, y: 100 }, { x: 140, y: 108 }, false, false)).toBe(true);
+    // The flag is sticky while the pointer rests between actions.
+    expect(nextUserControl({ x: 140, y: 108 }, { x: 140, y: 108 }, false, true)).toBe(true);
+    // The moment an input action runs, movement is Third Eye's — flag clears.
+    expect(nextUserControl({ x: 140, y: 108 }, { x: 600, y: 400 }, true, true)).toBe(false);
+  });
+
+  it("readback jitter below the threshold never claims user control", () => {
+    expect(
+      nextUserControl({ x: 100, y: 100 }, { x: 102, y: 99 }, false, false),
+    ).toBe(false);
+    // First sample (no previous) proves nothing either.
+    expect(nextUserControl(null, { x: 500, y: 500 }, false, false)).toBe(false);
   });
 });

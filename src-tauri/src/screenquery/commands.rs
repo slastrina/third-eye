@@ -69,6 +69,7 @@ mod tests {
                 cx: 0,
                 cy: 0,
                 app: None,
+                role: None,
             }])
         }
     }

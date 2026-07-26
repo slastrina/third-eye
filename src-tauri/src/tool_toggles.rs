@@ -44,6 +44,11 @@ pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
         "Capture the screen to look at it; saves only when asked",
     ),
     (
+        crate::llm::toolloop::READ_PAGE_TOOL,
+        "Read page",
+        "Read the focused window's full text (recipes, articles)",
+    ),
+    (
         crate::llm::toolloop::MEMORY_SEARCH_TOOL,
         "Memory search",
         "Search stored activity and conversation memories",
@@ -178,11 +183,20 @@ pub struct ToolTogglesStatus {
 pub struct ToggleGatedExecutor {
     inner: Box<dyn ToolExecutor>,
     toggles: Arc<ToolToggles>,
+    /// The inner tool's full name set, captured unfiltered at construction —
+    /// the routing claim survives a disable so the composite still delivers
+    /// the call HERE for the typed Settings refusal.
+    inner_names: Vec<String>,
 }
 
 impl ToggleGatedExecutor {
     pub fn new(inner: Box<dyn ToolExecutor>, toggles: Arc<ToolToggles>) -> Self {
-        Self { inner, toggles }
+        let inner_names = inner.definitions().into_iter().map(|d| d.name).collect();
+        Self {
+            inner,
+            toggles,
+            inner_names,
+        }
     }
 }
 
@@ -194,6 +208,13 @@ impl ToolExecutor for ToggleGatedExecutor {
             .into_iter()
             .filter(|d| self.toggles.is_enabled(&d.name))
             .collect()
+    }
+
+    fn claims(&self, name: &str) -> bool {
+        // Unfiltered on purpose: a disabled tool is hidden from the model
+        // but still OWNED here, so a stray call gets the typed Settings
+        // refusal instead of the composite's generic unknown-tool.
+        self.inner_names.iter().any(|n| n == name)
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
@@ -339,6 +360,9 @@ mod tests {
         toggles.set_enabled("wait", false);
         // Structurally inert: no definition offered…
         assert!(gated.definitions().is_empty());
+        // …but the gate still CLAIMS the name for routing, so the composite
+        // delivers the call here for the typed Settings refusal.
+        assert!(gated.claims("wait"));
         // …and a call that still names it is refused before the inner tool.
         let outcome = gated.execute(&wait_call()).await;
         assert!(!outcome.ok);

@@ -335,6 +335,31 @@ pub fn chat_new_session(memory: State<'_, MemoryState>) -> Result<i64, MemoryErr
     Ok(id)
 }
 
+/// Resume a stored chat session (2026-07-27 spec): subsequent exchanges
+/// append to it, and the ordered transcript comes back in the same call so
+/// the overlay seeds its view without a second round-trip. A missing id is
+/// the store's typed not-found — nothing is repointed on failure.
+#[tauri::command]
+pub fn chat_resume_session(
+    memory: State<'_, MemoryState>,
+    id: i64,
+) -> Result<Vec<crate::memory::store::ChatSessionMessage>, MemoryError> {
+    let store = require_store(&memory)?;
+    let messages = store.chat_session_messages(id)?;
+    if messages.is_empty() {
+        // chat_session_messages returns Ok([]) for unknown ids (plain
+        // SELECT); resuming a session that never existed must not silently
+        // fork history into it.
+        return Err(MemoryError::NotFound { id });
+    }
+    memory.set_current_chat_session(id);
+    log::info!(
+        "memory: chat session {id} resumed ({} messages)",
+        messages.len()
+    );
+    Ok(messages)
+}
+
 /// Newest-first chat session summaries (memory window Chats tab). A
 /// non-empty `query` searches across stored transcript text.
 #[tauri::command]
@@ -359,6 +384,50 @@ pub fn chat_session_messages(
 ) -> Result<Vec<crate::memory::store::ChatSessionMessage>, MemoryError> {
     let store = require_store(&memory)?;
     store.chat_session_messages(id)
+}
+
+/// Delete one stored chat session and its transcript (purge, 2026-07-27).
+/// If it was the live session, the next exchange starts a fresh one.
+#[tauri::command]
+pub fn chat_session_delete(memory: State<'_, MemoryState>, id: i64) -> Result<(), MemoryError> {
+    let store = require_store(&memory)?;
+    store.chat_session_delete(id)?;
+    memory.reset_chat_session_if(id);
+    log::info!("memory: chat session {id} deleted");
+    Ok(())
+}
+
+/// Delete EVERY stored chat session; resolves with how many went. The
+/// distilled memories stay — they have their own wipe in Settings.
+#[tauri::command]
+pub fn chat_sessions_wipe(memory: State<'_, MemoryState>) -> Result<usize, MemoryError> {
+    let store = require_store(&memory)?;
+    let deleted = store.chat_sessions_wipe()?;
+    memory.reset_chat_session();
+    log::info!("memory: wiped {deleted} chat session(s)");
+    Ok(deleted)
+}
+
+/// The memory knowledge graph (2026-07-27): newest memories as nodes,
+/// joined by semantic/keyword/app affinity — computed here so embeddings
+/// never cross IPC. Read-only over the store.
+#[tauri::command]
+pub fn memory_graph(
+    memory: State<'_, MemoryState>,
+    limit: Option<usize>,
+) -> Result<crate::memory::graph::MemoryGraph, MemoryError> {
+    let store = require_store(&memory)?;
+    let limit = limit
+        .unwrap_or(crate::memory::graph::GRAPH_MAX_NODES)
+        .min(crate::memory::graph::GRAPH_MAX_NODES);
+    let records = store.list_for_graph(limit)?;
+    let graph = crate::memory::graph::build_graph(&records);
+    log::debug!(
+        "memory: graph built ({} nodes, {} edges)",
+        graph.nodes.len(),
+        graph.edges.len()
+    );
+    Ok(graph)
 }
 
 /// Memory health snapshot — never rejects (health-as-value, R006). Safe to

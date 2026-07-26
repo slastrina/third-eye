@@ -14,15 +14,19 @@ export interface ApprovalCardProps {
   alwaysLabel?: string;
   onAllowOnce: () => void;
   onAllowAlways: () => void;
+  /** Permanent grant (persisted; revocable in Settings). Omitted on cards
+   *  whose gate has no forever semantics (MCP tools) — no button renders. */
+  onAllowForever?: () => void;
   onDeny: () => void;
 }
 
 export function ApprovalCard({
   title,
   summary,
-  alwaysLabel = "Always this session",
+  alwaysLabel = "This session",
   onAllowOnce,
   onAllowAlways,
+  onAllowForever,
   onDeny,
 }: ApprovalCardProps) {
   return (
@@ -38,6 +42,16 @@ export function ApprovalCard({
         <button type="button" className="approval-always" onClick={onAllowAlways}>
           {alwaysLabel}
         </button>
+        {onAllowForever && (
+          <button
+            type="button"
+            className="approval-always approval-forever"
+            title="Never ask again for this kind of action (change in Settings)"
+            onClick={onAllowForever}
+          >
+            Always
+          </button>
+        )}
         <button type="button" className="approval-deny" onClick={onDeny}>
           Deny
         </button>

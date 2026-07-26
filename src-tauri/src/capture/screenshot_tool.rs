@@ -157,7 +157,9 @@ impl ToolExecutor for ScreenshotTool {
         // Absent/malformed arguments fall back to the no-save default — the
         // capture itself must never fail on an argument the model invented.
         let args: ScreenshotArgs = serde_json::from_str(&call.arguments).unwrap_or_default();
-        match self.backend.capture_primary().await {
+        // Follow the frontmost window: verifying an app on a secondary
+        // monitor means LOOKING at that monitor (multi-display, 2026-07-27).
+        match self.backend.capture_frontmost().await {
             Ok(frame) => {
                 let saved = if args.save {
                     match save_png(&frame.base64_png, args.directory.as_deref()) {

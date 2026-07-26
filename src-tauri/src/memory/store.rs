@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS chat_session_messages (
 );
 ";
 
+/// One graph-builder input row: the record plus its private embedding.
+pub type GraphSourceRow = (MemoryRecord, Option<Vec<f32>>);
+
 const RECORD_COLUMNS: &str =
     "id, summary, apps, span_start_ms, span_end_ms, created_at_ms, updated_at_ms, source";
 
@@ -334,6 +337,33 @@ impl MemoryStore {
             .query_map(params![limit as i64, offset as i64], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Newest memories with their stored embeddings — the graph builder's
+    /// input. Embeddings stay inside the process (R-rule: they never cross
+    /// IPC); the graph command reduces them to edge weights.
+    pub fn list_for_graph(&self, limit: usize) -> Result<Vec<GraphSourceRow>, MemoryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RECORD_COLUMNS}, embedding FROM memories
+             ORDER BY created_at_ms DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let record = row_to_record(row)?;
+                let embedding_json: Option<String> = row.get(8)?;
+                Ok((record, embedding_json))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(record, embedding_json)| {
+                let embedding = embedding_json
+                    .and_then(|json| serde_json::from_str::<Vec<f32>>(&json).ok())
+                    .filter(|e| !e.is_empty());
+                (record, embedding)
+            })
+            .collect())
     }
 
     pub fn get(&self, id: i64) -> Result<MemoryRecord, MemoryError> {
@@ -621,6 +651,35 @@ impl MemoryStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Delete one stored session and its transcript. Typed not-found when
+    /// the id never existed — a purge button must not silently no-op.
+    pub fn chat_session_delete(&self, id: i64) -> Result<(), MemoryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM chat_session_messages WHERE session_id = ?1",
+            params![id],
+        )?;
+        let deleted = tx.execute("DELETE FROM chat_sessions WHERE id = ?1", params![id])?;
+        if deleted == 0 {
+            return Err(MemoryError::NotFound { id });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete EVERY stored session and transcript; returns how many
+    /// sessions went. The distilled memories derived from chats are NOT
+    /// touched — they have their own wipe.
+    pub fn chat_sessions_wipe(&self) -> Result<usize, MemoryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM chat_session_messages", [])?;
+        let deleted = tx.execute("DELETE FROM chat_sessions", [])?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn chat_session_messages(
@@ -915,6 +974,28 @@ mod tests {
         // A broad match returns newest-activity-first.
         let all = s.chat_sessions_matching("", 10).unwrap();
         assert_eq!(all.iter().map(|x| x.id).collect::<Vec<_>>(), vec![b, a]);
+    }
+
+    #[test]
+    fn chat_session_delete_removes_transcript_and_wipe_clears_all() {
+        let s = store();
+        let a = s.chat_session_create(1_000).unwrap();
+        let b = s.chat_session_create(2_000).unwrap();
+        s.chat_append_exchange(a, "q1", "a1", 3_000).unwrap();
+        s.chat_append_exchange(b, "q2", "a2", 4_000).unwrap();
+
+        s.chat_session_delete(a).unwrap();
+        assert!(s.chat_session_messages(a).unwrap().is_empty());
+        assert_eq!(s.chat_sessions(10).unwrap().len(), 1);
+        // Deleting again is a typed not-found, not a silent no-op.
+        assert!(matches!(
+            s.chat_session_delete(a),
+            Err(MemoryError::NotFound { id }) if id == a
+        ));
+
+        assert_eq!(s.chat_sessions_wipe().unwrap(), 1);
+        assert!(s.chat_sessions(10).unwrap().is_empty());
+        assert!(s.chat_messages_matching("q2", 10).unwrap().is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@
 // absorbed into named unavailable states — the view must stay renderable in
 // a plain browser, never crash.
 
-import type { ToolTogglesStatus } from "./chat";
+import type {
+  NudgeHistoryEntry, ToolTogglesStatus } from "./chat";
 import { useEffect, useReducer, useState } from "react";
 import {
   bannerDetail,
@@ -35,6 +36,11 @@ import {
   setCommandsEnabled,
   setHidRunMode,
   setMemoryRetention,
+  approvedActionKinds,
+  removeApprovedActionKind,
+  setNudgeAutoDismiss,
+  setNudgeCooldown,
+  nudgeHistory,
   setNudgesEnabled,
   setToolEnabled,
   toolTogglesStatus,
@@ -97,6 +103,21 @@ import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geom
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Toggle } from "./ui/Toggle";
 import { ChoiceChips } from "./ui/Chip";
+
+/** Closed nudge-tuning choice sets — mirror COOLDOWN_CHOICES_SECS /
+ *  AUTO_DISMISS_CHOICES_SECS in src-tauri/src/nudge/commands.rs. */
+const NUDGE_COOLDOWN_OPTIONS = [
+  { value: "60", label: "1 min" },
+  { value: "300", label: "5 min" },
+  { value: "900", label: "15 min" },
+  { value: "3600", label: "1 hour" },
+] as const;
+const NUDGE_DISMISS_OPTIONS = [
+  { value: "8", label: "8 s" },
+  { value: "12", label: "12 s" },
+  { value: "20", label: "20 s" },
+  { value: "30", label: "30 s" },
+] as const;
 import { RETENTION_OPTIONS, type Retention } from "./tour-state";
 import {
   drawerEdgeOf,
@@ -276,6 +297,8 @@ function Settings() {
   // plain state cell suffices — no transitions to keep pure.
   const [nudges, setNudges] = useState<NudgeStatus | null>(null);
   const [toolToggles, setToolToggles] = useState<ToolTogglesStatus | null>(null);
+  const [nudgeLog, setNudgeLog] = useState<NudgeHistoryEntry[] | null>(null);
+  const [approvedKinds, setApprovedKinds] = useState<string[] | null>(null);
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
   // or persist failure lands the truthful state, never a lying chip.
@@ -372,6 +395,14 @@ function Settings() {
     toolTogglesStatus().then(
       (status) => setToolToggles(status),
       (err) => console.debug("settings: tool_toggles_status unavailable:", err),
+    );
+    nudgeHistory().then(
+      (entries) => setNudgeLog(entries),
+      (err) => console.debug("settings: nudge_history unavailable:", err),
+    );
+    approvedActionKinds().then(
+      (kinds) => setApprovedKinds(kinds),
+      (err) => console.debug("settings: approved_action_kinds unavailable:", err),
     );
     memoryRetention().then(
       (status) => setRetention(status.retention as Retention),
@@ -634,6 +665,20 @@ function Settings() {
       // a rolled-back toggle comes back as the authoritative snapshot.
       (status) => setToolToggles(status),
       (err) => console.debug("settings: set_tool_enabled unavailable:", err),
+    );
+  };
+
+  const chooseNudgeCooldown = (value: string) => {
+    setNudgeCooldown(Number(value)).then(
+      (status) => setNudges(status),
+      (err) => console.debug("settings: set_nudge_cooldown unavailable:", err),
+    );
+  };
+
+  const chooseNudgeAutoDismiss = (value: string) => {
+    setNudgeAutoDismiss(Number(value)).then(
+      (status) => setNudges(status),
+      (err) => console.debug("settings: set_nudge_auto_dismiss unavailable:", err),
     );
   };
 
@@ -1339,6 +1384,37 @@ function Settings() {
               <span>{state.hid.error.detail}</span>
             </div>
           )}
+          {approvedKinds !== null && approvedKinds.length > 0 && (
+            <div className="settings-row settings-row--stack">
+              <span className="settings-row-label">
+                Always allowed
+                <span className="settings-row-sub">
+                  Granted with “Always” on an approval — never prompts again.
+                  Remove one to make it ask next time.
+                </span>
+              </span>
+              <ul className="settings-approved-kinds">
+                {approvedKinds.map((kind) => (
+                  <li key={kind}>
+                    <span>{kind.replaceAll("-", " ")}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove permanent approval for ${kind}`}
+                      onClick={() =>
+                        removeApprovedActionKind(kind).then(
+                          (kinds) => setApprovedKinds(kinds),
+                          (err) =>
+                            console.debug("settings: remove_approved_action_kind failed:", err),
+                        )
+                      }
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
         )}
 
@@ -1521,6 +1597,45 @@ function Settings() {
             <div className="settings-error" role="alert">
               <strong>{bannerTitle(nudges.lastError)}</strong>
               <span>{bannerDetail(nudges.lastError)}</span>
+            </div>
+          )}
+          {nudges !== null && (
+            <>
+              <div className="settings-row settings-row--stack">
+                <span className="settings-row-label">At most one nudge every</span>
+                <ChoiceChips
+                  label="At most one nudge every"
+                  options={NUDGE_COOLDOWN_OPTIONS}
+                  value={String(nudges.cooldownSecs)}
+                  onChange={chooseNudgeCooldown}
+                />
+              </div>
+              <div className="settings-row settings-row--stack">
+                <span className="settings-row-label">Banner stays for</span>
+                <ChoiceChips
+                  label="Banner stays for"
+                  options={NUDGE_DISMISS_OPTIONS}
+                  value={String(nudges.autoDismissSecs)}
+                  onChange={chooseNudgeAutoDismiss}
+                />
+              </div>
+            </>
+          )}
+          {nudgeLog !== null && nudgeLog.length > 0 && (
+            <div className="settings-row settings-row--stack">
+              <span className="settings-row-label">Recent nudges</span>
+              <ul className="settings-nudge-log">
+                {nudgeLog.map((entry) => (
+                  <li key={entry.shownAtMs} className="settings-nudge-log-item">
+                    <span className="settings-nudge-log-message">{entry.message}</span>
+                    <span className="settings-nudge-log-meta">
+                      {new Date(entry.shownAtMs).toLocaleString()}
+                      {entry.appContext ? ` · ${entry.appContext}` : ""}
+                      {entry.dismissReason ? ` · ${entry.dismissReason}` : " · showing"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </section>

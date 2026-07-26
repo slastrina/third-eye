@@ -24,6 +24,7 @@ import {
 import {
   appendTrailPoint,
   currentEntry,
+  fitContains,
   ghostTarget,
   hudApprovalsPending,
   hudHeadline,
@@ -32,11 +33,12 @@ import {
   hudVisible,
   initialHudState,
   isClickEntry,
+  nextUserControl,
   pruneTrail,
   settledClickRipples,
   trailOpacity,
 } from "./hud-state";
-import type { TrailPoint, ClickRipple } from "./hud-state";
+import type { TrailPoint, ClickRipple, CanvasFit } from "./hud-state";
 import { ActionTrail } from "./ui/ActionTrail";
 import { GhostIndicator } from "./ui/GhostIndicator";
 import { HudPill } from "./ui/HudPill";
@@ -173,6 +175,7 @@ export function HudPillView() {
           summary={request.summary}
           onAllowOnce={() => answerHid(request.approvalId, "allow-once")}
           onAllowAlways={() => answerHid(request.approvalId, "allow-kind")}
+          onAllowForever={() => answerHid(request.approvalId, "allow-always")}
           onDeny={() => answerHid(request.approvalId, "deny")}
         />
       ))}
@@ -198,13 +201,6 @@ export function HudPillView() {
   );
 }
 
-/** The canvas fit reply — the monitor origin to subtract from absolute
- *  screen points (hud.rs HudCanvasFit). */
-interface HudCanvasFit {
-  originX: number;
-  originY: number;
-}
-
 /** The passive click-through canvas window: the ghost ring at the current
  *  input action's target. Multi-monitor: each new target re-fits the canvas
  *  over the monitor containing it (fit_hud_canvas) and the returned origin
@@ -222,10 +218,21 @@ export function HudCanvasView() {
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const followerActive =
     hud.phase === "live" && hud.entries.some((entry) => entry.input);
+  // The hand-off flag: true while the USER is driving the mouse — the
+  // follower dot/annotation and trail hide (annotating a pointer Third Eye
+  // does not hold is noise), and reappear when Third Eye acts again.
+  const [userControl, setUserControl] = useState(false);
+  const userControlRef = useRef(false);
+  const prevCursorRef = useRef<{ x: number; y: number } | null>(null);
+  const runningRef = useRef(false);
+  runningRef.current = currentEntry(hud)?.input === true;
   useEffect(() => {
     if (!followerActive) {
       setCursor(null);
       setTrail([]);
+      setUserControl(false);
+      userControlRef.current = false;
+      prevCursorRef.current = null;
       return;
     }
     let cancelled = false;
@@ -235,9 +242,23 @@ export function HudCanvasView() {
           if (cancelled) return;
           setCursor(point);
           const now = Date.now();
-          setTrail((points) =>
-            point ? appendTrailPoint(points, { x: point.x, y: point.y, t: now }) : pruneTrail(points, now),
-          );
+          if (point) {
+            const drove = nextUserControl(
+              prevCursorRef.current,
+              point,
+              runningRef.current,
+              // Read through the setter to avoid a stale closure.
+              userControlRef.current,
+            );
+            userControlRef.current = drove;
+            setUserControl(drove);
+            prevCursorRef.current = point;
+            setTrail((points) =>
+              drove ? pruneTrail(points, now) : appendTrailPoint(points, { x: point.x, y: point.y, t: now }),
+            );
+          } else {
+            setTrail((points) => pruneTrail(points, now));
+          }
         },
         () => {},
       );
@@ -246,6 +267,7 @@ export function HudCanvasView() {
       cancelled = true;
       window.clearInterval(timer);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followerActive]);
   // Click ripples: burst at the exact target the moment a click settles —
   // green-lit amber for ok, failure color for a failed click. Diffed with
@@ -264,24 +286,53 @@ export function HudCanvasView() {
     );
     return () => window.clearTimeout(timer);
   }, [hud.entries]);
-  const [origin, setOrigin] = useReducer(
-    (_prev: HudCanvasFit, next: HudCanvasFit) => next,
-    { originX: 0, originY: 0 },
-  );
+  // The canvas fit: null until the window has actually been positioned this
+  // mount. Rendering global coordinates against a guessed origin is the
+  // follower-offset bug — with no fit, nothing coordinate-bearing renders.
+  const [fit, setFit] = useState<CanvasFit | null>(null);
+  const fitInFlight = useRef(false);
+  const requestFit = (x: number, y: number) => {
+    if (fitInFlight.current) return;
+    fitInFlight.current = true;
+    invoke<CanvasFit>("fit_hud_canvas", { x, y }).then(
+      (next) => {
+        fitInFlight.current = false;
+        setFit(next);
+      },
+      (err) => {
+        fitInFlight.current = false;
+        console.debug("hud: fit_hud_canvas unavailable:", err);
+        // No Tauri runtime (browser/e2e) — render against a zero origin
+        // covering everything rather than nothing. Inside the app the
+        // invoke succeeds and real bounds replace this.
+        setFit((current) =>
+          current ?? { originX: 0, originY: 0, width: Number.MAX_SAFE_INTEGER, height: Number.MAX_SAFE_INTEGER },
+        );
+      },
+    );
+  };
   const targetKey = target ? `${target.x},${target.y}` : null;
   useEffect(() => {
     if (!target) return;
-    invoke<HudCanvasFit>("fit_hud_canvas", { x: target.x, y: target.y }).then(
-      (fit) => setOrigin(fit),
-      (err) => console.debug("hud: fit_hud_canvas unavailable:", err),
-    );
+    requestFit(target.x, target.y);
     // Keyed on the coordinate pair — a settled/replaced action with the same
     // target must not re-fit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey]);
+  // No target to anchor on (approval prompts, keyboard-only stretches): the
+  // canvas follows the CURSOR's monitor instead, so the follower badge and
+  // trail always render against the real window origin.
+  useEffect(() => {
+    if (target || !cursor) return;
+    if (!fitContains(fit, cursor.x, cursor.y)) requestFit(cursor.x, cursor.y);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, cursor, fit]);
+  const origin = { originX: fit?.originX ?? 0, originY: fit?.originY ?? 0 };
 
   const entry = currentEntry(hud);
   if (!target && !cursor && ripples.length === 0 && trail.length === 0) return null;
+  // Never draw global coordinates against an unknown window origin.
+  if (fit === null) return null;
   const isClick = entry !== null && isClickEntry(entry);
   const now = Date.now();
   return (
@@ -314,7 +365,7 @@ export function HudCanvasView() {
           click={isClick}
         />
       )}
-      {cursor && (
+      {cursor && !userControl && (
         <div
           className="hud-follower"
           style={{ left: cursor.x - origin.originX, top: cursor.y - origin.originY }}

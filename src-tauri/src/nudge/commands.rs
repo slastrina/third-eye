@@ -81,6 +81,7 @@ pub fn dismiss_active(app: &AppHandle, reason: DismissReason) -> bool {
     if state.clear_active().is_none() {
         return false;
     }
+    state.record_history_dismissed(reason.as_str());
     log::info!("nudge: dismissed ({})", reason.as_str());
     if let Err(e) = app.emit(DISMISS_EVENT, reason) {
         log::warn!("nudge: {DISMISS_EVENT} broadcast failed: {e}");
@@ -131,6 +132,65 @@ pub fn nudge_context_frame(state: State<'_, NudgeState>, captured_at_ms: i64) ->
         frame.is_some()
     );
     frame
+}
+
+/// Allowed cooldown choices (Settings chips). A closed set: arbitrary
+/// values from a compromised webview cannot disable rate limiting.
+pub const COOLDOWN_CHOICES_SECS: &[u64] = &[60, 300, 900, 3600];
+
+/// Allowed auto-dismiss choices.
+pub const AUTO_DISMISS_CHOICES_SECS: &[u64] = &[8, 12, 20, 30];
+
+/// Set the nudge cooldown. Out-of-set values are ignored (status returned
+/// unchanged); persist failure rolls back, same contract as the toggle.
+#[tauri::command]
+pub fn set_nudge_cooldown(app: AppHandle, secs: u64) -> NudgeStatus {
+    let state = app.state::<NudgeState>();
+    if !COOLDOWN_CHOICES_SECS.contains(&secs) {
+        log::warn!("nudge: set_nudge_cooldown ignored out-of-set value {secs}");
+        return state.status();
+    }
+    let previous = state.set_cooldown_secs(secs);
+    match crate::config::save_nudge_cooldown_secs(&app, secs) {
+        Ok(()) => state.set_persist_error(None),
+        Err(e) => {
+            state.set_cooldown_secs(previous);
+            log::error!("nudge: {e}");
+            state.set_persist_error(Some(e));
+        }
+    }
+    let status = state.status();
+    emit_state(&app, status.clone());
+    status
+}
+
+/// Set the banner auto-dismiss window; applies to the NEXT shown nudge.
+#[tauri::command]
+pub fn set_nudge_auto_dismiss(app: AppHandle, secs: u64) -> NudgeStatus {
+    let state = app.state::<NudgeState>();
+    if !AUTO_DISMISS_CHOICES_SECS.contains(&secs) {
+        log::warn!("nudge: set_nudge_auto_dismiss ignored out-of-set value {secs}");
+        return state.status();
+    }
+    let previous = state.set_auto_dismiss_secs(secs);
+    match crate::config::save_nudge_auto_dismiss_secs(&app, secs) {
+        Ok(()) => state.set_persist_error(None),
+        Err(e) => {
+            state.set_auto_dismiss_secs(previous);
+            log::error!("nudge: {e}");
+            state.set_persist_error(Some(e));
+        }
+    }
+    let status = state.status();
+    emit_state(&app, status.clone());
+    status
+}
+
+/// The recent-nudges list (newest first, bounded) — read-only observability
+/// for the Settings section.
+#[tauri::command]
+pub fn nudge_history(state: State<'_, NudgeState>) -> Vec<super::NudgeHistoryEntry> {
+    state.history()
 }
 
 #[cfg(test)]
