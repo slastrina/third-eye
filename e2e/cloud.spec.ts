@@ -152,7 +152,7 @@ test("cloud section degrades to a named unavailable state outside Tauri", async 
     "Cloud state is unavailable outside the app.",
   );
   // The toggle is disabled (no backend truth) and no provider rows exist.
-  await expect(cloud.getByRole("checkbox", { name: "Use cloud providers" })).toBeDisabled();
+  await expect(cloud.getByRole("switch", { name: "Use cloud providers" })).toBeDisabled();
   await expect(cloud.locator("[data-cloud-provider]")).toHaveCount(0);
   await expect(cloud.locator(".settings-error")).toHaveCount(0);
 });
@@ -161,7 +161,7 @@ test("full opt-in flow: enable → masked key entry (never echoed) → presence 
   await installCloudIpcMock(page);
   await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
-  const toggle = cloud.getByRole("checkbox", { name: "Use cloud providers" });
+  const toggle = cloud.getByRole("switch", { name: "Use cloud providers" });
 
   // Mount-time cloud_optin_status resolves disabled → toggle enabled, off,
   // no unavailable line, and the opt-in-gated provider rows hidden.
@@ -231,7 +231,7 @@ test("an external cloud://optin broadcast (another window's toggle) flips this s
   await installCloudIpcMock(page);
   await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
-  const toggle = cloud.getByRole("checkbox", { name: "Use cloud providers" });
+  const toggle = cloud.getByRole("switch", { name: "Use cloud providers" });
   await expect(toggle).not.toBeChecked();
   await expect(cloud.locator("[data-cloud-provider]")).toHaveCount(0);
 
@@ -262,7 +262,7 @@ test("a persisted opt-in with a stored key rehydrates presence on mount", async 
   await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
 
-  await expect(cloud.getByRole("checkbox", { name: "Use cloud providers" })).toBeChecked();
+  await expect(cloud.getByRole("switch", { name: "Use cloud providers" })).toBeChecked();
   await expect(
     cloud.locator('[data-cloud-provider="anthropic"] [data-cloud-key-present]'),
   ).toHaveText("Stored");
@@ -280,7 +280,7 @@ test("a persist error on the opt-in toggle surfaces as data, not a rejection", a
   await installCloudIpcMock(page);
   await page.goto("/?view=settings&section=cloud");
   const cloud = cloudSection(page);
-  await expect(cloud.getByRole("checkbox", { name: "Use cloud providers" })).toBeEnabled();
+  await expect(cloud.getByRole("switch", { name: "Use cloud providers" })).toBeEnabled();
 
   await page.evaluate(() => {
     (window as any).__mockEmit("cloud://optin", {

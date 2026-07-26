@@ -23,8 +23,14 @@ use third_eye_lib::watcher::TextObservation;
 /// and present on the tool side of the persistence boundary.
 #[test]
 fn screen_element_payload_carries_coordinates() {
-    let element =
-        ScreenElement { text: "Submit".into(), x: 100, y: 200, width: 60, height: 24, app: None };
+    let element = ScreenElement {
+        text: "Submit".into(),
+        x: 100,
+        y: 200,
+        width: 60,
+        height: 24,
+        app: None,
+    };
     let v = serde_json::to_value(&element).unwrap();
     // camelCase, and the coordinates the model reads are all present.
     assert_eq!(v["text"], "Submit");
@@ -96,7 +102,10 @@ fn inserting_screen_derived_text_persists_no_coordinates() {
     let v = serde_json::to_value(&record).unwrap();
     let obj = v.as_object().expect("record serializes to an object");
     for coord in ["x", "y", "width", "height", "bbox", "rect"] {
-        assert!(!obj.contains_key(coord), "stored record leaked coordinate key {coord}: {v}");
+        assert!(
+            !obj.contains_key(coord),
+            "stored record leaked coordinate key {coord}: {v}"
+        );
     }
 }
 
@@ -121,6 +130,9 @@ fn text_observation_ingestion_payload_has_no_coordinate_keys() {
 
     // And explicitly: no coordinate ever crosses into ingestion.
     for coord in ["x", "y", "width", "height", "bbox", "rect", "coord"] {
-        assert!(!obj.contains_key(coord), "ingestion payload leaked coordinate key {coord}: {v}");
+        assert!(
+            !obj.contains_key(coord),
+            "ingestion payload leaked coordinate key {coord}: {v}"
+        );
     }
 }

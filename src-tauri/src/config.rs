@@ -58,12 +58,20 @@ pub fn load_hotkey(app: &AppHandle) -> Option<String> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
     let value = store.get(HOTKEY_KEY)?;
-    Some(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string()))
+    Some(
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string()),
+    )
 }
 
 /// Persist the hotkey. The error names the failed persist path; the caller
@@ -91,7 +99,10 @@ pub fn load_lane_model(app: &AppHandle, key: &str) -> Option<Option<String>> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -143,7 +154,10 @@ pub fn load_privacy_mode(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -189,7 +203,10 @@ pub fn load_watcher_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -241,7 +258,10 @@ pub fn load_cloud_optin(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -257,7 +277,9 @@ fn stored_cloud_optin(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Bool(b) => *b,
         other => {
-            log::warn!("config: {CLOUD_OPTIN_KEY} holds non-boolean value {other}; treating as off");
+            log::warn!(
+                "config: {CLOUD_OPTIN_KEY} holds non-boolean value {other}; treating as off"
+            );
             false
         }
     }
@@ -293,7 +315,10 @@ pub fn load_hid_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -309,7 +334,9 @@ fn stored_hid_enabled(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Bool(b) => *b,
         other => {
-            log::warn!("config: {HID_ENABLED_KEY} holds non-boolean value {other}; treating as off");
+            log::warn!(
+                "config: {HID_ENABLED_KEY} holds non-boolean value {other}; treating as off"
+            );
             false
         }
     }
@@ -346,7 +373,10 @@ pub fn load_hid_run_mode(app: &AppHandle) -> Option<crate::input::commands::HidR
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -363,7 +393,9 @@ fn stored_hid_run_mode(value: &serde_json::Value) -> crate::input::commands::Hid
     match serde_json::from_value::<crate::input::commands::HidRunMode>(value.clone()) {
         Ok(mode) => mode,
         Err(_) => {
-            log::warn!("config: {HID_RUN_MODE_KEY} holds unrecognized value {value}; treating as off");
+            log::warn!(
+                "config: {HID_RUN_MODE_KEY} holds unrecognized value {value}; treating as off"
+            );
             crate::input::commands::HidRunMode::Off
         }
     }
@@ -405,7 +437,10 @@ pub fn load_mcp_run_mode(app: &AppHandle) -> Option<crate::llm::mcp::McpRunMode>
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -422,7 +457,9 @@ fn stored_mcp_run_mode(value: &serde_json::Value) -> crate::llm::mcp::McpRunMode
     match serde_json::from_value::<crate::llm::mcp::McpRunMode>(value.clone()) {
         Ok(mode) => mode,
         Err(_) => {
-            log::warn!("config: {MCP_RUN_MODE_KEY} holds unrecognized value {value}; treating as off");
+            log::warn!(
+                "config: {MCP_RUN_MODE_KEY} holds unrecognized value {value}; treating as off"
+            );
             crate::llm::mcp::McpRunMode::Off
         }
     }
@@ -460,7 +497,10 @@ pub fn load_mcp_servers(app: &AppHandle) -> Option<Vec<crate::llm::mcp::McpServe
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -499,7 +539,9 @@ fn stored_mcp_server(value: &serde_json::Value) -> Option<crate::llm::mcp::McpSe
     let obj = match value.as_object() {
         Some(obj) => obj,
         None => {
-            log::warn!("config: {MCP_SERVERS_KEY} entry is not an object (got {value}); dropping it");
+            log::warn!(
+                "config: {MCP_SERVERS_KEY} entry is not an object (got {value}); dropping it"
+            );
             return None;
         }
     };
@@ -511,7 +553,9 @@ fn stored_mcp_server(value: &serde_json::Value) -> Option<crate::llm::mcp::McpSe
             .map(str::to_string)
     };
     let Some(id) = trimmed_str("id") else {
-        log::warn!("config: {MCP_SERVERS_KEY} entry has no non-blank id (got {value}); dropping it");
+        log::warn!(
+            "config: {MCP_SERVERS_KEY} entry has no non-blank id (got {value}); dropping it"
+        );
         return None;
     };
     // Transport discriminator: only "http" opts into the remote path; absent
@@ -636,7 +680,10 @@ pub fn save_mcp_servers(
     store
         .save()
         .map_err(|e| format!("failed to persist {MCP_SERVERS_KEY}={wire} to {path}: {e}"))?;
-    log::info!("config: persisted {MCP_SERVERS_KEY} ({} server(s)) to {path}", servers.len());
+    log::info!(
+        "config: persisted {MCP_SERVERS_KEY} ({} server(s)) to {path}",
+        servers.len()
+    );
     Ok(())
 }
 
@@ -654,7 +701,10 @@ pub fn load_cloud_heavy_provider(app: &AppHandle) -> Option<crate::cloud::keysto
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -671,17 +721,18 @@ fn stored_cloud_heavy_provider(
 ) -> Option<crate::cloud::keystore::CloudProvider> {
     match value {
         serde_json::Value::Null => None,
-        other => match serde_json::from_value::<crate::cloud::keystore::CloudProvider>(other.clone())
-        {
-            Ok(provider) => Some(provider),
-            Err(_) => {
-                log::warn!(
-                    "config: {CLOUD_HEAVY_PROVIDER_KEY} holds unrecognized value {other}; \
+        other => {
+            match serde_json::from_value::<crate::cloud::keystore::CloudProvider>(other.clone()) {
+                Ok(provider) => Some(provider),
+                Err(_) => {
+                    log::warn!(
+                        "config: {CLOUD_HEAVY_PROVIDER_KEY} holds unrecognized value {other}; \
                      treating as unselected"
-                );
-                None
+                    );
+                    None
+                }
             }
-        },
+        }
     }
 }
 
@@ -700,9 +751,9 @@ pub fn save_cloud_heavy_provider(
         .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
     let wire = provider.map(|p| p.account());
     store.set(CLOUD_HEAVY_PROVIDER_KEY, serde_json::json!(wire));
-    store
-        .save()
-        .map_err(|e| format!("failed to persist {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}: {e}"))?;
+    store.save().map_err(|e| {
+        format!("failed to persist {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}: {e}")
+    })?;
     log::info!("config: persisted {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}");
     Ok(())
 }
@@ -723,7 +774,10 @@ pub fn load_first_run_complete(app: &AppHandle) -> bool {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return false;
         }
     };
@@ -759,9 +813,9 @@ pub fn save_first_run_complete(app: &AppHandle, complete: bool) -> Result<(), St
         .store(SETTINGS_STORE)
         .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
     store.set(FIRST_RUN_COMPLETE_KEY, serde_json::json!(complete));
-    store
-        .save()
-        .map_err(|e| format!("failed to persist {FIRST_RUN_COMPLETE_KEY}={complete} to {path}: {e}"))?;
+    store.save().map_err(|e| {
+        format!("failed to persist {FIRST_RUN_COMPLETE_KEY}={complete} to {path}: {e}")
+    })?;
     log::info!("config: persisted {FIRST_RUN_COMPLETE_KEY}={complete} to {path}");
     Ok(())
 }
@@ -789,7 +843,10 @@ pub fn load_nudges_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -837,7 +894,10 @@ pub fn load_nudge_cooldown_secs(app: &AppHandle) -> u64 {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return NUDGE_COOLDOWN_SECS_DEFAULT;
         }
     };
@@ -977,7 +1037,10 @@ pub fn load_overlay_presentation(app: &AppHandle) -> Option<OverlayPresentation>
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -1132,9 +1195,9 @@ pub fn save_overlay_presentation(
     let wire = serde_json::to_value(presentation)
         .map_err(|e| format!("failed to serialize {OVERLAY_PRESENTATION_KEY}: {e}"))?;
     store.set(OVERLAY_PRESENTATION_KEY, wire.clone());
-    store
-        .save()
-        .map_err(|e| format!("failed to persist {OVERLAY_PRESENTATION_KEY}={wire} to {path}: {e}"))?;
+    store.save().map_err(|e| {
+        format!("failed to persist {OVERLAY_PRESENTATION_KEY}={wire} to {path}: {e}")
+    })?;
     log::info!("config: persisted {OVERLAY_PRESENTATION_KEY}={wire} to {path}");
     Ok(())
 }
@@ -1159,7 +1222,10 @@ pub fn load_skills_dir(app: &AppHandle) -> Option<String> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -1248,7 +1314,10 @@ pub fn load_llm_endpoint(app: &AppHandle) -> Option<String> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -1267,7 +1336,9 @@ fn stored_llm_endpoint(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::String(s) => {
             let trimmed = s.trim().trim_end_matches('/');
             if trimmed.is_empty() {
-                log::warn!("config: {LLM_ENDPOINT_KEY} holds a blank string; using default endpoint");
+                log::warn!(
+                    "config: {LLM_ENDPOINT_KEY} holds a blank string; using default endpoint"
+                );
                 None
             } else if is_http_url(trimmed) {
                 Some(trimmed.to_string())
@@ -1321,7 +1392,10 @@ pub fn load_chat_memory_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
-            log::error!("config: failed to open settings store at {}: {e}", store_path(app));
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
             return None;
         }
     };
@@ -1355,10 +1429,97 @@ pub fn save_chat_memory_enabled(app: &AppHandle, enabled: bool) -> Result<(), St
         .store(SETTINGS_STORE)
         .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
     store.set(CHAT_MEMORY_ENABLED_KEY, serde_json::json!(enabled));
-    store
-        .save()
-        .map_err(|e| format!("failed to persist {CHAT_MEMORY_ENABLED_KEY}={enabled} to {path}: {e}"))?;
+    store.save().map_err(|e| {
+        format!("failed to persist {CHAT_MEMORY_ENABLED_KEY}={enabled} to {path}: {e}")
+    })?;
     log::info!("config: persisted {CHAT_MEMORY_ENABLED_KEY}={enabled} to {path}");
+    Ok(())
+}
+
+/// Store key holding how long observed memory is kept (2026-07 redesign,
+/// tour step "Memory" + Settings). Wire contract shared with the TS side
+/// (tour-state.ts RETENTION_OPTIONS): "7d" | "30d" | "90d" | "forever".
+/// Display/persist only in this milestone — store pruning that honors the
+/// value is a specced follow-up, so nothing here touches the memory store.
+pub const MEMORY_RETENTION_KEY: &str = "memoryRetention";
+
+/// The retention wire values, single source of truth for validation.
+pub const MEMORY_RETENTION_VALUES: [&str; 4] = ["7d", "30d", "90d", "forever"];
+
+/// Default when nothing (usable) is persisted.
+pub const MEMORY_RETENTION_DEFAULT: &str = "30d";
+
+/// Validate one candidate retention value to its canonical form. `None` for
+/// anything outside the wire contract — callers decide between rejecting an
+/// IPC write and falling back to the default for a stored value.
+pub fn parse_memory_retention(value: &str) -> Option<&'static str> {
+    MEMORY_RETENTION_VALUES
+        .iter()
+        .find(|v| **v == value)
+        .copied()
+}
+
+/// The retention window in milliseconds; `None` for "forever" (never prune)
+/// AND for out-of-contract values — garbage must never widen deletion.
+pub fn memory_retention_window_ms(retention: &str) -> Option<i64> {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    match parse_memory_retention(retention) {
+        Some("7d") => Some(7 * DAY_MS),
+        Some("30d") => Some(30 * DAY_MS),
+        Some("90d") => Some(90 * DAY_MS),
+        _ => None, // "forever" or invalid: no pruning either way
+    }
+}
+
+/// Interpret one stored retention value: a valid string is trusted, anything
+/// else (wrong type, unknown string) is logged and treated as the default —
+/// garbage in the store must not invent a retention policy.
+fn stored_memory_retention(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::String(s) => parse_memory_retention(s).unwrap_or_else(|| {
+            log::warn!(
+                "config: {MEMORY_RETENTION_KEY} holds unknown value {s:?}; using {MEMORY_RETENTION_DEFAULT}"
+            );
+            MEMORY_RETENTION_DEFAULT
+        }),
+        other => {
+            log::warn!(
+                "config: {MEMORY_RETENTION_KEY} holds non-string value {other}; using {MEMORY_RETENTION_DEFAULT}"
+            );
+            MEMORY_RETENTION_DEFAULT
+        }
+    }
+}
+
+/// Read the persisted retention. `None` means nothing persisted (no store /
+/// no key): the caller uses [`MEMORY_RETENTION_DEFAULT`].
+pub fn load_memory_retention(app: &AppHandle) -> Option<&'static str> {
+    let store = match app.store(SETTINGS_STORE) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(
+                "config: failed to open settings store at {}: {e}",
+                store_path(app)
+            );
+            return None;
+        }
+    };
+    let value = store.get(MEMORY_RETENTION_KEY)?;
+    Some(stored_memory_retention(&value))
+}
+
+/// Persist a retention value (already validated by the caller via
+/// [`parse_memory_retention`]). The error names the failed persist path.
+pub fn save_memory_retention(app: &AppHandle, retention: &str) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(MEMORY_RETENTION_KEY, serde_json::json!(retention));
+    store.save().map_err(|e| {
+        format!("failed to persist {MEMORY_RETENTION_KEY}={retention} to {path}: {e}")
+    })?;
+    log::info!("config: persisted {MEMORY_RETENTION_KEY}={retention} to {path}");
     Ok(())
 }
 
@@ -1366,6 +1527,54 @@ pub fn save_chat_memory_enabled(app: &AppHandle, enabled: bool) -> Result<(), St
 mod tests {
     use super::*;
     use crate::llm::router::{HEAVY_LANE, THIN_LANE};
+
+    #[test]
+    fn parse_memory_retention_accepts_only_wire_values() {
+        for v in MEMORY_RETENTION_VALUES {
+            assert_eq!(parse_memory_retention(v), Some(v));
+        }
+        assert_eq!(parse_memory_retention("60d"), None);
+        assert_eq!(parse_memory_retention(""), None);
+        assert_eq!(parse_memory_retention("Forever"), None); // case-sensitive wire contract
+    }
+
+    #[test]
+    fn retention_window_maps_days_and_never_prunes_forever_or_garbage() {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        assert_eq!(memory_retention_window_ms("7d"), Some(7 * DAY));
+        assert_eq!(memory_retention_window_ms("30d"), Some(30 * DAY));
+        assert_eq!(memory_retention_window_ms("90d"), Some(90 * DAY));
+        assert_eq!(memory_retention_window_ms("forever"), None);
+        // Garbage must never widen deletion.
+        assert_eq!(memory_retention_window_ms("1d"), None);
+        assert_eq!(memory_retention_window_ms(""), None);
+    }
+
+    #[test]
+    fn stored_memory_retention_trusts_valid_strings() {
+        assert_eq!(stored_memory_retention(&serde_json::json!("90d")), "90d");
+        assert_eq!(
+            stored_memory_retention(&serde_json::json!("forever")),
+            "forever"
+        );
+    }
+
+    #[test]
+    fn stored_memory_retention_defaults_on_garbage() {
+        // Unknown string, wrong type, null: all fall back instead of inventing policy.
+        assert_eq!(
+            stored_memory_retention(&serde_json::json!("6 months")),
+            MEMORY_RETENTION_DEFAULT
+        );
+        assert_eq!(
+            stored_memory_retention(&serde_json::json!(30)),
+            MEMORY_RETENTION_DEFAULT
+        );
+        assert_eq!(
+            stored_memory_retention(&serde_json::Value::Null),
+            MEMORY_RETENTION_DEFAULT
+        );
+    }
 
     #[test]
     fn lane_model_key_maps_canonical_lanes_and_rejects_others() {
@@ -1383,19 +1592,34 @@ mod tests {
     #[test]
     fn stored_null_means_explicitly_unpinned() {
         // The store-vs-env contract: null is a decision, not an absence.
-        assert_eq!(stored_model_pin(THIN_MODEL_KEY, &serde_json::Value::Null), None);
+        assert_eq!(
+            stored_model_pin(THIN_MODEL_KEY, &serde_json::Value::Null),
+            None
+        );
     }
 
     #[test]
     fn stored_blank_string_unpins_instead_of_pinning_a_nameless_model() {
-        assert_eq!(stored_model_pin(THIN_MODEL_KEY, &serde_json::json!("")), None);
-        assert_eq!(stored_model_pin(THIN_MODEL_KEY, &serde_json::json!("   ")), None);
+        assert_eq!(
+            stored_model_pin(THIN_MODEL_KEY, &serde_json::json!("")),
+            None
+        );
+        assert_eq!(
+            stored_model_pin(THIN_MODEL_KEY, &serde_json::json!("   ")),
+            None
+        );
     }
 
     #[test]
     fn stored_non_string_value_is_treated_as_unpinned() {
-        assert_eq!(stored_model_pin(HEAVY_MODEL_KEY, &serde_json::json!(42)), None);
-        assert_eq!(stored_model_pin(HEAVY_MODEL_KEY, &serde_json::json!({"id": "x"})), None);
+        assert_eq!(
+            stored_model_pin(HEAVY_MODEL_KEY, &serde_json::json!(42)),
+            None
+        );
+        assert_eq!(
+            stored_model_pin(HEAVY_MODEL_KEY, &serde_json::json!({"id": "x"})),
+            None
+        );
     }
 
     #[test]
@@ -1457,9 +1681,18 @@ mod tests {
             assert_eq!(stored_hid_run_mode(&stored), mode, "wire form: {stored}");
         }
         // The exact kebab-case strings the store holds and src/chat.ts keys on.
-        assert_eq!(stored_hid_run_mode(&serde_json::json!("off")), HidRunMode::Off);
-        assert_eq!(stored_hid_run_mode(&serde_json::json!("ask")), HidRunMode::Ask);
-        assert_eq!(stored_hid_run_mode(&serde_json::json!("auto-run")), HidRunMode::AutoRun);
+        assert_eq!(
+            stored_hid_run_mode(&serde_json::json!("off")),
+            HidRunMode::Off
+        );
+        assert_eq!(
+            stored_hid_run_mode(&serde_json::json!("ask")),
+            HidRunMode::Ask
+        );
+        assert_eq!(
+            stored_hid_run_mode(&serde_json::json!("auto-run")),
+            HidRunMode::AutoRun
+        );
     }
 
     #[test]
@@ -1479,7 +1712,11 @@ mod tests {
             serde_json::json!({"mode": "ask"}),
             serde_json::json!(["ask"]),
         ] {
-            assert_eq!(stored_hid_run_mode(&bad), HidRunMode::Off, "bad value: {bad}");
+            assert_eq!(
+                stored_hid_run_mode(&bad),
+                HidRunMode::Off,
+                "bad value: {bad}"
+            );
         }
     }
 
@@ -1494,9 +1731,18 @@ mod tests {
             assert_eq!(stored_mcp_run_mode(&stored), mode, "wire form: {stored}");
         }
         // The exact kebab-case strings the store holds and src/chat.ts keys on.
-        assert_eq!(stored_mcp_run_mode(&serde_json::json!("off")), McpRunMode::Off);
-        assert_eq!(stored_mcp_run_mode(&serde_json::json!("ask")), McpRunMode::Ask);
-        assert_eq!(stored_mcp_run_mode(&serde_json::json!("auto-run")), McpRunMode::AutoRun);
+        assert_eq!(
+            stored_mcp_run_mode(&serde_json::json!("off")),
+            McpRunMode::Off
+        );
+        assert_eq!(
+            stored_mcp_run_mode(&serde_json::json!("ask")),
+            McpRunMode::Ask
+        );
+        assert_eq!(
+            stored_mcp_run_mode(&serde_json::json!("auto-run")),
+            McpRunMode::AutoRun
+        );
     }
 
     #[test]
@@ -1516,7 +1762,11 @@ mod tests {
             serde_json::json!({"mode": "ask"}),
             serde_json::json!(["ask"]),
         ] {
-            assert_eq!(stored_mcp_run_mode(&bad), McpRunMode::Off, "bad value: {bad}");
+            assert_eq!(
+                stored_mcp_run_mode(&bad),
+                McpRunMode::Off,
+                "bad value: {bad}"
+            );
         }
     }
 
@@ -1530,7 +1780,10 @@ mod tests {
             McpServerConfig {
                 id: "everything".to_string(),
                 command: "npx".to_string(),
-                args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-everything".to_string(),
+                ],
                 enabled: true,
                 transport: McpTransport::Stdio,
                 url: None,
@@ -1627,7 +1880,8 @@ mod tests {
             })
         );
         // Array args with a non-string element → only the string args survive.
-        let entry = serde_json::json!({ "id": "y", "command": "srv", "args": ["--flag", 42, "--other"] });
+        let entry =
+            serde_json::json!({ "id": "y", "command": "srv", "args": ["--flag", 42, "--other"] });
         assert_eq!(
             stored_mcp_server(&entry).unwrap().args,
             vec!["--flag".to_string(), "--other".to_string()]
@@ -1786,6 +2040,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // the constant IS the documented claim
     fn stored_non_boolean_nudges_value_falls_back_to_default_on() {
         // Q7: garbage must not flip the user-facing setting — the default
         // (on) is safe here because nudges are display-only and capture is
@@ -1794,14 +2049,19 @@ mod tests {
         assert!(stored_nudges_enabled(&serde_json::json!("false")));
         assert!(stored_nudges_enabled(&serde_json::json!(0)));
         assert!(stored_nudges_enabled(&serde_json::Value::Null));
-        assert!(stored_nudges_enabled(&serde_json::json!({"enabled": false})));
+        assert!(stored_nudges_enabled(
+            &serde_json::json!({"enabled": false})
+        ));
     }
 
     #[test]
     fn stored_positive_integer_cooldown_is_trusted() {
         assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(60)), 60);
         assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(1)), 1);
-        assert_eq!(stored_nudge_cooldown_secs(&serde_json::json!(86_400)), 86_400);
+        assert_eq!(
+            stored_nudge_cooldown_secs(&serde_json::json!(86_400)),
+            86_400
+        );
     }
 
     #[test]
@@ -1839,7 +2099,9 @@ mod tests {
         assert!(!stored_first_run_complete(&serde_json::json!("true")));
         assert!(!stored_first_run_complete(&serde_json::json!(1)));
         assert!(!stored_first_run_complete(&serde_json::Value::Null));
-        assert!(!stored_first_run_complete(&serde_json::json!({"complete": true})));
+        assert!(!stored_first_run_complete(
+            &serde_json::json!({"complete": true})
+        ));
     }
 
     #[test]
@@ -1857,7 +2119,9 @@ mod tests {
         assert!(stored_chat_memory_enabled(&serde_json::json!("false")));
         assert!(stored_chat_memory_enabled(&serde_json::json!(0)));
         assert!(stored_chat_memory_enabled(&serde_json::Value::Null));
-        assert!(stored_chat_memory_enabled(&serde_json::json!({"enabled": false})));
+        assert!(stored_chat_memory_enabled(
+            &serde_json::json!({"enabled": false})
+        ));
     }
 
     #[test]
@@ -1867,7 +2131,9 @@ mod tests {
         assert!(!stored_watcher_enabled(&serde_json::json!("true")));
         assert!(!stored_watcher_enabled(&serde_json::json!(1)));
         assert!(!stored_watcher_enabled(&serde_json::Value::Null));
-        assert!(!stored_watcher_enabled(&serde_json::json!({"enabled": true})));
+        assert!(!stored_watcher_enabled(
+            &serde_json::json!({"enabled": true})
+        ));
     }
 
     #[test]
@@ -1973,7 +2239,10 @@ mod tests {
         let value = serde_json::json!({ "mode": "bottom" });
         let got = stored_overlay_presentation(&value);
         assert_eq!(got.mode, PresentationMode::Bottom);
-        assert_eq!(got.edge_extents, OverlayPresentation::default().edge_extents);
+        assert_eq!(
+            got.edge_extents,
+            OverlayPresentation::default().edge_extents
+        );
         assert_eq!(got.modal_size, OverlayPresentation::default().modal_size);
     }
 
@@ -2005,7 +2274,10 @@ mod tests {
         );
         assert_eq!(
             stored_point(Some(&serde_json::json!({ "x": -1920.0, "y": -128.0 }))),
-            Some(OverlayPointConfig { x: -1920.0, y: -128.0 })
+            Some(OverlayPointConfig {
+                x: -1920.0,
+                y: -128.0
+            })
         );
         // Integers coerce to f64; zero is a legal origin.
         assert_eq!(
@@ -2028,12 +2300,12 @@ mod tests {
         // non-object, a missing coordinate, or a non-finite value must yield
         // None (center), never a garbage point that could land off-screen.
         for bad in [
-            serde_json::json!("512,384"),      // string
-            serde_json::json!(512),            // bare number
-            serde_json::json!(true),           // boolean
-            serde_json::json!([512, 384]),     // array
-            serde_json::json!({ "x": 512 }),   // missing y
-            serde_json::json!({ "y": 384 }),   // missing x
+            serde_json::json!("512,384"),                // string
+            serde_json::json!(512),                      // bare number
+            serde_json::json!(true),                     // boolean
+            serde_json::json!([512, 384]),               // array
+            serde_json::json!({ "x": 512 }),             // missing y
+            serde_json::json!({ "y": 384 }),             // missing x
             serde_json::json!({ "x": "512", "y": 384 }), // non-number x
             serde_json::json!({ "x": 512, "y": null }),  // null y
         ] {

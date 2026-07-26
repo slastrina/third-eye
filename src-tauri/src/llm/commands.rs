@@ -205,7 +205,11 @@ struct OverlayApprovalPrompt {
 
 impl OverlayApprovalPrompt {
     fn new(app: AppHandle, state: Arc<ApprovalState>, request_id: u64) -> Self {
-        Self { app, state, request_id }
+        Self {
+            app,
+            state,
+            request_id,
+        }
     }
 }
 
@@ -217,7 +221,11 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
             "llm: HID approval requested id={approval_id} kind={kind:?} (request={})",
             self.request_id
         );
-        let payload = ApprovalRequestPayload { approval_id, kind, summary };
+        let payload = ApprovalRequestPayload {
+            approval_id,
+            kind,
+            summary,
+        };
         if let Err(e) = self.app.emit(HID_APPROVAL_EVENT, payload) {
             log::warn!("llm: HID approval-request emit failed id={approval_id}: {e}; denying");
             self.state.cancel(approval_id);
@@ -533,9 +541,17 @@ impl LlmState {
             if let Some(abort) = prev.aborter {
                 abort();
             }
-            log::debug!("llm: request {} cancelled (superseded by request {})", prev.id, id);
+            log::debug!(
+                "llm: request {} cancelled (superseded by request {})",
+                prev.id,
+                id
+            );
         }
-        *active = Some(ActiveRequest { id, aborter: None, stop: Arc::new(AtomicBool::new(false)) });
+        *active = Some(ActiveRequest {
+            id,
+            aborter: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        });
         id
     }
 
@@ -613,7 +629,6 @@ impl LlmState {
             }
         }
     }
-
 }
 
 /// Compose the discovered markdown skill packs (M007 S06) into one system-turn
@@ -683,8 +698,7 @@ pub async fn chat(
         // exit path, including abort — single-flight supersede aborts this
         // task, which drops the future and runs this destructor.
         #[cfg(desktop)]
-        let _activity =
-            crate::tray::begin_activity(&task_app, crate::tray::ActivityKind::Stream);
+        let _activity = crate::tray::begin_activity(&task_app, crate::tray::ActivityKind::Stream);
         let started = Instant::now();
         let first_token_at: Mutex<Option<Instant>> = Mutex::new(None);
         // Chat-ingest capture (M008 S01): every tool event is accumulated so
@@ -704,7 +718,10 @@ pub async fn chat(
                     );
                 }
             }
-            let payload = TokenEvent { request_id: id, token: token.into() };
+            let payload = TokenEvent {
+                request_id: id,
+                token: token.into(),
+            };
             if let Err(e) = task_app.emit(TOKEN_EVENT, payload) {
                 log::warn!("llm: request {id} token emit failed: {e}");
             }
@@ -715,7 +732,10 @@ pub async fn chat(
         // what used to fill with blank newlines. Emission failure is logged, never
         // fatal, same policy as tokens.
         let on_reasoning = |delta: &str| {
-            let payload = ReasoningEvent { request_id: id, delta: delta.into() };
+            let payload = ReasoningEvent {
+                request_id: id,
+                delta: delta.into(),
+            };
             if let Err(e) = task_app.emit(REASONING_EVENT, payload) {
                 log::warn!("llm: request {id} reasoning emit failed: {e}");
             }
@@ -807,7 +827,11 @@ pub async fn chat(
             // The tool holds the same per-run FocusedApp intent the gate and
             // screen_query share: its post-action verification fails an action
             // whose focus readback lands outside the focused app (M008).
-            InputTool::new(keyboard_safe_backend, input_state.arm_state(), focused_app.clone()),
+            InputTool::new(
+                keyboard_safe_backend,
+                input_state.arm_state(),
+                focused_app.clone(),
+            ),
             FocusAppTool::new(appfocus_state.backend()),
             mode,
             approval.whitelist(),
@@ -842,7 +866,8 @@ pub async fn chat(
             Some(peer) => match McpExecutor::connect(peer).await {
                 Ok(mcp_executor) => {
                     let mcp_mode = mcp.mode();
-                    let mcp_approver = Arc::new(OverlayMcpApprovalPrompt::new(task_app.clone(), id));
+                    let mcp_approver =
+                        Arc::new(OverlayMcpApprovalPrompt::new(task_app.clone(), id));
                     executors.push(Box::new(McpApprovalGate::new(
                         mcp_executor,
                         mcp_mode,
@@ -915,8 +940,11 @@ pub async fn chat(
         // A user-stopped run ends Stopped; a natural finish or error ends Idle.
         // The terminal phase is broadcast below only if this request still owns
         // the slot (a superseded task must not clobber its successor's Running).
-        let terminal_phase =
-            if matches!(&result, Ok(outcome) if outcome.stopped) { RunPhase::Stopped } else { RunPhase::Idle };
+        let terminal_phase = if matches!(&result, Ok(outcome) if outcome.stopped) {
+            RunPhase::Stopped
+        } else {
+            RunPhase::Idle
+        };
 
         // Chat-ingest policy read before `result` moves into the match arms:
         // `Some` exactly for Ok outcomes (stopped included), `None` on Err.
@@ -961,7 +989,10 @@ pub async fn chat(
                     err.kind(),
                     err.endpoint()
                 );
-                let payload = ErrorEvent { request_id: id, error: err };
+                let payload = ErrorEvent {
+                    request_id: id,
+                    error: err,
+                };
                 if let Err(e) = task_app.emit(ERROR_EVENT, payload) {
                     log::warn!("llm: request {id} error emit failed: {e}");
                 }
@@ -1006,7 +1037,10 @@ pub async fn chat(
             }
         }
 
-        if let Some(phase) = task_app.state::<LlmState>().finish_with_phase(id, terminal_phase) {
+        if let Some(phase) = task_app
+            .state::<LlmState>()
+            .finish_with_phase(id, terminal_phase)
+        {
             broadcast_run_state(&task_app, phase);
         }
     });
@@ -1020,7 +1054,11 @@ pub async fn chat(
 #[tauri::command]
 pub async fn llm_health(state: State<'_, LlmState>) -> Result<LlmHealth, String> {
     let health = state.router.health().await;
-    log::debug!("llm: health probe endpoint={} online={}", health.endpoint, health.online);
+    log::debug!(
+        "llm: health probe endpoint={} online={}",
+        health.endpoint,
+        health.online
+    );
     Ok(health)
 }
 
@@ -1029,7 +1067,11 @@ pub async fn llm_health(state: State<'_, LlmState>) -> Result<LlmHealth, String>
 /// Returns the updated [`ModelInfo`] so the UI can render the new state
 /// without a second round-trip, and broadcasts it app-wide (S07).
 #[tauri::command]
-pub fn set_model(app: AppHandle, state: State<'_, LlmState>, lane: String) -> Result<ModelInfo, String> {
+pub fn set_model(
+    app: AppHandle,
+    state: State<'_, LlmState>,
+    lane: String,
+) -> Result<ModelInfo, String> {
     let info = state.set_model(&lane)?;
     broadcast_model_info(&app, &info);
     Ok(info)
@@ -1080,9 +1122,10 @@ pub async fn list_models(state: State<'_, LlmState>) -> Result<Vec<String>, LlmE
 /// failure is logged, never fatal — the app still runs on the env pins.
 pub fn apply_persisted_lane_models(app: &AppHandle) {
     let state = app.state::<LlmState>();
-    for (lane, key) in
-        [(THIN_LANE, crate::config::THIN_MODEL_KEY), (HEAVY_LANE, crate::config::HEAVY_MODEL_KEY)]
-    {
+    for (lane, key) in [
+        (THIN_LANE, crate::config::THIN_MODEL_KEY),
+        (HEAVY_LANE, crate::config::HEAVY_MODEL_KEY),
+    ] {
         if let Some(pin) = crate::config::load_lane_model(app, key) {
             match state.set_lane_model(lane, pin.clone()) {
                 Ok(_) => log::info!("llm: applied persisted {key} ({lane} lane → {:?})", pin),
@@ -1104,9 +1147,22 @@ fn broadcast_model_info(app: &AppHandle, info: &ModelInfo) {
 /// keys on this. Emission failure is logged, not fatal — the state stays
 /// queryable via `run_state`, same posture as the model-info/privacy broadcasts.
 fn broadcast_run_state(app: &AppHandle, phase: RunPhase) {
+    // Every phase transition keeps the HUD's global-Escape kill-switch in
+    // sync: registered only while a run is live AND HID is armed (hud.rs).
+    crate::hud::sync_esc_guard(app, phase == RunPhase::Running);
     if let Err(e) = app.emit(RUN_STATE_EVENT, RunStatePayload { phase }) {
         log::warn!("llm: run-state broadcast failed: {e}");
     }
+}
+
+/// The Escape kill-switch's stop path (hud.rs): the same cooperative stop as
+/// `stop_chat`, reachable from the global-shortcut handler which has only an
+/// `AppHandle`. Never rejects — a stop with nothing in flight is a no-op.
+pub fn stop_run_from_esc(app: &AppHandle) {
+    let state = app.state::<LlmState>();
+    let phase = state.request_stop();
+    broadcast_run_state(app, phase);
+    log::debug!("llm: esc kill-switch -> {phase:?}");
 }
 
 /// Stop the in-flight chat run (S04 T04): flips the cooperative Stop flag so the
@@ -1127,7 +1183,9 @@ pub fn stop_chat(app: AppHandle, state: State<'_, LlmState>) -> RunStatePayload 
 /// render the Stop control truthfully before any broadcast arrives.
 #[tauri::command]
 pub fn run_state(state: State<'_, LlmState>) -> RunStatePayload {
-    RunStatePayload { phase: state.run_phase() }
+    RunStatePayload {
+        phase: state.run_phase(),
+    }
 }
 
 /// Queryable routing state (health-as-value, like `llm_health`): the active
@@ -1158,7 +1216,11 @@ pub struct EndpointStatus {
 /// Assemble an [`EndpointStatus`] — pure so the restart-required contract is
 /// unit-testable without a Tauri runtime: the effective next-launch endpoint
 /// (configured, else fallback) is compared against the running one.
-fn endpoint_status_for(active: &str, configured: Option<String>, fallback: String) -> EndpointStatus {
+fn endpoint_status_for(
+    active: &str,
+    configured: Option<String>,
+    fallback: String,
+) -> EndpointStatus {
     let effective = configured.as_deref().unwrap_or(&fallback);
     EndpointStatus {
         active: active.to_string(),
@@ -1405,8 +1467,14 @@ pub fn mcp_servers(app: AppHandle) -> McpServersStatus {
 pub fn set_mcp_servers(app: AppHandle, servers: Vec<McpServerConfig>) -> McpServersStatus {
     match crate::config::save_mcp_servers(&app, &servers) {
         Ok(()) => {
-            log::info!("llm: persisted {} MCP server(s) via settings", servers.len());
-            McpServersStatus { servers, persist_error: None }
+            log::info!(
+                "llm: persisted {} MCP server(s) via settings",
+                servers.len()
+            );
+            McpServersStatus {
+                servers,
+                persist_error: None,
+            }
         }
         Err(e) => {
             // The store still holds the previous list; surface THAT as the truth so
@@ -1432,7 +1500,9 @@ pub struct McpAuthState {
 
 impl McpAuthState {
     pub fn new() -> Self {
-        Self { store: McpAuthStore::new() }
+        Self {
+            store: McpAuthStore::new(),
+        }
     }
 
     /// The keystore handle — the http connect path (T04) reads tokens through
@@ -1470,13 +1540,18 @@ pub fn set_mcp_auth(
     auth_ref: String,
     token: String,
 ) -> Result<McpAuthStatus, McpAuthError> {
-    state.store.set_token(&auth_ref, &token).map_err(|e| {
+    state.store.set_token(&auth_ref, &token).inspect_err(|e| {
         // The account key is non-secret (it is the settings.json authRef); the
         // token bytes are never logged.
-        log::error!("llm: set MCP auth failed for {} ({})", auth_ref.trim(), e.kind());
-        e
+        log::error!(
+            "llm: set MCP auth failed for {} ({})",
+            auth_ref.trim(),
+            e.kind()
+        );
     })?;
-    Ok(McpAuthStatus { present: state.store.token_present(&auth_ref)? })
+    Ok(McpAuthStatus {
+        present: state.store.token_present(&auth_ref)?,
+    })
 }
 
 /// IPC: delete a remote MCP server's stored bearer token. Deleting an absent
@@ -1487,11 +1562,16 @@ pub fn delete_mcp_auth(
     state: State<'_, McpAuthState>,
     auth_ref: String,
 ) -> Result<McpAuthStatus, McpAuthError> {
-    state.store.delete_token(&auth_ref).map_err(|e| {
-        log::error!("llm: delete MCP auth failed for {} ({})", auth_ref.trim(), e.kind());
-        e
+    state.store.delete_token(&auth_ref).inspect_err(|e| {
+        log::error!(
+            "llm: delete MCP auth failed for {} ({})",
+            auth_ref.trim(),
+            e.kind()
+        );
     })?;
-    Ok(McpAuthStatus { present: state.store.token_present(&auth_ref)? })
+    Ok(McpAuthStatus {
+        present: state.store.token_present(&auth_ref)?,
+    })
 }
 
 /// IPC: presence snapshot for one `authRef` account — the Settings MCP surface
@@ -1502,10 +1582,17 @@ pub fn mcp_auth_status(
     state: State<'_, McpAuthState>,
     auth_ref: String,
 ) -> Result<McpAuthStatus, McpAuthError> {
-    state.store.token_present(&auth_ref).map(|present| McpAuthStatus { present }).map_err(|e| {
-        log::error!("llm: MCP auth status query failed for {} ({})", auth_ref.trim(), e.kind());
-        e
-    })
+    state
+        .store
+        .token_present(&auth_ref)
+        .map(|present| McpAuthStatus { present })
+        .inspect_err(|e| {
+            log::error!(
+                "llm: MCP auth status query failed for {} ({})",
+                auth_ref.trim(),
+                e.kind()
+            );
+        })
 }
 
 /// Install the `privacy://state` emitter on the shared [`GuardState`]
@@ -1529,7 +1616,9 @@ pub fn install_guard_notifier(app: &AppHandle) {
 /// so `THIRD_EYE_THIN_MODEL=""` behaves like an absent var instead of
 /// pinning a nameless model.
 fn env_model(value: Option<String>) -> Option<String> {
-    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// `THIRD_EYE_ENDPOINT` semantics — trim whitespace, drop trailing slashes,
@@ -1621,7 +1710,10 @@ mod tests {
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
@@ -1664,7 +1756,10 @@ mod tests {
         assert!(!aborted.load(Ordering::SeqCst));
 
         s.begin();
-        assert!(aborted.load(Ordering::SeqCst), "prior request must be aborted on resubmit");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "prior request must be aborted on resubmit"
+        );
     }
 
     #[test]
@@ -1676,7 +1771,10 @@ mod tests {
         s.finish_with_phase(id, RunPhase::Idle);
 
         s.begin();
-        assert!(!aborted.load(Ordering::SeqCst), "finished request must not be aborted");
+        assert!(
+            !aborted.load(Ordering::SeqCst),
+            "finished request must not be aborted"
+        );
     }
 
     #[test]
@@ -1690,7 +1788,10 @@ mod tests {
         // The superseded task reaches its terminal state late: must be a no-op.
         s.finish_with_phase(old, RunPhase::Idle);
         s.begin();
-        assert!(aborted.load(Ordering::SeqCst), "successor tracking was lost to a stale finish");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "successor tracking was lost to a stale finish"
+        );
     }
 
     #[test]
@@ -1703,7 +1804,10 @@ mod tests {
 
         s.finish_with_phase(new, RunPhase::Idle);
         s.begin();
-        assert!(!stale.load(Ordering::SeqCst), "stale aborter must never be installed");
+        assert!(
+            !stale.load(Ordering::SeqCst),
+            "stale aborter must never be installed"
+        );
     }
 
     #[test]
@@ -1724,7 +1828,10 @@ mod tests {
         assert_eq!(serde_json::to_value(RunPhase::Idle).unwrap(), "idle");
         assert_eq!(serde_json::to_value(RunPhase::Running).unwrap(), "running");
         assert_eq!(serde_json::to_value(RunPhase::Stopped).unwrap(), "stopped");
-        let v = serde_json::to_value(RunStatePayload { phase: RunPhase::Running }).unwrap();
+        let v = serde_json::to_value(RunStatePayload {
+            phase: RunPhase::Running,
+        })
+        .unwrap();
         assert_eq!(v["phase"], "running");
     }
 
@@ -1746,7 +1853,10 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst), "the flag starts unset");
 
         assert_eq!(s.request_stop(), RunPhase::Stopped);
-        assert!(flag.load(Ordering::SeqCst), "stop must flip the loop's cooperative flag");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "stop must flip the loop's cooperative flag"
+        );
         assert_eq!(s.run_phase(), RunPhase::Stopped);
     }
 
@@ -1768,7 +1878,11 @@ mod tests {
         // The superseded task reaching its terminal state must not clobber the
         // successor's Running phase.
         assert_eq!(s.finish_with_phase(old, RunPhase::Idle), None);
-        assert_eq!(s.run_phase(), RunPhase::Running, "a stale finish left the phase alone");
+        assert_eq!(
+            s.run_phase(),
+            RunPhase::Running,
+            "a stale finish left the phase alone"
+        );
     }
 
     #[test]
@@ -1776,8 +1890,8 @@ mod tests {
         let s = state();
         let old = s.begin();
         s.begin(); // supersede
-        // The old id no longer owns the slot: it gets a fresh never-set flag, so
-        // a late should_stop closure over it can never falsely stop the new run.
+                   // The old id no longer owns the slot: it gets a fresh never-set flag, so
+                   // a late should_stop closure over it can never falsely stop the new run.
         assert!(!s.stop_flag(old).load(Ordering::SeqCst));
     }
 
@@ -1814,7 +1928,10 @@ mod tests {
         .unwrap();
         assert_eq!(v["approvalId"], 7);
         assert_eq!(v["toolName"], "mcp__weather_forecast");
-        assert_eq!(v["summary"], "Call mcp__weather_forecast({\"city\":\"Paris\"})");
+        assert_eq!(
+            v["summary"],
+            "Call mcp__weather_forecast({\"city\":\"Paris\"})"
+        );
     }
 
     #[test]
@@ -1857,7 +1974,10 @@ mod tests {
         assert_eq!(v["servers"][0]["command"], "npx");
         assert_eq!(v["servers"][0]["args"][1], "@ref/weather");
         assert_eq!(v["servers"][0]["enabled"], true);
-        assert_eq!(v["persistError"], "failed to persist mcpServers to settings.json");
+        assert_eq!(
+            v["persistError"],
+            "failed to persist mcpServers to settings.json"
+        );
     }
 
     #[test]
@@ -1909,7 +2029,10 @@ mod tests {
     async fn approval_state_delivers_the_verdict_to_the_waiting_gate() {
         let s = Arc::new(ApprovalState::new());
         let (id, rx) = s.register();
-        assert!(s.respond(id, ApprovalVerdict::AllowKind), "a live waiter must accept the verdict");
+        assert!(
+            s.respond(id, ApprovalVerdict::AllowKind),
+            "a live waiter must accept the verdict"
+        );
         assert_eq!(rx.await.unwrap(), ApprovalVerdict::AllowKind);
     }
 
@@ -1921,7 +2044,10 @@ mod tests {
         // Registered then cancelled (the timeout path): a late reply is a no-op.
         let (id, _rx) = s.register();
         s.cancel(id);
-        assert!(!s.respond(id, ApprovalVerdict::AllowOnce), "a cancelled waiter must not accept");
+        assert!(
+            !s.respond(id, ApprovalVerdict::AllowOnce),
+            "a cancelled waiter must not accept"
+        );
     }
 
     #[test]
@@ -1943,7 +2069,11 @@ mod tests {
 
     #[test]
     fn token_event_serializes_camel_case() {
-        let v = serde_json::to_value(TokenEvent { request_id: 7, token: "hi".into() }).unwrap();
+        let v = serde_json::to_value(TokenEvent {
+            request_id: 7,
+            token: "hi".into(),
+        })
+        .unwrap();
         assert_eq!(v["requestId"], 7);
         assert_eq!(v["token"], "hi");
     }
@@ -1953,9 +2083,11 @@ mod tests {
         // src/chat.ts pins the same event string and reads `delta` — the const
         // and payload shape are the contract lock for the Thinking… stream.
         assert_eq!(REASONING_EVENT, "llm://reasoning");
-        let v =
-            serde_json::to_value(ReasoningEvent { request_id: 7, delta: "let me think".into() })
-                .unwrap();
+        let v = serde_json::to_value(ReasoningEvent {
+            request_id: 7,
+            delta: "let me think".into(),
+        })
+        .unwrap();
         assert_eq!(v["requestId"], 7);
         assert_eq!(v["delta"], "let me think");
     }
@@ -2013,8 +2145,15 @@ mod tests {
         assert_eq!(s.model_info().active_lane, THIN_LANE);
 
         let info = s.set_model(HEAVY_LANE).unwrap();
-        assert_eq!(info.active_lane, HEAVY_LANE, "returned info must reflect the switch");
-        assert_eq!(s.model_info().active_lane, HEAVY_LANE, "the switch must persist");
+        assert_eq!(
+            info.active_lane, HEAVY_LANE,
+            "returned info must reflect the switch"
+        );
+        assert_eq!(
+            s.model_info().active_lane,
+            HEAVY_LANE,
+            "the switch must persist"
+        );
 
         // And back: overriding is not one-way.
         assert_eq!(s.set_model(THIN_LANE).unwrap().active_lane, THIN_LANE);
@@ -2024,12 +2163,19 @@ mod tests {
     fn set_model_rejects_unknown_lane_and_leaves_routing_unchanged() {
         let s = routed_state();
         let err = s.set_model("turbo").unwrap_err();
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
         assert!(
             err.contains(THIN_LANE) && err.contains(HEAVY_LANE),
             "error must list known lanes: {err}"
         );
-        assert_eq!(s.model_info().active_lane, THIN_LANE, "rejection must not change routing");
+        assert_eq!(
+            s.model_info().active_lane,
+            THIN_LANE,
+            "rejection must not change routing"
+        );
     }
 
     #[test]
@@ -2044,9 +2190,14 @@ mod tests {
     #[test]
     fn state_set_lane_model_repins_and_reflects_in_info() {
         let s = routed_state();
-        let info = s.set_lane_model(THIN_LANE, Some("qwen2.5-14b".into())).unwrap();
+        let info = s
+            .set_lane_model(THIN_LANE, Some("qwen2.5-14b".into()))
+            .unwrap();
         assert_eq!(info.lanes[0].model_id.as_deref(), Some("qwen2.5-14b"));
-        assert_eq!(s.model_info().lanes[0].model_id.as_deref(), Some("qwen2.5-14b"));
+        assert_eq!(
+            s.model_info().lanes[0].model_id.as_deref(),
+            Some("qwen2.5-14b")
+        );
 
         // Explicit unpin round-trips too.
         let info = s.set_lane_model(THIN_LANE, None).unwrap();
@@ -2057,9 +2208,15 @@ mod tests {
     fn state_set_lane_model_rejects_unknown_lane_unchanged() {
         let s = routed_state();
         let err = s.set_lane_model("turbo", Some("x".into())).unwrap_err();
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
         assert_eq!(s.model_info().lanes[0].model_id.as_deref(), Some("thin-1b"));
-        assert_eq!(s.model_info().lanes[1].model_id.as_deref(), Some("heavy-7b"));
+        assert_eq!(
+            s.model_info().lanes[1].model_id.as_deref(),
+            Some("heavy-7b")
+        );
     }
 
     #[test]
@@ -2067,13 +2224,20 @@ mod tests {
         assert_eq!(env_model(None), None);
         assert_eq!(env_model(Some(String::new())), None);
         assert_eq!(env_model(Some("   ".into())), None);
-        assert_eq!(env_model(Some(" qwen2.5-7b ".into())), Some("qwen2.5-7b".into()));
+        assert_eq!(
+            env_model(Some(" qwen2.5-7b ".into())),
+            Some("qwen2.5-7b".into())
+        );
     }
 
     #[test]
     fn endpoint_status_restart_required_only_when_effective_differs_from_active() {
         // No override, fallback == active: the boring steady state.
-        let s = endpoint_status_for("http://localhost:1234", None, "http://localhost:1234".into());
+        let s = endpoint_status_for(
+            "http://localhost:1234",
+            None,
+            "http://localhost:1234".into(),
+        );
         assert!(!s.restart_required);
         assert_eq!(s.configured, None);
 
@@ -2120,7 +2284,14 @@ mod tests {
         // The save-time bar matches config::stored_llm_endpoint's load-time
         // bar: a value that would be repaired away on the next boot must be
         // rejected here with a message instead of persisting silently dead.
-        for bad in ["", "   ", "localhost:1234", "ws://127.0.0.1:1234", "file:///tmp/x", "/a/path"] {
+        for bad in [
+            "",
+            "   ",
+            "localhost:1234",
+            "ws://127.0.0.1:1234",
+            "file:///tmp/x",
+            "/a/path",
+        ] {
             assert!(normalized_endpoint(bad).is_err(), "must reject {bad:?}");
         }
     }
@@ -2132,8 +2303,14 @@ mod tests {
         assert_eq!(env_endpoint(None), DEFAULT_ENDPOINT);
         assert_eq!(env_endpoint(Some(String::new())), DEFAULT_ENDPOINT);
         assert_eq!(env_endpoint(Some("   ".into())), DEFAULT_ENDPOINT);
-        assert_eq!(env_endpoint(Some(" http://127.0.0.1:9999/ ".into())), "http://127.0.0.1:9999");
-        assert_eq!(env_endpoint(Some("http://192.0.2.1:9".into())), "http://192.0.2.1:9");
+        assert_eq!(
+            env_endpoint(Some(" http://127.0.0.1:9999/ ".into())),
+            "http://127.0.0.1:9999"
+        );
+        assert_eq!(
+            env_endpoint(Some("http://192.0.2.1:9".into())),
+            "http://192.0.2.1:9"
+        );
     }
 
     /// TEST-NET-1 (RFC 5737): reserved documentation address — nothing can
@@ -2166,8 +2343,7 @@ mod tests {
 
         // The pinned Low-confidence redaction condition (Luhn-failing digits
         // beside card context) — a request the guard must refuse externally.
-        let request =
-            ChatRequest::new(vec![ChatMessage::user("credit card: 4111 1111 1111 1112")]);
+        let request = ChatRequest::new(vec![ChatMessage::user("credit card: 4111 1111 1111 1112")]);
         let err = client.stream_chat(&request, &|_| {}).await.unwrap_err();
         assert_eq!(
             err.kind(),

@@ -42,8 +42,11 @@ const SEED_SECRETS: [&str; 5] = [
 
 /// The byte-exact placeholder vocabulary (pinned in privacy unit tests) that
 /// must appear instead.
-const PLACEHOLDERS: [&str; 3] =
-    ["[REDACTED:password]", "[REDACTED:card]", "[REDACTED:api-key]"];
+const PLACEHOLDERS: [&str; 3] = [
+    "[REDACTED:password]",
+    "[REDACTED:card]",
+    "[REDACTED:api-key]",
+];
 
 /// A scratch db path under the OS temp dir, cleaned up on drop so failed
 /// runs do not accumulate files.
@@ -88,7 +91,9 @@ mod scripted {
         let cap = captured.clone();
         tokio::spawn(async move {
             for response in responses {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
                 while !request_complete(&buf) {
@@ -109,18 +114,27 @@ mod scripted {
     /// `content-length` bytes of body.
     fn request_complete(buf: &[u8]) -> bool {
         let text = String::from_utf8_lossy(buf);
-        let Some(header_end) = text.find("\r\n\r\n") else { return false };
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
         let content_length = text
             .lines()
             .find_map(|l| {
-                l.to_ascii_lowercase().strip_prefix("content-length:")?.trim().parse::<usize>().ok()
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
             })
             .unwrap_or(0);
         buf.len() >= header_end + 4 + content_length
     }
 
     pub fn sse_token(token: &str) -> String {
-        format!("data: {}\n\n", serde_json::json!({"choices": [{"delta": {"content": token}}]}))
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": token}}]})
+        )
     }
 
     /// HTTP/1.1 200 chunked SSE response, terminated and connection-closed.
@@ -208,7 +222,10 @@ fn assert_no_secret_bytes(bytes: &[u8], what: &str) {
 /// Returns which sibling files existed at scan time.
 fn scan_store_files(db_path: &Path, stage: &str) -> (bool, bool) {
     let bytes = std::fs::read(db_path).expect("read store db file");
-    assert!(!bytes.is_empty(), "store db file must not be empty ({stage})");
+    assert!(
+        !bytes.is_empty(),
+        "store db file must not be empty ({stage})"
+    );
     assert_no_secret_bytes(&bytes, &format!("store file ({stage})"));
 
     let mut existed = (false, false);
@@ -260,7 +277,9 @@ async fn redacted_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
         None,
         Arc::new(GuardState::new()),
     ));
-    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+        .lane_client(THIN_LANE)
+        .expect("thin lane must resolve");
 
     let watcher = WatcherState::new();
     let rx = watcher.subscribe();
@@ -287,7 +306,11 @@ async fn redacted_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
 
     // The pipeline really ran: two distillations, two summaries each.
     let status = ingest.status();
-    assert!(status.last_error.is_none(), "distillation failed: {:?}", status.last_error);
+    assert!(
+        status.last_error.is_none(),
+        "distillation failed: {:?}",
+        status.last_error
+    );
     assert_eq!(status.distilled_count, 4, "2 batches x 2 summary lines");
     assert_eq!(store.count().unwrap(), 4);
 
@@ -308,8 +331,14 @@ async fn redacted_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
             "request 0 must carry {placeholder}: {body1}"
         );
     }
-    assert!(body2.contains("[REDACTED:api-key]"), "request 1 must carry the api-key placeholder");
-    assert!(body2.contains("[REDACTED:card]"), "request 1 must carry the card placeholder");
+    assert!(
+        body2.contains("[REDACTED:api-key]"),
+        "request 1 must carry the api-key placeholder"
+    );
+    assert!(
+        body2.contains("[REDACTED:card]"),
+        "request 1 must carry the card placeholder"
+    );
     // Redaction is surgical: innocent screen text reaches the model intact.
     assert!(
         body1.contains(INNOCENT_MARKER),
@@ -321,7 +350,10 @@ async fn redacted_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
     // scanning the siblings now covers stored content the main file may not
     // yet hold.
     let (wal_before, _) = scan_store_files(&scratch.path, "pre-checkpoint");
-    assert!(wal_before, "WAL-mode store must have a -wal sibling while open");
+    assert!(
+        wal_before,
+        "WAL-mode store must have a -wal sibling while open"
+    );
 
     // Closing the last connection checkpoints the WAL into the main file, so
     // the post-close scan sees every stored page in the main db.

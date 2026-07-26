@@ -24,7 +24,10 @@ fn mock_app() -> App<tauri::test::MockRuntime> {
 
 /// The window may already exist (created from tauri.conf.json at build) or
 /// not (mock runtime); either way return a live webview with this label.
-fn webview(app: &App<tauri::test::MockRuntime>, label: &str) -> WebviewWindow<tauri::test::MockRuntime> {
+fn webview(
+    app: &App<tauri::test::MockRuntime>,
+    label: &str,
+) -> WebviewWindow<tauri::test::MockRuntime> {
     match app.get_webview_window(label) {
         Some(w) => w,
         None => tauri::WebviewWindowBuilder::new(app, label, Default::default())

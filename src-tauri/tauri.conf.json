@@ -44,6 +44,74 @@
         "skipTaskbar": true,
         "visible": false,
         "focus": false
+      },
+      {
+        "label": "hud-canvas",
+        "title": "Third Eye HUD",
+        "url": "index.html?view=hud-canvas",
+        "width": 800,
+        "height": 600,
+        "center": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "visibleOnAllWorkspaces": true,
+        "focus": false
+      },
+      {
+        "label": "hud-pill",
+        "title": "Third Eye HUD",
+        "url": "index.html?view=hud-pill",
+        "width": 460,
+        "height": 360,
+        "center": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "visibleOnAllWorkspaces": true,
+        "focus": false
+      },
+      {
+        "label": "tray-panel",
+        "title": "Third Eye",
+        "url": "index.html?view=tray-panel",
+        "width": 336,
+        "height": 430,
+        "center": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "visibleOnAllWorkspaces": true,
+        "focus": false
+      },
+      {
+        "label": "memory",
+        "title": "Third Eye Memory",
+        "url": "index.html?view=memory",
+        "width": 780,
+        "height": 540,
+        "minWidth": 620,
+        "minHeight": 420,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {
@@ -52,7 +120,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

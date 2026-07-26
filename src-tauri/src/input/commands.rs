@@ -56,13 +56,19 @@ pub struct HidArmState {
 impl HidArmState {
     /// A holder in the given run mode.
     pub fn with_mode(mode: HidRunMode) -> Self {
-        Self { mode: AtomicU8::new(mode as u8) }
+        Self {
+            mode: AtomicU8::new(mode as u8),
+        }
     }
 
     /// A holder starting armed (→ `Ask`) or disarmed (→ `Off`). Back-compat with
     /// the S03 boolean surface: an armed machine defaults to inline prompting.
     pub fn new(armed: bool) -> Self {
-        Self::with_mode(if armed { HidRunMode::Ask } else { HidRunMode::Off })
+        Self::with_mode(if armed {
+            HidRunMode::Ask
+        } else {
+            HidRunMode::Off
+        })
     }
 
     /// The safe default: disarmed (`Off`). HID is never armed without an explicit,
@@ -92,7 +98,11 @@ impl HidArmState {
     /// Back-compat boolean writer: arm → `Ask`, disarm → `Off`. Retained for the
     /// S03 `set_hid_armed` applier path.
     pub fn set_armed(&self, armed: bool) {
-        self.set_mode(if armed { HidRunMode::Ask } else { HidRunMode::Off });
+        self.set_mode(if armed {
+            HidRunMode::Ask
+        } else {
+            HidRunMode::Off
+        });
     }
 }
 
@@ -115,7 +125,11 @@ impl InputState {
     /// (D038). The S03 applier arms it from the persisted `hidEnabled` choice
     /// after a permission preflight.
     pub fn new(backend: Arc<dyn InputControl>) -> Self {
-        Self { backend, arm: Arc::new(HidArmState::disarmed()), last_error: Mutex::new(None) }
+        Self {
+            backend,
+            arm: Arc::new(HidArmState::disarmed()),
+            last_error: Mutex::new(None),
+        }
     }
 
     /// State bound to this platform's live backend: the enigo-backed
@@ -421,8 +435,9 @@ pub fn apply_hid_armed(app: &AppHandle, desired: bool, via: &str) -> HidArmedSta
     let state = app.state::<InputState>();
     let previous = state.armed();
     let permission = state.permission();
-    let (armed, error) =
-        resolve_arm(desired, previous, permission, |d| crate::config::save_hid_enabled(app, d));
+    let (armed, error) = resolve_arm(desired, previous, permission, |d| {
+        crate::config::save_hid_enabled(app, d)
+    });
 
     state.arm_state().set_armed(armed);
     state.record_error(error.clone());
@@ -432,7 +447,10 @@ pub fn apply_hid_armed(app: &AppHandle, desired: bool, via: &str) -> HidArmedSta
             if armed { "armed" } else { "disarmed" }
         ),
         Some(err) => {
-            log::error!("input: arm={desired} refused/failed (via {via}): {} ({err})", err.kind())
+            log::error!(
+                "input: arm={desired} refused/failed (via {via}): {} ({err})",
+                err.kind()
+            )
         }
     }
 
@@ -464,7 +482,10 @@ pub fn apply_hid_run_mode(app: &AppHandle, desired: HidRunMode, via: &str) -> Hi
     match &error {
         None => log::info!("input: HID run mode = {mode:?} (via {via})"),
         Some(err) => {
-            log::error!("input: mode={desired:?} refused/failed (via {via}): {} ({err})", err.kind())
+            log::error!(
+                "input: mode={desired:?} refused/failed (via {via}): {} ({err})",
+                err.kind()
+            )
         }
     }
 
@@ -494,7 +515,9 @@ pub fn apply_persisted_hid_armed(app: &AppHandle) {
             persisted
         };
         state.arm_state().set_mode(mode);
-        log::info!("input: applied persisted HID run mode (persisted={persisted:?}, mode={mode:?})");
+        log::info!(
+            "input: applied persisted HID run mode (persisted={persisted:?}, mode={mode:?})"
+        );
     }
 }
 
@@ -587,7 +610,8 @@ mod tests {
         }
 
         fn request_permission(&self) -> bool {
-            self.prompt_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.prompt_requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self.permission.granted
         }
 
@@ -608,13 +632,25 @@ mod tests {
 
     #[test]
     fn permission_is_a_backend_passthrough_value() {
-        let (state, _) = state_with(InputPermission { granted: false, supported: true });
-        assert_eq!(state.permission(), InputPermission { granted: false, supported: true });
+        let (state, _) = state_with(InputPermission {
+            granted: false,
+            supported: true,
+        });
+        assert_eq!(
+            state.permission(),
+            InputPermission {
+                granted: false,
+                supported: true
+            }
+        );
     }
 
     #[tokio::test]
     async fn backend_handle_reaches_the_same_backend() {
-        let (state, backend) = state_with(InputPermission { granted: true, supported: true });
+        let (state, backend) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
         // The Arc the executor will hold must dispatch to the state's backend.
         state
             .backend()
@@ -646,14 +682,23 @@ mod tests {
         // explicit Settings choice (D038/R019). The machine stays disarmed even
         // when the grant is present.
         use std::sync::atomic::Ordering;
-        let (state, backend) = state_with(InputPermission { granted: true, supported: true });
+        let (state, backend) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
         assert!(!state.armed(), "precondition: disarmed by default");
         let result = state.request_permission();
         assert!(
             backend.prompt_requested.load(Ordering::SeqCst),
             "a supported backend must be prompted during onboarding"
         );
-        assert_eq!(result, InputPermission { granted: true, supported: true });
+        assert_eq!(
+            result,
+            InputPermission {
+                granted: true,
+                supported: true
+            }
+        );
         assert!(
             !state.armed(),
             "requesting the Accessibility grant must never arm HID (D038)"
@@ -664,19 +709,31 @@ mod tests {
     fn input_state_is_disarmed_by_default() {
         // A freshly constructed managed state must never advertise armed — HID
         // is armed only by the explicit persisted Settings choice.
-        let (state, _) = state_with(InputPermission { granted: true, supported: true });
-        assert!(!state.armed(), "InputState must default to disarmed regardless of permission");
+        let (state, _) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
+        assert!(
+            !state.armed(),
+            "InputState must default to disarmed regardless of permission"
+        );
     }
 
     #[test]
     fn arm_state_handle_shares_the_same_flag() {
         // The Arc the executor's InputTool holds must observe the applier's
         // mutation through the state — one shared holder, no re-mount.
-        let (state, _) = state_with(InputPermission { granted: true, supported: true });
+        let (state, _) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
         let handle = state.arm_state();
         assert!(!handle.armed());
         handle.set_armed(true);
-        assert!(state.armed(), "a mutation through the shared handle must be visible on the state");
+        assert!(
+            state.armed(),
+            "a mutation through the shared handle must be visible on the state"
+        );
     }
 
     #[test]
@@ -697,18 +754,27 @@ mod tests {
         let (armed, error) = resolve_arm(
             true,
             false,
-            InputPermission { granted: false, supported: true },
+            InputPermission {
+                granted: false,
+                supported: true,
+            },
             |d| {
                 persisted = Some(d);
                 Ok(())
             },
         );
         assert!(!armed, "an ungranted arm must stay disarmed");
-        assert_eq!(persisted, None, "permission preflight must refuse before persisting");
+        assert_eq!(
+            persisted, None,
+            "permission preflight must refuse before persisting"
+        );
         let err = error.expect("a refused arm must surface a typed error, never a silent no-op");
         assert_eq!(err.kind(), "permission-denied");
         // The walkthrough matches on the serialized kind tag over IPC.
-        assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "permission-denied");
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["kind"],
+            "permission-denied"
+        );
     }
 
     #[test]
@@ -717,14 +783,21 @@ mod tests {
         let (armed, error) = resolve_arm(
             true,
             false,
-            InputPermission { granted: true, supported: true },
+            InputPermission {
+                granted: true,
+                supported: true,
+            },
             |d| {
                 persisted = Some(d);
                 Ok(())
             },
         );
         assert!(armed);
-        assert_eq!(persisted, Some(true), "a granted arm must persist the choice");
+        assert_eq!(
+            persisted,
+            Some(true),
+            "a granted arm must persist the choice"
+        );
         assert!(error.is_none());
     }
 
@@ -735,10 +808,16 @@ mod tests {
         let (armed, error) = resolve_arm(
             true,
             false,
-            InputPermission { granted: true, supported: true },
+            InputPermission {
+                granted: true,
+                supported: true,
+            },
             |_| Err("disk full at /settings.json".to_string()),
         );
-        assert!(!armed, "persist failure must roll back to the previous arm state");
+        assert!(
+            !armed,
+            "persist failure must roll back to the previous arm state"
+        );
         let err = error.expect("a persist failure must be surfaced, not swallowed");
         assert_eq!(err.kind(), "input-failed");
         assert_eq!(
@@ -755,23 +834,39 @@ mod tests {
         let (armed, error) = resolve_arm(
             false,
             true,
-            InputPermission { granted: false, supported: true },
+            InputPermission {
+                granted: false,
+                supported: true,
+            },
             |d| {
                 persisted = Some(d);
                 Ok(())
             },
         );
         assert!(!armed);
-        assert_eq!(persisted, Some(false), "disarm must persist off regardless of permission");
+        assert_eq!(
+            persisted,
+            Some(false),
+            "disarm must persist off regardless of permission"
+        );
         assert!(error.is_none(), "disarming is never a permission failure");
     }
 
     #[test]
     fn status_is_health_as_value_reflecting_arm_permission_and_error() {
-        let (state, _) = state_with(InputPermission { granted: true, supported: true });
+        let (state, _) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
         let status = state.status();
         assert!(!status.armed, "status defaults to disarmed");
-        assert_eq!(status.permission, InputPermission { granted: true, supported: true });
+        assert_eq!(
+            status.permission,
+            InputPermission {
+                granted: true,
+                supported: true
+            }
+        );
         assert!(status.error.is_none());
 
         state.arm_state().set_armed(true);
@@ -807,7 +902,10 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn open_input_settings_off_macos_is_typed_unsupported() {
-        assert_eq!(open_input_settings_impl().unwrap_err().kind(), "unsupported");
+        assert_eq!(
+            open_input_settings_impl().unwrap_err().kind(),
+            "unsupported"
+        );
     }
 
     use crate::input::ActionKind;
@@ -886,7 +984,10 @@ mod tests {
 
         wl.allow(ActionKind::KeyPress);
         assert!(wl.contains(ActionKind::KeyPress), "allow must add the kind");
-        assert!(!wl.contains(ActionKind::MouseMove), "allow adds only the named kind");
+        assert!(
+            !wl.contains(ActionKind::MouseMove),
+            "allow adds only the named kind"
+        );
 
         // Idempotent — allowing the same kind twice is one grant.
         wl.allow(ActionKind::KeyPress);
@@ -894,7 +995,10 @@ mod tests {
 
         wl.clear();
         assert!(wl.is_empty(), "session-clear must empty the whitelist");
-        assert!(!wl.contains(ActionKind::KeyPress), "a cleared kind prompts again");
+        assert!(
+            !wl.contains(ActionKind::KeyPress),
+            "a cleared kind prompts again"
+        );
         // After clear, that kind resolves back to Prompt in Ask mode.
         assert_eq!(
             resolve_approval(HidRunMode::Ask, ActionKind::KeyPress, &wl),
@@ -938,17 +1042,30 @@ mod tests {
             let (mode, error) = resolve_run_mode(
                 desired,
                 HidRunMode::Off,
-                InputPermission { granted: false, supported: true },
+                InputPermission {
+                    granted: false,
+                    supported: true,
+                },
                 |m| {
                     persisted = Some(m);
                     Ok(())
                 },
             );
-            assert_eq!(mode, HidRunMode::Off, "an ungranted {desired:?} must stay Off");
-            assert_eq!(persisted, None, "permission preflight must refuse before persisting");
+            assert_eq!(
+                mode,
+                HidRunMode::Off,
+                "an ungranted {desired:?} must stay Off"
+            );
+            assert_eq!(
+                persisted, None,
+                "permission preflight must refuse before persisting"
+            );
             let err = error.expect("a refused select must surface a typed error");
             assert_eq!(err.kind(), "permission-denied");
-            assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "permission-denied");
+            assert_eq!(
+                serde_json::to_value(&err).unwrap()["kind"],
+                "permission-denied"
+            );
         }
     }
 
@@ -959,14 +1076,21 @@ mod tests {
             let (mode, error) = resolve_run_mode(
                 desired,
                 HidRunMode::Off,
-                InputPermission { granted: true, supported: true },
+                InputPermission {
+                    granted: true,
+                    supported: true,
+                },
                 |m| {
                     persisted = Some(m);
                     Ok(())
                 },
             );
             assert_eq!(mode, desired);
-            assert_eq!(persisted, Some(desired), "a granted select must persist the mode");
+            assert_eq!(
+                persisted,
+                Some(desired),
+                "a granted select must persist the mode"
+            );
             assert!(error.is_none());
         }
     }
@@ -979,15 +1103,25 @@ mod tests {
         let (mode, error) = resolve_run_mode(
             HidRunMode::Off,
             HidRunMode::Ask,
-            InputPermission { granted: false, supported: true },
+            InputPermission {
+                granted: false,
+                supported: true,
+            },
             |m| {
                 persisted = Some(m);
                 Ok(())
             },
         );
         assert_eq!(mode, HidRunMode::Off);
-        assert_eq!(persisted, Some(HidRunMode::Off), "Off must persist regardless of permission");
-        assert!(error.is_none(), "selecting Off is never a permission failure");
+        assert_eq!(
+            persisted,
+            Some(HidRunMode::Off),
+            "Off must persist regardless of permission"
+        );
+        assert!(
+            error.is_none(),
+            "selecting Off is never a permission failure"
+        );
     }
 
     #[test]
@@ -997,10 +1131,17 @@ mod tests {
         let (mode, error) = resolve_run_mode(
             HidRunMode::AutoRun,
             HidRunMode::Ask,
-            InputPermission { granted: true, supported: true },
+            InputPermission {
+                granted: true,
+                supported: true,
+            },
             |_| Err("disk full at /settings.json".to_string()),
         );
-        assert_eq!(mode, HidRunMode::Ask, "persist failure must roll back to the previous mode");
+        assert_eq!(
+            mode,
+            HidRunMode::Ask,
+            "persist failure must roll back to the previous mode"
+        );
         let err = error.expect("a persist failure must be surfaced, not swallowed");
         assert_eq!(err.kind(), "input-failed");
         assert_eq!(
@@ -1013,8 +1154,15 @@ mod tests {
     fn status_carries_the_run_mode_for_the_selector() {
         // The hid://state broadcast now carries `mode` so the Settings selector
         // renders the persisted three-way choice, not just the boolean.
-        let (state, _) = state_with(InputPermission { granted: true, supported: true });
-        assert_eq!(state.status().mode, HidRunMode::Off, "status defaults to Off");
+        let (state, _) = state_with(InputPermission {
+            granted: true,
+            supported: true,
+        });
+        assert_eq!(
+            state.status().mode,
+            HidRunMode::Off,
+            "status defaults to Off"
+        );
         let v = serde_json::to_value(state.status()).unwrap();
         assert_eq!(v["mode"], "off");
         assert_eq!(v["armed"], false);
@@ -1022,7 +1170,10 @@ mod tests {
         state.arm_state().set_mode(HidRunMode::AutoRun);
         let status = state.status();
         assert_eq!(status.mode, HidRunMode::AutoRun);
-        assert!(status.armed, "an active mode reports armed for the S03 surface");
+        assert!(
+            status.armed,
+            "an active mode reports armed for the S03 surface"
+        );
         assert_eq!(serde_json::to_value(&status).unwrap()["mode"], "auto-run");
     }
 
@@ -1032,7 +1183,10 @@ mod tests {
         // safe default a missing/garbage value falls back to.
         assert_eq!(serde_json::to_value(HidRunMode::Off).unwrap(), "off");
         assert_eq!(serde_json::to_value(HidRunMode::Ask).unwrap(), "ask");
-        assert_eq!(serde_json::to_value(HidRunMode::AutoRun).unwrap(), "auto-run");
+        assert_eq!(
+            serde_json::to_value(HidRunMode::AutoRun).unwrap(),
+            "auto-run"
+        );
         assert_eq!(HidRunMode::default(), HidRunMode::Off);
         // Round-trips through the wire form.
         for mode in [HidRunMode::Off, HidRunMode::Ask, HidRunMode::AutoRun] {

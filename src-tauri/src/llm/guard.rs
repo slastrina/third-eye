@@ -190,7 +190,10 @@ impl GuardState {
             redactions: DetectionKind::ALL
                 .into_iter()
                 .filter(|kind| self.redaction_count(*kind) > 0)
-                .map(|kind| Detection { kind, count: self.redaction_count(kind) })
+                .map(|kind| Detection {
+                    kind,
+                    count: self.redaction_count(kind),
+                })
                 .collect(),
             blocked_count: self.blocked_count(),
             last_block_reason: self.last_block_reason(),
@@ -222,7 +225,10 @@ pub struct GuardTelemetry {
 /// text), build the typed error, and record it in [`GuardState`].
 fn block(state: &GuardState, endpoint: &str, reason: GuardBlockReason) -> LlmError {
     log::warn!("guard: blocked endpoint={endpoint} reason={reason}");
-    let err = LlmError::GuardBlocked { endpoint: endpoint.to_string(), reason };
+    let err = LlmError::GuardBlocked {
+        endpoint: endpoint.to_string(),
+        reason,
+    };
     state.record_block(reason, &err);
     err
 }
@@ -246,7 +252,11 @@ fn guard_chat_request(
     redact: Redactor<'_>,
 ) -> Result<ChatRequest, LlmError> {
     if request.messages.iter().any(|m| !m.attachments.is_empty()) {
-        return Err(block(state, endpoint, GuardBlockReason::AttachmentUnredactable));
+        return Err(block(
+            state,
+            endpoint,
+            GuardBlockReason::AttachmentUnredactable,
+        ));
     }
     let mut guarded = request.clone();
     let mut counts = [0usize; 3];
@@ -297,7 +307,10 @@ fn collect_detections(counts: &[usize; 3]) -> Vec<Detection> {
     DetectionKind::ALL
         .into_iter()
         .filter(|kind| counts[kind_index(*kind)] > 0)
-        .map(|kind| Detection { kind, count: counts[kind_index(kind)] })
+        .map(|kind| Detection {
+            kind,
+            count: counts[kind_index(kind)],
+        })
         .collect()
 }
 
@@ -314,7 +327,11 @@ pub struct GuardedClient {
 impl GuardedClient {
     pub fn new(inner: Arc<dyn LlmClient>, state: Arc<GuardState>) -> Self {
         let trust = EndpointTrust::classify(inner.endpoint());
-        Self { inner, trust, state }
+        Self {
+            inner,
+            trust,
+            state,
+        }
     }
 
     pub fn trust(&self) -> EndpointTrust {
@@ -360,7 +377,9 @@ impl LlmClient for GuardedClient {
         // failing closed (never reaching the inner client on a block).
         match self.trust {
             EndpointTrust::Loopback => {
-                self.inner.stream_chat_reasoning(request, on_token, on_reasoning).await
+                self.inner
+                    .stream_chat_reasoning(request, on_token, on_reasoning)
+                    .await
             }
             EndpointTrust::External => {
                 let guarded = guard_chat_request(
@@ -369,7 +388,9 @@ impl LlmClient for GuardedClient {
                     request,
                     &privacy::redact,
                 )?;
-                self.inner.stream_chat_reasoning(&guarded, on_token, on_reasoning).await
+                self.inner
+                    .stream_chat_reasoning(&guarded, on_token, on_reasoning)
+                    .await
             }
         }
     }
@@ -390,7 +411,11 @@ pub struct GuardedEmbedder {
 impl GuardedEmbedder {
     pub fn new(inner: Arc<dyn Embedder>, state: Arc<GuardState>) -> Self {
         let trust = EndpointTrust::classify(inner.endpoint());
-        Self { inner, trust, state }
+        Self {
+            inner,
+            trust,
+            state,
+        }
     }
 
     pub fn trust(&self) -> EndpointTrust {
@@ -408,12 +433,8 @@ impl Embedder for GuardedEmbedder {
         match self.trust {
             EndpointTrust::Loopback => self.inner.embed(texts).await,
             EndpointTrust::External => {
-                let guarded = guard_embed_texts(
-                    &self.state,
-                    self.inner.endpoint(),
-                    texts,
-                    &privacy::redact,
-                )?;
+                let guarded =
+                    guard_embed_texts(&self.state, self.inner.endpoint(), texts, &privacy::redact)?;
                 self.inner.embed(&guarded).await
             }
         }
@@ -449,13 +470,13 @@ mod tests {
     #[test]
     fn everything_else_classifies_external_fail_closed() {
         for endpoint in [
-            "http://192.168.1.50:1234",   // LAN IP
-            "http://192.0.2.1:9",         // TEST-NET-1
-            "https://api.openai.com/v1",  // real domain
-            "http://127.0.0.1.evil.com",  // loopback-lookalike domain
-            "http://[::ffff:7f00:1]:80",  // IPv4-mapped loopback is not ::1
+            "http://192.168.1.50:1234",     // LAN IP
+            "http://192.0.2.1:9",           // TEST-NET-1
+            "https://api.openai.com/v1",    // real domain
+            "http://127.0.0.1.evil.com",    // loopback-lookalike domain
+            "http://[::ffff:7f00:1]:80",    // IPv4-mapped loopback is not ::1
             "http://my-macbook.local:1234", // could resolve to loopback — no DNS
-            "localhost:1234",             // no scheme: parses as scheme, host None
+            "localhost:1234",               // no scheme: parses as scheme, host None
             "not a url",
             "",
         ] {
@@ -499,11 +520,18 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.seen.lock().unwrap() = Some(request.clone());
             on_token("ok");
-            Ok(StreamOutcome { text: "ok".into(), token_count: 1, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: "ok".into(),
+                token_count: 1,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint.clone() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint.clone(),
+            }
         }
     }
 
@@ -529,7 +557,9 @@ mod tests {
         assert_eq!(client.trust(), EndpointTrust::Loopback);
         // Secrets and attachments both survive untouched on loopback.
         let req = request(vec![ChatMessage::user("password: hunter2")
-            .with_attachments(vec![Attachment { base64_png: "QUJD".into() }])]);
+            .with_attachments(vec![Attachment {
+                base64_png: "QUJD".into(),
+            }])]);
         let outcome = client.stream_chat(&req, &|_| {}).await.unwrap();
         assert_eq!(outcome.text, "ok");
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
@@ -545,19 +575,27 @@ mod tests {
         let (client, inner, state) = guarded(EXTERNAL);
         assert_eq!(client.trust(), EndpointTrust::External);
         let req = request(vec![ChatMessage::user("what is on my screen?")
-            .with_attachments(vec![Attachment { base64_png: "QUJD".into() }])]);
+            .with_attachments(vec![Attachment {
+                base64_png: "QUJD".into(),
+            }])]);
         let err = client.stream_chat(&req, &|_| {}).await.unwrap_err();
         assert_eq!(err.kind(), "guard-blocked");
         assert_eq!(err.endpoint(), EXTERNAL);
         assert!(matches!(
             err,
-            LlmError::GuardBlocked { reason: GuardBlockReason::AttachmentUnredactable, .. }
+            LlmError::GuardBlocked {
+                reason: GuardBlockReason::AttachmentUnredactable,
+                ..
+            }
         ));
         // The inner client is the only socket-writing component: zero calls
         // proves the block happened before any socket write.
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.blocked_count(), 1);
-        assert_eq!(state.last_block_reason(), Some(GuardBlockReason::AttachmentUnredactable));
+        assert_eq!(
+            state.last_block_reason(),
+            Some(GuardBlockReason::AttachmentUnredactable)
+        );
         assert_eq!(state.last_error().unwrap().kind(), "guard-blocked");
     }
 
@@ -570,11 +608,17 @@ mod tests {
         let err = client.stream_chat(&req, &|_| {}).await.unwrap_err();
         assert!(matches!(
             err,
-            LlmError::GuardBlocked { reason: GuardBlockReason::LowConfidence, .. }
+            LlmError::GuardBlocked {
+                reason: GuardBlockReason::LowConfidence,
+                ..
+            }
         ));
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.blocked_count(), 1);
-        assert_eq!(state.last_block_reason(), Some(GuardBlockReason::LowConfidence));
+        assert_eq!(
+            state.last_block_reason(),
+            Some(GuardBlockReason::LowConfidence)
+        );
     }
 
     #[test]
@@ -593,10 +637,16 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            LlmError::GuardBlocked { reason: GuardBlockReason::RedactionFailed, .. }
+            LlmError::GuardBlocked {
+                reason: GuardBlockReason::RedactionFailed,
+                ..
+            }
         ));
         assert_eq!(state.blocked_count(), 1);
-        assert_eq!(state.last_block_reason(), Some(GuardBlockReason::RedactionFailed));
+        assert_eq!(
+            state.last_block_reason(),
+            Some(GuardBlockReason::RedactionFailed)
+        );
     }
 
     #[tokio::test]
@@ -711,15 +761,20 @@ mod tests {
         assert_eq!(embedder.trust(), EndpointTrust::Loopback);
         let texts = vec!["password: hunter2".to_string()];
         embedder.embed(&texts).await.unwrap();
-        assert_eq!(inner.seen.lock().unwrap().as_deref(), Some(texts.as_slice()));
+        assert_eq!(
+            inner.seen.lock().unwrap().as_deref(),
+            Some(texts.as_slice())
+        );
         assert_eq!(state.redaction_count(DetectionKind::Password), 0);
     }
 
     #[tokio::test]
     async fn external_embed_forwards_redacted_texts_and_counts() {
         let (embedder, inner, state) = guarded_embedder(EXTERNAL);
-        let texts =
-            vec!["password: hunter2".to_string(), "weekly meeting notes".to_string()];
+        let texts = vec![
+            "password: hunter2".to_string(),
+            "weekly meeting notes".to_string(),
+        ];
         let vectors = embedder.embed(&texts).await.unwrap();
         assert_eq!(vectors.len(), 2);
         let seen = inner.seen.lock().unwrap().clone().unwrap();
@@ -741,7 +796,10 @@ mod tests {
         assert_eq!(err.endpoint(), EXTERNAL);
         assert!(matches!(
             err,
-            LlmError::GuardBlocked { reason: GuardBlockReason::LowConfidence, .. }
+            LlmError::GuardBlocked {
+                reason: GuardBlockReason::LowConfidence,
+                ..
+            }
         ));
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.blocked_count(), 1);
@@ -752,11 +810,13 @@ mod tests {
         let state = GuardState::new();
         let failing: Redactor<'_> =
             &|_: &str| Err(RedactionError::PatternCompile { detector: "test" });
-        let err = guard_embed_texts(&state, EXTERNAL, &["hi".to_string()], failing)
-            .unwrap_err();
+        let err = guard_embed_texts(&state, EXTERNAL, &["hi".to_string()], failing).unwrap_err();
         assert!(matches!(
             err,
-            LlmError::GuardBlocked { reason: GuardBlockReason::RedactionFailed, .. }
+            LlmError::GuardBlocked {
+                reason: GuardBlockReason::RedactionFailed,
+                ..
+            }
         ));
         assert_eq!(state.blocked_count(), 1);
     }
@@ -767,10 +827,19 @@ mod tests {
     fn state_aggregates_redaction_counts_per_kind() {
         let state = GuardState::new();
         state.record_redactions(&[
-            Detection { kind: DetectionKind::Password, count: 2 },
-            Detection { kind: DetectionKind::ApiKey, count: 1 },
+            Detection {
+                kind: DetectionKind::Password,
+                count: 2,
+            },
+            Detection {
+                kind: DetectionKind::ApiKey,
+                count: 1,
+            },
         ]);
-        state.record_redactions(&[Detection { kind: DetectionKind::Password, count: 1 }]);
+        state.record_redactions(&[Detection {
+            kind: DetectionKind::Password,
+            count: 1,
+        }]);
         assert_eq!(state.redaction_count(DetectionKind::Password), 3);
         assert_eq!(state.redaction_count(DetectionKind::ApiKey), 1);
         assert_eq!(state.redaction_count(DetectionKind::Card), 0);
@@ -779,7 +848,10 @@ mod tests {
     #[test]
     fn snapshot_serializes_kinds_and_counts_only_camel_case() {
         let state = GuardState::new();
-        state.record_redactions(&[Detection { kind: DetectionKind::Card, count: 2 }]);
+        state.record_redactions(&[Detection {
+            kind: DetectionKind::Card,
+            count: 2,
+        }]);
         let err = block(&state, EXTERNAL, GuardBlockReason::LowConfidence);
         assert_eq!(err.kind(), "guard-blocked");
 
@@ -792,7 +864,10 @@ mod tests {
         assert_eq!(v["lastError"]["reason"], "low-confidence");
         // The whole snapshot never carries request text — only kinds/counts.
         let wire = v.to_string();
-        assert!(!wire.contains("detail"), "no free-text fields in telemetry: {wire}");
+        assert!(
+            !wire.contains("detail"),
+            "no free-text fields in telemetry: {wire}"
+        );
     }
 
     #[test]
@@ -821,13 +896,19 @@ mod tests {
     fn record_redactions_notifies_once_with_the_fresh_snapshot() {
         let state = GuardState::new();
         let seen = capturing_notifier(&state);
-        state.record_redactions(&[Detection { kind: DetectionKind::Password, count: 2 }]);
+        state.record_redactions(&[Detection {
+            kind: DetectionKind::Password,
+            count: 2,
+        }]);
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "one mutation, one notification");
         assert_eq!(
             seen[0].redactions,
-            vec![Detection { kind: DetectionKind::Password, count: 2 }]
+            vec![Detection {
+                kind: DetectionKind::Password,
+                count: 2
+            }]
         );
         assert_eq!(seen[0].blocked_count, 0);
     }
@@ -837,7 +918,10 @@ mod tests {
         let state = GuardState::new();
         let seen = capturing_notifier(&state);
         state.record_redactions(&[]);
-        assert!(seen.lock().unwrap().is_empty(), "clean forwards must not broadcast");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "clean forwards must not broadcast"
+        );
     }
 
     #[test]
@@ -853,7 +937,10 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].blocked_count, 1);
-        assert_eq!(seen[0].last_block_reason, Some(GuardBlockReason::LowConfidence));
+        assert_eq!(
+            seen[0].last_block_reason,
+            Some(GuardBlockReason::LowConfidence)
+        );
         assert_eq!(seen[0].last_error.as_ref().unwrap().kind(), "guard-blocked");
     }
 
@@ -862,7 +949,10 @@ mod tests {
         // Production before setup() (and every pre-S03 unit test) runs with
         // no notifier — mutations must be silent no-ops on the seam.
         let state = GuardState::new();
-        state.record_redactions(&[Detection { kind: DetectionKind::ApiKey, count: 1 }]);
+        state.record_redactions(&[Detection {
+            kind: DetectionKind::ApiKey,
+            count: 1,
+        }]);
         assert_eq!(state.redaction_count(DetectionKind::ApiKey), 1);
     }
 
@@ -881,7 +971,10 @@ mod tests {
         }));
         let err = block(&state, EXTERNAL, GuardBlockReason::RedactionFailed);
         assert_eq!(err.kind(), "guard-blocked");
-        state.record_redactions(&[Detection { kind: DetectionKind::Card, count: 1 }]);
+        state.record_redactions(&[Detection {
+            kind: DetectionKind::Card,
+            count: 1,
+        }]);
         assert_eq!(ok.load(Ordering::SeqCst), 2);
     }
 
@@ -894,7 +987,10 @@ mod tests {
         let seen = capturing_notifier(&state);
 
         client
-            .stream_chat(&request(vec![ChatMessage::user("password: hunter2")]), &|_| {})
+            .stream_chat(
+                &request(vec![ChatMessage::user("password: hunter2")]),
+                &|_| {},
+            )
             .await
             .unwrap();
         client
@@ -909,10 +1005,16 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(
             seen[0].redactions,
-            vec![Detection { kind: DetectionKind::Password, count: 1 }]
+            vec![Detection {
+                kind: DetectionKind::Password,
+                count: 1
+            }]
         );
         assert_eq!(seen[1].blocked_count, 1);
-        assert_eq!(seen[1].last_block_reason, Some(GuardBlockReason::LowConfidence));
+        assert_eq!(
+            seen[1].last_block_reason,
+            Some(GuardBlockReason::LowConfidence)
+        );
         // Kinds-and-counts only, even through the seam: no secret bytes.
         let wire = serde_json::to_string(&*seen).unwrap();
         assert!(!wire.contains("hunter2"));
@@ -921,15 +1023,24 @@ mod tests {
 
     #[test]
     fn block_reason_strings_are_kebab_case_pinned() {
-        assert_eq!(GuardBlockReason::AttachmentUnredactable.as_str(), "attachment-unredactable");
-        assert_eq!(GuardBlockReason::RedactionFailed.as_str(), "redaction-failed");
+        assert_eq!(
+            GuardBlockReason::AttachmentUnredactable.as_str(),
+            "attachment-unredactable"
+        );
+        assert_eq!(
+            GuardBlockReason::RedactionFailed.as_str(),
+            "redaction-failed"
+        );
         assert_eq!(GuardBlockReason::LowConfidence.as_str(), "low-confidence");
         for reason in [
             GuardBlockReason::AttachmentUnredactable,
             GuardBlockReason::RedactionFailed,
             GuardBlockReason::LowConfidence,
         ] {
-            assert_eq!(serde_json::to_value(reason).unwrap(), json!(reason.as_str()));
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                json!(reason.as_str())
+            );
             assert_eq!(reason.to_string(), reason.as_str());
         }
     }

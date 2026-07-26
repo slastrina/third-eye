@@ -35,8 +35,12 @@ pub const DEFAULT_SHORTCUT: &str = "super+shift+space";
 /// Preset shortcuts offered in the tray's Hotkey submenu. All must parse
 /// (unit-tested); the default is always among them so the user can rebind
 /// back without editing settings.json.
-pub const HOTKEY_PRESETS: [&str; 4] =
-    [DEFAULT_SHORTCUT, "alt+space", "ctrl+shift+space", "super+shift+k"];
+pub const HOTKEY_PRESETS: [&str; 4] = [
+    DEFAULT_SHORTCUT,
+    "alt+space",
+    "ctrl+shift+space",
+    "super+shift+k",
+];
 
 /// Human-readable menu label for a shortcut: macOS modifier symbols on
 /// macOS ("⌘⇧Space"), title-cased plus-joined tokens elsewhere
@@ -158,16 +162,22 @@ fn register(app: &AppHandle, shortcut_str: &str) -> HotkeyStatus {
         }
     };
 
-    let result = app.global_shortcut().on_shortcut(shortcut, |app, _shortcut, event| {
-        if event.state() == ShortcutState::Pressed {
-            on_hotkey_pressed(app);
-        }
-    });
+    let result = app
+        .global_shortcut()
+        .on_shortcut(shortcut, |app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                on_hotkey_pressed(app);
+            }
+        });
 
     match result {
         Ok(()) => {
             log::info!("hotkey: registered global shortcut '{shortcut_str}'");
-            HotkeyStatus { shortcut: shortcut_str.into(), registered: true, error: None }
+            HotkeyStatus {
+                shortcut: shortcut_str.into(),
+                registered: true,
+                error: None,
+            }
         }
         Err(e) => {
             let msg = format!(
@@ -175,7 +185,11 @@ fn register(app: &AppHandle, shortcut_str: &str) -> HotkeyStatus {
                  (likely already taken by another app): {e}"
             );
             log::error!("hotkey: {msg}");
-            HotkeyStatus { shortcut: shortcut_str.into(), registered: false, error: Some(msg) }
+            HotkeyStatus {
+                shortcut: shortcut_str.into(),
+                registered: false,
+                error: Some(msg),
+            }
         }
     }
 }
@@ -208,11 +222,13 @@ pub fn rebind(app: &AppHandle, state: &HotkeyState, new: &str) -> HotkeyStatus {
         }
     };
 
-    let registered = app.global_shortcut().on_shortcut(new_shortcut, |app, _shortcut, event| {
-        if event.state() == ShortcutState::Pressed {
-            on_hotkey_pressed(app);
-        }
-    });
+    let registered = app
+        .global_shortcut()
+        .on_shortcut(new_shortcut, |app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                on_hotkey_pressed(app);
+            }
+        });
     if let Err(e) = registered {
         let msg = format!(
             "rebind failed: shortcut '{new}' registration failed (likely \
@@ -256,7 +272,11 @@ pub fn rebind(app: &AppHandle, state: &HotkeyState, new: &str) -> HotkeyStatus {
     }
 
     log::info!("hotkey: rebound '{}' → '{new}'", old.shortcut);
-    *status = HotkeyStatus { shortcut: new.into(), registered: true, error: None };
+    *status = HotkeyStatus {
+        shortcut: new.into(),
+        registered: true,
+        error: None,
+    };
     status.clone()
 }
 
@@ -307,10 +327,7 @@ fn on_hotkey_pressed(app: &AppHandle) {
                 // broadcast `nudge://dismiss` (reason `summoned`) — the
                 // frontend swaps the banner for chat preloaded from the
                 // retained `nudge://show` payload (no new IPC, R005/D019).
-                crate::nudge::commands::dismiss_active(
-                    app,
-                    crate::nudge::DismissReason::Summoned,
-                );
+                crate::nudge::commands::dismiss_active(app, crate::nudge::DismissReason::Summoned);
                 log::info!(
                     "hotkey: summon-from-nudge latency: {:.2}ms (hotkey-press to input-ready, \
                      state={})",
@@ -410,7 +427,10 @@ mod tests {
     fn malformed_shortcut_strings_fail_to_parse() {
         // Negative surface for S05's user-configurable shortcuts.
         for bad in ["", "super+", "super+shift+notakey", "space+super"] {
-            assert!(bad.parse::<Shortcut>().is_err(), "expected parse failure: {bad:?}");
+            assert!(
+                bad.parse::<Shortcut>().is_err(),
+                "expected parse failure: {bad:?}"
+            );
         }
     }
 
@@ -452,7 +472,10 @@ mod tests {
 
     #[test]
     fn startup_uses_valid_persisted_shortcut() {
-        assert_eq!(startup_shortcut(Some("alt+space")), ("alt+space".into(), None));
+        assert_eq!(
+            startup_shortcut(Some("alt+space")),
+            ("alt+space".into(), None)
+        );
     }
 
     #[test]
@@ -469,8 +492,14 @@ mod tests {
             let (shortcut, error) = startup_shortcut(Some(bad));
             assert_eq!(shortcut, DEFAULT_SHORTCUT, "bad value: {bad:?}");
             let error = error.expect("fallback must be named");
-            assert!(error.contains(bad), "error must name the bad value: {error}");
-            assert!(error.contains(DEFAULT_SHORTCUT), "error must name the fallback: {error}");
+            assert!(
+                error.contains(bad),
+                "error must name the bad value: {error}"
+            );
+            assert!(
+                error.contains(DEFAULT_SHORTCUT),
+                "error must name the fallback: {error}"
+            );
         }
     }
 

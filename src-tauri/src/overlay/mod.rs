@@ -183,7 +183,10 @@ fn dispatch(app: &AppHandle, event: OverlayEvent) -> Result<OverlayState, String
     });
     if let Err(err) = result {
         manager.restore(from);
-        log::error!("overlay: {event:?} failed, state restored to {}: {err}", from.as_str());
+        log::error!(
+            "overlay: {event:?} failed, state restored to {}: {err}",
+            from.as_str()
+        );
         return Err(err);
     }
 
@@ -232,7 +235,13 @@ mod tests {
     #[test]
     fn show_while_visible_is_rejected() {
         let err = VisibleIdle.apply(Show).unwrap_err();
-        assert_eq!(err, InvalidTransition { from: VisibleIdle, event: Show });
+        assert_eq!(
+            err,
+            InvalidTransition {
+                from: VisibleIdle,
+                event: Show
+            }
+        );
         assert!(VisibleFocused.apply(Show).is_err());
     }
 

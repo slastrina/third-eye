@@ -36,7 +36,10 @@ pub fn apply_nudges_enabled(app: &AppHandle, desired: bool, via: &str) -> NudgeS
     match crate::config::save_nudges_enabled(app, desired) {
         Ok(()) => {
             state.set_persist_error(None);
-            log::info!("nudge: {} (via {via})", if desired { "enabled" } else { "disabled" });
+            log::info!(
+                "nudge: {} (via {via})",
+                if desired { "enabled" } else { "disabled" }
+            );
         }
         Err(e) => {
             state.set_enabled(previous);

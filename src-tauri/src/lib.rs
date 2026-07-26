@@ -10,18 +10,20 @@ pub mod cloud;
 pub mod config;
 #[cfg(desktop)]
 pub mod hotkey;
+#[cfg(desktop)]
+pub mod hud;
 pub mod input;
 pub mod llm;
 #[cfg(desktop)]
 pub mod memory;
-#[cfg(desktop)]
+pub mod memory_window;
 pub mod nudge;
 pub mod ocr;
 #[cfg(desktop)]
 pub mod onboarding;
 pub mod overlay;
-pub mod screenquery;
 pub mod privacy;
+pub mod screenquery;
 pub mod settings_window;
 #[cfg(desktop)]
 pub mod tray;
@@ -44,7 +46,11 @@ pub fn run() {
         let mut builder =
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"));
         if let Ok(path) = std::env::var("THIRD_EYE_LOG_FILE") {
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 Ok(file) => {
                     builder.target(env_logger::Target::Pipe(Box::new(file)));
                 }
@@ -161,6 +167,11 @@ pub fn run() {
         // setup() before the tray builds.
         .manage(capture::PrivacyState::new())
         .invoke_handler(tauri::generate_handler![
+            hud::show_hud,
+            hud::hide_hud,
+            hud::fit_hud_canvas,
+            #[cfg(desktop)]
+            tray::hide_tray_panel,
             overlay::show_overlay,
             overlay::hide_overlay,
             overlay::focus_overlay,
@@ -210,9 +221,13 @@ pub fn run() {
             memory::commands::memory_wipe,
             memory::commands::memory_status,
             memory::commands::set_chat_memory_enabled,
+            memory::commands::memory_retention,
+            memory::commands::set_memory_retention,
             nudge::commands::set_nudges_enabled,
             nudge::commands::nudge_status,
             settings_window::show_settings_window,
+            memory_window::show_memory_window,
+            memory_window::hide_memory_window,
             settings_window::hide_settings_window,
             cloud::commands::set_cloud_api_key,
             cloud::commands::delete_cloud_api_key,
@@ -259,6 +274,15 @@ pub fn run() {
             // overlay conversion — a settings window that activates the app
             // would break the Accessory contract.
             settings_window::init(app.handle())?;
+
+            // Memory window (2026-07 redesign): same fatal posture — it can
+            // become key for typing, so it must be a nonactivating panel.
+            memory_window::init(app.handle())?;
+
+            // HUD panels (2026-07 redesign): never-key nonactivating panels;
+            // same fatal posture — a HUD that could take key status would
+            // swallow the synthesized keystrokes it narrates.
+            hud::init(app.handle())?;
 
             // Registration failure is surfaced (logged + queryable state),
             // never fatal: the app still runs and IPC commands still work.
@@ -317,8 +341,16 @@ pub fn run() {
             // stays reachable via the hotkey and IPC; the cause is logged.
             #[cfg(desktop)]
             if let Err(e) = tray::init(app.handle()) {
-                log::error!("tray: build failed (non-fatal, hotkey still summons the overlay): {e}");
+                log::error!(
+                    "tray: build failed (non-fatal, hotkey still summons the overlay): {e}"
+                );
             }
+
+            // Tray-panel conversion IS fatal (overlay/settings posture): a
+            // plain window here would activate the app on click, breaking
+            // the Accessory contract.
+            #[cfg(desktop)]
+            tray::init_panel(app.handle())?;
 
             // Persisted lane pins (S07): a present settings.json key wins
             // over the THIRD_EYE_* env fallback the router booted with.
@@ -387,6 +419,12 @@ pub fn run() {
             #[cfg(desktop)]
             memory::ingest::spawn(app.handle());
 
+            // Retention enforcement (memoryRetention): prune expired
+            // memories once per launch, after the store is installed by
+            // ingest::spawn; also re-runs on every retention write.
+            #[cfg(desktop)]
+            memory::commands::apply_retention(app.handle());
+
             // Nudge detector (S05): the observation broadcast's second
             // consumer. Batches on a fixed interval, classifies via the
             // thin lane behind the pure gate, and shows the click-through
@@ -430,8 +468,9 @@ pub fn run() {
             // child spawned → no handle → a no-op.
             #[cfg(desktop)]
             if let tauri::RunEvent::Exit = event {
-                if let Some(token) =
-                    app_handle.state::<llm::mcp::McpState>().take_shutdown_handle()
+                if let Some(token) = app_handle
+                    .state::<llm::mcp::McpState>()
+                    .take_shutdown_handle()
                 {
                     token.cancel();
                     log::info!("llm: MCP server child cancelled cleanly on app exit");

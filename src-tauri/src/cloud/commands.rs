@@ -16,7 +16,9 @@ pub struct CloudKeysState {
 
 impl CloudKeysState {
     pub fn new() -> Self {
-        Self { store: KeyStore::new() }
+        Self {
+            store: KeyStore::new(),
+        }
     }
 
     /// The keystore handle — S03's client construction reads keys through
@@ -57,9 +59,12 @@ pub fn set_cloud_api_key(
     provider: CloudProvider,
     key: String,
 ) -> Result<CloudKeyStatus, CloudKeyError> {
-    state.store.set_key(provider, &key).map_err(|e| {
-        log::error!("cloud: set key failed for {} ({})", provider.account(), e.kind());
-        e
+    state.store.set_key(provider, &key).inspect_err(|e| {
+        log::error!(
+            "cloud: set key failed for {} ({})",
+            provider.account(),
+            e.kind()
+        );
     })?;
     status(&state.store)
 }
@@ -70,9 +75,12 @@ pub fn delete_cloud_api_key(
     state: State<CloudKeysState>,
     provider: CloudProvider,
 ) -> Result<CloudKeyStatus, CloudKeyError> {
-    state.store.delete_key(provider).map_err(|e| {
-        log::error!("cloud: delete key failed for {} ({})", provider.account(), e.kind());
-        e
+    state.store.delete_key(provider).inspect_err(|e| {
+        log::error!(
+            "cloud: delete key failed for {} ({})",
+            provider.account(),
+            e.kind()
+        );
     })?;
     status(&state.store)
 }
@@ -80,9 +88,8 @@ pub fn delete_cloud_api_key(
 /// IPC: presence snapshot for the Settings surface (S04 renders it).
 #[tauri::command]
 pub fn cloud_key_status(state: State<CloudKeysState>) -> Result<CloudKeyStatus, CloudKeyError> {
-    status(&state.store).map_err(|e| {
+    status(&state.store).inspect_err(|e| {
         log::error!("cloud: key status query failed ({})", e.kind());
-        e
     })
 }
 
@@ -95,7 +102,10 @@ mod tests {
     /// fails this test and forces a deliberate contract change.
     #[test]
     fn status_carries_presence_booleans_only() {
-        let s = CloudKeyStatus { openai_present: true, anthropic_present: false };
+        let s = CloudKeyStatus {
+            openai_present: true,
+            anthropic_present: false,
+        };
         let v = serde_json::to_value(s).unwrap();
         let obj = v.as_object().unwrap();
         assert_eq!(obj.len(), 2, "status must stay presence-only: {obj:?}");

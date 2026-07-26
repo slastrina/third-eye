@@ -103,7 +103,9 @@ pub fn classification_gate(
     if let Some(last) = last_nudge_at_ms {
         // try_from + saturate: an absurd configured cooldown clamps to
         // "forever" instead of wrapping negative and disabling rate limiting.
-        let cooldown_ms = i64::try_from(cooldown_secs).unwrap_or(i64::MAX).saturating_mul(1000);
+        let cooldown_ms = i64::try_from(cooldown_secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
         if now_ms.saturating_sub(last) < cooldown_ms {
             return Err(SkipReason::CoolingDown);
         }
@@ -150,7 +152,10 @@ pub fn classify_messages(batch: &[TextObservation]) -> Vec<ChatMessage> {
 /// nudge, as does any reply outside the contract (conservative: garbage
 /// never nudges). Messages are capped at [`MAX_MESSAGE_CHARS`].
 pub fn parse_nudge_verdict(text: &str) -> Option<String> {
-    let line = text.lines().map(strip_list_marker).find(|l| !l.is_empty())?;
+    let line = text
+        .lines()
+        .map(strip_list_marker)
+        .find(|l| !l.is_empty())?;
     let lower = line.to_lowercase();
     if lower == "no" || lower.starts_with("no.") || lower.starts_with("no,") {
         return None;
@@ -158,7 +163,10 @@ pub fn parse_nudge_verdict(text: &str) -> Option<String> {
     if !lower.starts_with("yes") {
         return None;
     }
-    let rest = line[3..].trim().trim_start_matches([':', ',', '-', '—', '.']).trim();
+    let rest = line[3..]
+        .trim()
+        .trim_start_matches([':', ',', '-', '—', '.'])
+        .trim();
     if rest.is_empty() {
         return None;
     }
@@ -171,8 +179,9 @@ fn strip_list_marker(line: &str) -> &str {
     let l = line.trim().trim_start_matches(['-', '*', '•']).trim_start();
     let digits = l.chars().take_while(char::is_ascii_digit).count();
     if digits > 0 {
-        if let Some(rest) =
-            l[digits..].strip_prefix('.').or_else(|| l[digits..].strip_prefix(')'))
+        if let Some(rest) = l[digits..]
+            .strip_prefix('.')
+            .or_else(|| l[digits..].strip_prefix(')'))
         {
             return rest.trim();
         }
@@ -509,7 +518,10 @@ pub async fn classification_round(
         batch.len()
     );
     let messages = classify_messages(batch);
-    match client.stream_chat(&ChatRequest::new(messages), &|_| {}).await {
+    match client
+        .stream_chat(&ChatRequest::new(messages), &|_| {})
+        .await
+    {
         Ok(outcome) => match parse_nudge_verdict(&outcome.text) {
             Some(message) => {
                 let trigger = batch.last().expect("gate rejects empty batches");
@@ -622,7 +634,10 @@ async fn fetch_memory_context(app: &AppHandle, screen_text: &str) -> Vec<String>
     match crate::memory::search(&store, embedder.as_ref(), &query, MEMORY_CONTEXT_LIMIT).await {
         Ok(outcome) => outcome.results.into_iter().map(|r| r.summary).collect(),
         Err(e) => {
-            log::warn!("nudge: memory context lookup failed ({}); nudging without it: {e}", e.kind());
+            log::warn!(
+                "nudge: memory context lookup failed ({}); nudging without it: {e}",
+                e.kind()
+            );
             Vec::new()
         }
     }
@@ -681,12 +696,18 @@ fn auto_dismiss(app: &AppHandle) {
         log::error!("nudge: auto-dismiss hide failed: {e}");
     }
     commands::emit_state(app, nudge_state.status());
-    log::info!("nudge: auto-dismissed ({})", DismissReason::AutoTimeout.as_str());
+    log::info!(
+        "nudge: auto-dismissed ({})",
+        DismissReason::AutoTimeout.as_str()
+    );
 }
 
 /// Milliseconds since the Unix epoch — cooldown stamps and `nudge://show`.
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -696,7 +717,11 @@ mod tests {
     use OverlayState::*;
 
     fn obs(text: &str, app: Option<&str>, at: u64) -> TextObservation {
-        TextObservation { text: text.into(), app_context: app.map(Into::into), captured_at: at }
+        TextObservation {
+            text: text.into(),
+            app_context: app.map(Into::into),
+            captured_at: at,
+        }
     }
 
     fn payload() -> NudgePayload {
@@ -713,7 +738,10 @@ mod tests {
 
     #[test]
     fn gate_passes_when_enabled_hidden_cooled_and_batched() {
-        assert_eq!(classification_gate(true, Hidden, None, 1_000, 300, 3), Ok(()));
+        assert_eq!(
+            classification_gate(true, Hidden, None, 1_000, 300, 3),
+            Ok(())
+        );
         // A prior nudge older than the cooldown does not suppress.
         assert_eq!(
             classification_gate(true, Hidden, Some(0), 300_000, 300, 1),
@@ -780,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_survives_a_huge_cooldown_without_overflow(){
+    fn gate_survives_a_huge_cooldown_without_overflow() {
         // u64::MAX seconds * 1000 must saturate, not wrap into "elapsed".
         assert_eq!(
             classification_gate(true, Hidden, Some(0), i64::MAX - 1, u64::MAX, 1),
@@ -801,7 +829,10 @@ mod tests {
     #[test]
     fn classify_messages_label_apps_and_truncate_long_text() {
         let long = "x".repeat(SNIPPET_MAX_CHARS * 2);
-        let batch = vec![obs("cargo build failed", Some("Terminal"), 1), obs(&long, None, 2)];
+        let batch = vec![
+            obs("cargo build failed", Some("Terminal"), 1),
+            obs(&long, None, 2),
+        ];
         let messages = classify_messages(&batch);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, Role::System);
@@ -888,25 +919,50 @@ mod tests {
         let v = serde_json::to_value(payload()).unwrap();
         assert_eq!(v["kind"], "nudge");
         assert_eq!(v["message"], "Stuck on that borrow error? I can help.");
-        assert_eq!(v["screenText"], "error[E0502]: cannot borrow `buf` as mutable");
+        assert_eq!(
+            v["screenText"],
+            "error[E0502]: cannot borrow `buf` as mutable"
+        );
         assert_eq!(v["appContext"], "Zed");
         assert_eq!(v["capturedAtMs"], 1_752_900_000_000i64);
-        assert_eq!(v["memoryContext"][0], "User debugged the ingest pipeline in Rust.");
+        assert_eq!(
+            v["memoryContext"][0],
+            "User debugged the ingest pipeline in Rust."
+        );
         let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(
             keys,
-            ["appContext", "capturedAtMs", "kind", "memoryContext", "message", "screenText"],
+            [
+                "appContext",
+                "capturedAtMs",
+                "kind",
+                "memoryContext",
+                "message",
+                "screenText"
+            ],
             "unexpected field set: {keys:?}"
         );
     }
 
     #[test]
     fn dismiss_reasons_serialize_kebab_case() {
-        assert_eq!(serde_json::to_value(DismissReason::AutoTimeout).unwrap(), "auto-timeout");
-        assert_eq!(serde_json::to_value(DismissReason::Summoned).unwrap(), "summoned");
-        assert_eq!(serde_json::to_value(DismissReason::Disabled).unwrap(), "disabled");
-        assert_eq!(serde_json::to_value(DismissReason::Hidden).unwrap(), "hidden");
+        assert_eq!(
+            serde_json::to_value(DismissReason::AutoTimeout).unwrap(),
+            "auto-timeout"
+        );
+        assert_eq!(
+            serde_json::to_value(DismissReason::Summoned).unwrap(),
+            "summoned"
+        );
+        assert_eq!(
+            serde_json::to_value(DismissReason::Disabled).unwrap(),
+            "disabled"
+        );
+        assert_eq!(
+            serde_json::to_value(DismissReason::Hidden).unwrap(),
+            "hidden"
+        );
         assert_eq!(DismissReason::AutoTimeout.as_str(), "auto-timeout");
     }
 
@@ -915,7 +971,10 @@ mod tests {
     #[test]
     fn state_defaults_to_enabled_with_nothing_active() {
         let state = NudgeState::new();
-        assert!(state.enabled(), "D019: default on — the off-switch is the feature");
+        assert!(
+            state.enabled(),
+            "D019: default on — the off-switch is the feature"
+        );
         assert!(!state.nudge_active());
         assert!(state.active().is_none());
     }
@@ -941,7 +1000,10 @@ mod tests {
         assert_eq!(state.active().unwrap().message, payload().message);
         let status = state.status();
         assert_eq!(status.last_nudge_at_ms, Some(1234));
-        assert!(status.last_error.is_none(), "a shown nudge is a success — error cleared");
+        assert!(
+            status.last_error.is_none(),
+            "a shown nudge is a success — error cleared"
+        );
     }
 
     #[test]
@@ -967,7 +1029,11 @@ mod tests {
         state.record_no_nudge();
         let status = state.status();
         assert!(status.last_error.is_none());
-        assert_eq!(status.last_nudge_at_ms, Some(77), "a NO verdict must not reset cooldown");
+        assert_eq!(
+            status.last_nudge_at_ms,
+            Some(77),
+            "a NO verdict must not reset cooldown"
+        );
     }
 
     #[test]
@@ -1016,7 +1082,10 @@ mod tests {
         for i in 0..3 {
             assert!(!push_bounded(&mut batch, obs(&format!("t{i}"), None, i), 3));
         }
-        assert!(push_bounded(&mut batch, obs("t3", None, 3), 3), "cap reached → drop");
+        assert!(
+            push_bounded(&mut batch, obs("t3", None, 3), 3),
+            "cap reached → drop"
+        );
         assert_eq!(batch.len(), 3);
         assert_eq!(batch.first().unwrap().text, "t1", "oldest must be gone");
         assert_eq!(batch.last().unwrap().text, "t3");
@@ -1030,7 +1099,10 @@ mod tests {
         assert!(!auto_dismiss_should_fire(true, VisibleFocused));
         assert!(!auto_dismiss_should_fire(true, Hidden));
         for overlay in [Hidden, VisibleIdle, VisibleFocused] {
-            assert!(!auto_dismiss_should_fire(false, overlay), "overlay {overlay:?}");
+            assert!(
+                !auto_dismiss_should_fire(false, overlay),
+                "overlay {overlay:?}"
+            );
         }
     }
 
@@ -1093,11 +1165,18 @@ mod tests {
                     detail: "connection refused".into(),
                 });
             }
-            Ok(StreamOutcome { text: self.reply.clone(), token_count: 1, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: self.reply.clone(),
+                token_count: 1,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
@@ -1106,7 +1185,9 @@ mod tests {
     }
 
     fn batch_of(n: usize) -> Vec<TextObservation> {
-        (0..n).map(|i| obs(&format!("observation {i}"), Some("Zed"), 1000 + i as u64)).collect()
+        (0..n)
+            .map(|i| obs(&format!("observation {i}"), Some("Zed"), 1000 + i as u64))
+            .collect()
     }
 
     #[tokio::test]
@@ -1115,11 +1196,20 @@ mod tests {
         state.set_enabled(false);
         let client = ScriptedClient::ok("YES: never sent");
         let outcome = classification_round(
-            &state, &thin_router(client.clone()), &batch_of(3), Hidden, 1_000, 300,
+            &state,
+            &thin_router(client.clone()),
+            &batch_of(3),
+            Hidden,
+            1_000,
+            300,
         )
         .await;
         assert_eq!(outcome, RoundOutcome::Skipped(SkipReason::Disabled));
-        assert_eq!(client.calls(), 0, "a suppressed round costs zero thin-lane tokens");
+        assert_eq!(
+            client.calls(),
+            0,
+            "a suppressed round costs zero thin-lane tokens"
+        );
         assert_eq!(state.status().suppressed.disabled, 1);
         assert!(!state.nudge_active());
     }
@@ -1129,14 +1219,25 @@ mod tests {
         let state = NudgeState::new();
         let client = ScriptedClient::failing();
         let outcome = classification_round(
-            &state, &thin_router(client), &batch_of(2), Hidden, 1_000, 300,
+            &state,
+            &thin_router(client),
+            &batch_of(2),
+            Hidden,
+            1_000,
+            300,
         )
         .await;
         assert_eq!(outcome, RoundOutcome::Failed);
         assert!(!state.nudge_active(), "a failed round never shows a banner");
         let status = state.status();
-        assert_eq!(status.last_error.as_ref().map(|e| e.kind()), Some("offline"));
-        assert!(status.last_nudge_at_ms.is_none(), "failure must not stamp the cooldown");
+        assert_eq!(
+            status.last_error.as_ref().map(|e| e.kind()),
+            Some("offline")
+        );
+        assert!(
+            status.last_nudge_at_ms.is_none(),
+            "failure must not stamp the cooldown"
+        );
     }
 
     #[tokio::test]
@@ -1147,14 +1248,25 @@ mod tests {
             detail: "down".into(),
         });
         let outcome = classification_round(
-            &state, &thin_router(ScriptedClient::ok("NO")), &batch_of(2), Hidden, 1_000, 300,
+            &state,
+            &thin_router(ScriptedClient::ok("NO")),
+            &batch_of(2),
+            Hidden,
+            1_000,
+            300,
         )
         .await;
         assert_eq!(outcome, RoundOutcome::NoNudge);
         assert!(!state.nudge_active());
         let status = state.status();
-        assert!(status.last_error.is_none(), "a within-contract NO is a success");
-        assert!(status.last_nudge_at_ms.is_none(), "a NO verdict must not stamp the cooldown");
+        assert!(
+            status.last_error.is_none(),
+            "a within-contract NO is a success"
+        );
+        assert!(
+            status.last_nudge_at_ms.is_none(),
+            "a NO verdict must not stamp the cooldown"
+        );
     }
 
     #[tokio::test]
@@ -1164,7 +1276,12 @@ mod tests {
         let mut batch = batch_of(2);
         batch.push(obs("error[E0502]: cannot borrow", Some("Terminal"), 2_000));
         let outcome = classification_round(
-            &state, &thin_router(client.clone()), &batch, Hidden, 1_000, 300,
+            &state,
+            &thin_router(client.clone()),
+            &batch,
+            Hidden,
+            1_000,
+            300,
         )
         .await;
         let RoundOutcome::Nudge(payload) = outcome else {
@@ -1174,7 +1291,10 @@ mod tests {
         assert_eq!(payload.screen_text, "error[E0502]: cannot borrow");
         assert_eq!(payload.app_context.as_deref(), Some("Terminal"));
         assert_eq!(payload.captured_at_ms, 2_000);
-        assert!(payload.memory_context.is_empty(), "memory attaches later, best-effort");
+        assert!(
+            payload.memory_context.is_empty(),
+            "memory attaches later, best-effort"
+        );
         // Showing (and the cooldown stamp) is the loop's job after the show
         // side effect succeeds — the round itself arms nothing.
         assert!(!state.nudge_active());
@@ -1196,10 +1316,13 @@ mod tests {
         ]);
         router.set_active(HEAVY_LANE).unwrap();
         let state = NudgeState::new();
-        let outcome =
-            classification_round(&state, &router, &batch_of(2), Hidden, 1_000, 300).await;
+        let outcome = classification_round(&state, &router, &batch_of(2), Hidden, 1_000, 300).await;
         assert_eq!(outcome, RoundOutcome::NoNudge);
         assert_eq!(thin.calls(), 1, "classification must ride the thin lane");
-        assert_eq!(heavy.calls(), 0, "the user's active lane must never see nudge traffic");
+        assert_eq!(
+            heavy.calls(),
+            0,
+            "the user's active lane must never see nudge traffic"
+        );
     }
 }

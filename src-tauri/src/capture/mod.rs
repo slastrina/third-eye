@@ -37,7 +37,11 @@ use serde::Serialize;
 /// `privacy-mode`) and camelCase fields — the same IPC error contract shape
 /// as [`crate::llm::LlmError`]; the UI matches on `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum CaptureError {
     /// Screen Recording permission is not granted (TCC). The UI responds
     /// with the guided walkthrough, never a bare error string.
@@ -95,7 +99,10 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureError::PermissionDenied { detail } => {
-                write!(f, "capture permission-denied: Screen Recording not granted ({detail})")
+                write!(
+                    f,
+                    "capture permission-denied: Screen Recording not granted ({detail})"
+                )
             }
             CaptureError::NoDisplay { detail } => {
                 write!(f, "capture no-display: no display available ({detail})")
@@ -158,7 +165,10 @@ impl PrivacyState {
 
     /// Current status as health-as-value — never an error, safe to poll.
     pub fn status(&self) -> PrivacyStatus {
-        PrivacyStatus { enabled: self.enabled(), error: self.last_error.lock().unwrap().clone() }
+        PrivacyStatus {
+            enabled: self.enabled(),
+            error: self.last_error.lock().unwrap().clone(),
+        }
     }
 }
 
@@ -212,7 +222,10 @@ pub fn permission_status() -> CapturePermission {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        CapturePermission { granted: false, supported: false }
+        CapturePermission {
+            granted: false,
+            supported: false,
+        }
     }
 }
 
@@ -246,7 +259,10 @@ mod tests {
     #[async_trait]
     impl ScreenCapture for MockCapture {
         fn permission(&self) -> CapturePermission {
-            CapturePermission { granted: self.fail_with.is_none(), supported: true }
+            CapturePermission {
+                granted: self.fail_with.is_none(),
+                supported: true,
+            }
         }
 
         fn request_permission(&self) -> bool {
@@ -257,7 +273,11 @@ mod tests {
             if let Some(err) = &self.fail_with {
                 return Err(err.clone());
             }
-            Ok(CapturedFrame { width: 4, height: 2, base64_png: "cGl4ZWxz".into() })
+            Ok(CapturedFrame {
+                width: 4,
+                height: 2,
+                base64_png: "cGl4ZWxz".into(),
+            })
         }
     }
 
@@ -273,7 +293,9 @@ mod tests {
     #[tokio::test]
     async fn errors_propagate_through_dyn_with_kind() {
         let backend: Arc<dyn ScreenCapture> = Arc::new(MockCapture {
-            fail_with: Some(CaptureError::PermissionDenied { detail: "TCC denied".into() }),
+            fail_with: Some(CaptureError::PermissionDenied {
+                detail: "TCC denied".into(),
+            }),
         });
         let err = backend.capture_primary().await.unwrap_err();
         assert_eq!(err.kind(), "permission-denied");
@@ -283,25 +305,41 @@ mod tests {
     fn error_json_shape_is_the_ipc_contract() {
         // The UI matches on `kind` and reads camelCase fields; a change here
         // is a breaking IPC change and must be coordinated with src/chat.ts.
-        let denied = CaptureError::PermissionDenied { detail: "TCC denied".into() };
+        let denied = CaptureError::PermissionDenied {
+            detail: "TCC denied".into(),
+        };
         let v = serde_json::to_value(&denied).unwrap();
         assert_eq!(v["kind"], "permission-denied");
         assert_eq!(v["detail"], "TCC denied");
 
-        let no_display = CaptureError::NoDisplay { detail: "asleep".into() };
-        assert_eq!(serde_json::to_value(&no_display).unwrap()["kind"], "no-display");
+        let no_display = CaptureError::NoDisplay {
+            detail: "asleep".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&no_display).unwrap()["kind"],
+            "no-display"
+        );
 
-        let failed = CaptureError::CaptureFailed { detail: "stream error".into() };
-        assert_eq!(serde_json::to_value(&failed).unwrap()["kind"], "capture-failed");
+        let failed = CaptureError::CaptureFailed {
+            detail: "stream error".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap()["kind"],
+            "capture-failed"
+        );
 
-        let unsupported =
-            CaptureError::Unsupported { platform: "linux".into(), detail: "no backend".into() };
+        let unsupported = CaptureError::Unsupported {
+            platform: "linux".into(),
+            detail: "no backend".into(),
+        };
         let v = serde_json::to_value(&unsupported).unwrap();
         assert_eq!(v["kind"], "unsupported");
         assert_eq!(v["platform"], "linux");
         assert_eq!(v["detail"], "no backend");
 
-        let privacy = CaptureError::PrivacyMode { detail: "privacy on".into() };
+        let privacy = CaptureError::PrivacyMode {
+            detail: "privacy on".into(),
+        };
         let v = serde_json::to_value(&privacy).unwrap();
         assert_eq!(v["kind"], "privacy-mode");
         assert_eq!(v["detail"], "privacy on");
@@ -310,11 +348,22 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            CaptureError::PermissionDenied { detail: String::new() },
-            CaptureError::NoDisplay { detail: String::new() },
-            CaptureError::CaptureFailed { detail: String::new() },
-            CaptureError::Unsupported { platform: String::new(), detail: String::new() },
-            CaptureError::PrivacyMode { detail: String::new() },
+            CaptureError::PermissionDenied {
+                detail: String::new(),
+            },
+            CaptureError::NoDisplay {
+                detail: String::new(),
+            },
+            CaptureError::CaptureFailed {
+                detail: String::new(),
+            },
+            CaptureError::Unsupported {
+                platform: String::new(),
+                detail: String::new(),
+            },
+            CaptureError::PrivacyMode {
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -344,10 +393,18 @@ mod tests {
     #[test]
     fn privacy_status_carries_and_clears_the_last_persist_error() {
         let s = PrivacyState::new();
-        assert_eq!(s.status(), PrivacyStatus { enabled: false, error: None });
+        assert_eq!(
+            s.status(),
+            PrivacyStatus {
+                enabled: false,
+                error: None
+            }
+        );
 
         s.set_enabled(true);
-        s.record_error(Some("failed to persist privacyMode=true to /tmp/settings.json".into()));
+        s.record_error(Some(
+            "failed to persist privacyMode=true to /tmp/settings.json".into(),
+        ));
         let status = s.status();
         assert!(status.enabled);
         assert!(status.error.as_deref().unwrap().contains("privacyMode"));
@@ -359,7 +416,11 @@ mod tests {
 
     #[test]
     fn privacy_status_serializes_camel_case() {
-        let v = serde_json::to_value(PrivacyStatus { enabled: true, error: None }).unwrap();
+        let v = serde_json::to_value(PrivacyStatus {
+            enabled: true,
+            error: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({ "enabled": true, "error": null }));
         let v = serde_json::to_value(PrivacyStatus {
             enabled: false,
@@ -372,7 +433,9 @@ mod tests {
 
     #[test]
     fn error_display_names_kind_and_detail() {
-        let err = CaptureError::PermissionDenied { detail: "TCC denied".into() };
+        let err = CaptureError::PermissionDenied {
+            detail: "TCC denied".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("permission-denied"), "kind missing: {msg}");
         assert!(msg.contains("TCC denied"), "detail missing: {msg}");
@@ -380,14 +443,21 @@ mod tests {
 
     #[test]
     fn frame_and_permission_serialize_camel_case() {
-        let frame = CapturedFrame { width: 2048, height: 1152, base64_png: "QUJD".into() };
+        let frame = CapturedFrame {
+            width: 2048,
+            height: 1152,
+            base64_png: "QUJD".into(),
+        };
         let v = serde_json::to_value(&frame).unwrap();
         assert_eq!(v["width"], 2048);
         assert_eq!(v["height"], 1152);
         assert_eq!(v["base64Png"], "QUJD");
 
-        let p = CapturePermission { granted: false, supported: true };
-        let v = serde_json::to_value(&p).unwrap();
+        let p = CapturePermission {
+            granted: false,
+            supported: true,
+        };
+        let v = serde_json::to_value(p).unwrap();
         assert_eq!(v["granted"], false);
         assert_eq!(v["supported"], true);
     }
@@ -400,7 +470,13 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(status.supported);
         } else {
-            assert_eq!(status, CapturePermission { granted: false, supported: false });
+            assert_eq!(
+                status,
+                CapturePermission {
+                    granted: false,
+                    supported: false
+                }
+            );
         }
     }
 }

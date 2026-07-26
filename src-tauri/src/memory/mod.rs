@@ -118,7 +118,11 @@ impl MemoryState {
 /// (`db` / `not-found` / `invalid-input`) and camelCase fields — this JSON
 /// shape is the error half of the memory IPC contract with the UI (S04).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum MemoryError {
     /// SQLite refused or failed the operation (I/O, corruption, constraint,
     /// bad state). Carries the underlying detail for logs and surfaces.
@@ -157,7 +161,9 @@ impl std::error::Error for MemoryError {}
 
 impl From<rusqlite::Error> for MemoryError {
     fn from(e: rusqlite::Error) -> Self {
-        MemoryError::Db { detail: e.to_string() }
+        MemoryError::Db {
+            detail: e.to_string(),
+        }
     }
 }
 
@@ -169,7 +175,9 @@ mod tests {
     fn error_json_shape_is_the_ipc_contract() {
         // S04 matches on `kind` and reads camelCase fields; a change here is
         // a breaking IPC change.
-        let db = MemoryError::Db { detail: "disk I/O error".into() };
+        let db = MemoryError::Db {
+            detail: "disk I/O error".into(),
+        };
         let v = serde_json::to_value(&db).unwrap();
         assert_eq!(v["kind"], "db");
         assert_eq!(v["detail"], "disk I/O error");
@@ -179,7 +187,9 @@ mod tests {
         assert_eq!(v["kind"], "not-found");
         assert_eq!(v["id"], 42);
 
-        let invalid = MemoryError::InvalidInput { detail: "summary is empty".into() };
+        let invalid = MemoryError::InvalidInput {
+            detail: "summary is empty".into(),
+        };
         let v = serde_json::to_value(&invalid).unwrap();
         assert_eq!(v["kind"], "invalid-input");
         assert_eq!(v["detail"], "summary is empty");
@@ -187,15 +197,31 @@ mod tests {
 
     #[test]
     fn error_kind_mirrors_serde_tag() {
-        assert_eq!(MemoryError::Db { detail: String::new() }.kind(), "db");
+        assert_eq!(
+            MemoryError::Db {
+                detail: String::new()
+            }
+            .kind(),
+            "db"
+        );
         assert_eq!(MemoryError::NotFound { id: 1 }.kind(), "not-found");
-        assert_eq!(MemoryError::InvalidInput { detail: String::new() }.kind(), "invalid-input");
+        assert_eq!(
+            MemoryError::InvalidInput {
+                detail: String::new()
+            }
+            .kind(),
+            "invalid-input"
+        );
     }
 
     #[test]
     fn error_display_names_the_failure() {
         assert!(MemoryError::NotFound { id: 7 }.to_string().contains('7'));
-        assert!(MemoryError::Db { detail: "locked".into() }.to_string().contains("locked"));
+        assert!(MemoryError::Db {
+            detail: "locked".into()
+        }
+        .to_string()
+        .contains("locked"));
     }
 
     #[test]
@@ -219,7 +245,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "guard-blocked");
-        assert_eq!(guard.blocked_count(), 1, "the shared GuardState must record the block");
+        assert_eq!(
+            guard.blocked_count(),
+            1,
+            "the shared GuardState must record the block"
+        );
     }
 
     #[test]

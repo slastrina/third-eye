@@ -41,8 +41,11 @@ pub enum DetectionKind {
 
 impl DetectionKind {
     /// Stable detection/report order (also the internal counter index).
-    pub const ALL: [DetectionKind; 3] =
-        [DetectionKind::Password, DetectionKind::Card, DetectionKind::ApiKey];
+    pub const ALL: [DetectionKind; 3] = [
+        DetectionKind::Password,
+        DetectionKind::Card,
+        DetectionKind::ApiKey,
+    ];
 
     /// The byte-exact placeholder substituted into redacted text.
     pub fn placeholder(self) -> &'static str {
@@ -149,7 +152,9 @@ impl Pattern {
     fn get(&self) -> Result<&Regex, RedactionError> {
         match &*self.compiled {
             Ok(re) => Ok(re),
-            Err(_) => Err(RedactionError::PatternCompile { detector: self.detector }),
+            Err(_) => Err(RedactionError::PatternCompile {
+                detector: self.detector,
+            }),
         }
     }
 }
@@ -250,7 +255,10 @@ pub fn redact(text: &str) -> Result<RedactionOutcome, RedactionError> {
     let detections = DetectionKind::ALL
         .into_iter()
         .filter(|kind| counts[kind.index()] > 0)
-        .map(|kind| Detection { kind, count: counts[kind.index()] })
+        .map(|kind| Detection {
+            kind,
+            count: counts[kind.index()],
+        })
         .collect();
 
     Ok(RedactionOutcome {
@@ -392,7 +400,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += d;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 #[cfg(test)]
@@ -428,7 +436,10 @@ mod tests {
         assert_eq!(out.text, "password: [REDACTED:password]");
         assert_eq!(
             out.detections,
-            vec![Detection { kind: DetectionKind::Password, count: 1 }]
+            vec![Detection {
+                kind: DetectionKind::Password,
+                count: 1
+            }]
         );
     }
 
@@ -436,18 +447,42 @@ mod tests {
 
     #[test]
     fn detection_serde_shape_is_camel_case_fields_kebab_case_kinds() {
-        let d = Detection { kind: DetectionKind::ApiKey, count: 2 };
-        assert_eq!(serde_json::to_value(&d).unwrap(), json!({"kind": "api-key", "count": 2}));
-        let d = Detection { kind: DetectionKind::Password, count: 1 };
-        assert_eq!(serde_json::to_value(&d).unwrap(), json!({"kind": "password", "count": 1}));
-        let d = Detection { kind: DetectionKind::Card, count: 3 };
-        assert_eq!(serde_json::to_value(&d).unwrap(), json!({"kind": "card", "count": 3}));
+        let d = Detection {
+            kind: DetectionKind::ApiKey,
+            count: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({"kind": "api-key", "count": 2})
+        );
+        let d = Detection {
+            kind: DetectionKind::Password,
+            count: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({"kind": "password", "count": 1})
+        );
+        let d = Detection {
+            kind: DetectionKind::Card,
+            count: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({"kind": "card", "count": 3})
+        );
     }
 
     #[test]
     fn confidence_serde_is_kebab_case() {
-        assert_eq!(serde_json::to_value(RedactionConfidence::Confident).unwrap(), json!("confident"));
-        assert_eq!(serde_json::to_value(RedactionConfidence::Low).unwrap(), json!("low"));
+        assert_eq!(
+            serde_json::to_value(RedactionConfidence::Confident).unwrap(),
+            json!("confident")
+        );
+        assert_eq!(
+            serde_json::to_value(RedactionConfidence::Low).unwrap(),
+            json!("low")
+        );
     }
 
     // --- Card detector: Luhn-gated, spaced and contiguous ---
@@ -607,7 +642,10 @@ mod tests {
         assert_eq!(out.confidence, RedactionConfidence::Low);
         // At the cap exactly: still confident.
         let at_cap = "a".repeat(SCAN_CAP_BYTES);
-        assert_eq!(redact_ok(&at_cap).confidence, RedactionConfidence::Confident);
+        assert_eq!(
+            redact_ok(&at_cap).confidence,
+            RedactionConfidence::Confident
+        );
     }
 
     #[test]
@@ -640,9 +678,18 @@ mod tests {
         assert_eq!(
             out.detections,
             vec![
-                Detection { kind: DetectionKind::Password, count: 2 },
-                Detection { kind: DetectionKind::Card, count: 2 },
-                Detection { kind: DetectionKind::ApiKey, count: 1 },
+                Detection {
+                    kind: DetectionKind::Password,
+                    count: 2
+                },
+                Detection {
+                    kind: DetectionKind::Card,
+                    count: 2
+                },
+                Detection {
+                    kind: DetectionKind::ApiKey,
+                    count: 1
+                },
             ]
         );
         assert!(!out.text.contains("4444"));

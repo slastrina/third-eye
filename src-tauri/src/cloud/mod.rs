@@ -18,3 +18,14 @@ pub mod commands;
 pub mod keystore;
 pub mod optin;
 pub mod routing;
+
+/// Serializes the tests that touch the REAL OS credential store (two in
+/// keystore.rs, one in client.rs): under the default parallel test runner
+/// concurrent keychain access intermittently fails with "No default store
+/// has been set", flaking the suite. Poison is absorbed — one panicking
+/// test must not cascade the lock into the others.
+#[cfg(test)]
+pub(crate) fn real_keychain_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}

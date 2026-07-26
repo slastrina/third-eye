@@ -60,3 +60,47 @@ test("the auto-run danger warning is absent while HID is off by default", async 
   // most dangerous posture is never surfaced without an explicit opt-in.
   await expect(page.locator("[data-hid-autorun-warning]")).toHaveCount(0);
 });
+
+// ---------------------------------------------------------------------------
+// Live automation HUD (2026-07 redesign, surface 7). The HUD windows fold
+// llm:// broadcasts, which never arrive outside Tauri — so these specs drive
+// the ?hud=seed TEST HOOK (Hud.tsx), which replays a scripted run through the
+// SAME reducer the live events use.
+// ---------------------------------------------------------------------------
+
+test("hud-pill renders nothing without a run (absorb posture)", async ({ page }) => {
+  await page.goto("/?view=hud-pill");
+  await expect(page.locator(".te-hudpill")).toHaveCount(0);
+  await expect(page.locator(".te-trail")).toHaveCount(0);
+});
+
+test("seeded run: pill narrates the current action and the trail settles honestly", async ({ page }) => {
+  await page.goto("/?view=hud-pill&hud=seed");
+  // The current (still-running) action is the headline; announced-only count.
+  const pill = page.locator(".te-hudpill");
+  await expect(pill).toBeVisible();
+  await expect(pill).toHaveAttribute("data-tone", "acting");
+  await expect(pill.locator(".te-hudpill__headline")).toHaveText("click · 226, 184");
+  await expect(pill.locator(".te-hudpill__count")).toHaveText("3 / 3");
+  // Stop control present while live.
+  await expect(pill.getByRole("button", { name: /Stop/ })).toBeVisible();
+  // Trail: settled ✓ / ✗ with the typed failure line, ● for the live action —
+  // and nothing beyond what was announced (no invented future steps).
+  const items = page.locator(".te-trail__item");
+  await expect(items).toHaveCount(3);
+  await expect(items.nth(0)).toHaveAttribute("data-status", "ok");
+  await expect(items.nth(1)).toHaveAttribute("data-status", "failed");
+  await expect(items.nth(1)).toContainText("verification-failed");
+  await expect(items.nth(2)).toHaveAttribute("data-status", "running");
+});
+
+test("seeded run: the canvas draws the ghost ring at the live action's target", async ({ page }) => {
+  await page.goto("/?view=hud-canvas&hud=seed");
+  const ghost = page.locator(".te-ghost");
+  await expect(ghost).toHaveCount(1);
+  // The live click's coordinates, straight from the action's own arguments.
+  await expect(ghost).toHaveCSS("left", "226px");
+  await expect(ghost).toHaveCSS("top", "184px");
+  // Click-through by construction: the marker never intercepts pointer events.
+  await expect(ghost).toHaveCSS("pointer-events", "none");
+});

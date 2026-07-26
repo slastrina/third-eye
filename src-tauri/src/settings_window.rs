@@ -205,7 +205,10 @@ mod tests {
             win["resizable"], true,
             "must be user-resizable (the NSPanel style mask re-asserts this on macOS)"
         );
-        assert_eq!(win["url"], "index.html?view=settings", "must render the settings view");
+        assert_eq!(
+            win["url"], "index.html?view=settings",
+            "must render the settings view"
+        );
         assert_eq!(win["focus"], false, "must not request focus at creation");
     }
 
@@ -226,9 +229,11 @@ mod tests {
     fn every_declared_window_has_a_capability_granting_core_default() {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let capabilities: [serde_json::Value; 2] = [
+        let capabilities: [serde_json::Value; 4] = [
             serde_json::from_str(include_str!("../capabilities/default.json")).unwrap(),
             serde_json::from_str(include_str!("../capabilities/settings.json")).unwrap(),
+            serde_json::from_str(include_str!("../capabilities/hud.json")).unwrap(),
+            serde_json::from_str(include_str!("../capabilities/memory.json")).unwrap(),
         ];
 
         for window in conf["app"]["windows"].as_array().expect("windows array") {

@@ -36,9 +36,7 @@
 //!   hatch capture uses for blocking ScreenCaptureKit calls.
 
 use async_trait::async_trait;
-use enigo::{
-    Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
-};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use objc2_core_foundation::CFString;
 
 use super::{
@@ -105,7 +103,10 @@ pub fn has_permission() -> bool {
 /// dropped immediately; nothing is stored. Returns the real combined state via
 /// the read-only preflights rather than assuming either prompt succeeded.
 pub fn request_permission() -> bool {
-    let settings = Settings { open_prompt_to_get_permissions: true, ..Settings::default() };
+    let settings = Settings {
+        open_prompt_to_get_permissions: true,
+        ..Settings::default()
+    };
     // Constructing Enigo is what surfaces the AX TCC prompt; we don't need the
     // handle afterwards. If construction fails we still report the real state.
     match Enigo::new(&settings) {
@@ -127,7 +128,10 @@ pub fn request_permission() -> bool {
 
 /// Current permission state as the IPC health-as-value shape.
 pub fn permission_status() -> InputPermission {
-    InputPermission { granted: has_permission(), supported: true }
+    InputPermission {
+        granted: has_permission(),
+        supported: true,
+    }
 }
 
 /// The live macOS backend: synthesizes mouse/keyboard events via enigo. A ZST
@@ -162,12 +166,12 @@ impl InputControl for MacosInput {
                      process may read the accessibility tree but cannot post synthetic events; \
                      grant it in System Settings → Privacy & Security → Accessibility"
                 }
-                (false, true) => {
-                    "Accessibility not granted (AXIsProcessTrusted false)"
-                }
+                (false, true) => "Accessibility not granted (AXIsProcessTrusted false)",
                 (true, true) => unreachable!("has_permission() false but both grants true"),
             };
-            let err = InputError::PermissionDenied { detail: detail.into() };
+            let err = InputError::PermissionDenied {
+                detail: detail.into(),
+            };
             log::error!("input: {} ({err})", err.kind());
             return Err(err);
         }
@@ -268,8 +272,7 @@ unsafe fn copy_string_attr(element: *mut std::ffi::c_void, name: &str) -> Option
 /// verification and `screen_query` attribution report, so the model can compare
 /// them directly.
 fn app_name_for_pid(pid: i32) -> Option<String> {
-    let app =
-        objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+    let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
     app.localizedName().map(|n| n.to_string())
 }
 
@@ -305,7 +308,12 @@ fn read_focused_element() -> Option<FocusReport> {
             copy_string_attr(el, "AXValue")
         };
         CFRelease(el);
-        Some(FocusReport { app, role, title, value })
+        Some(FocusReport {
+            app,
+            role,
+            title,
+            value,
+        })
     }
 }
 
@@ -325,7 +333,10 @@ fn tail_excerpt(s: &str, max_chars: usize) -> String {
 
 /// Bound a focus snapshot for the model-facing report: the value excerpt only.
 fn redact_focus(f: FocusReport) -> FocusReport {
-    FocusReport { value: f.value.map(|v| tail_excerpt(&v, VALUE_EXCERPT_CHARS)), ..f }
+    FocusReport {
+        value: f.value.map(|v| tail_excerpt(&v, VALUE_EXCERPT_CHARS)),
+        ..f
+    }
 }
 
 /// How long a click/key-press gets for the OS to settle keyboard focus before
@@ -403,7 +414,10 @@ fn wait_for_cursor_commit(x: i32, y: i32) -> Result<CursorPosition, InputError> 
     for _ in 0..TRIES {
         last = cursor_location()?;
         if (last.0 - x as f64).abs() <= TOLERANCE && (last.1 - y as f64).abs() <= TOLERANCE {
-            return Ok(CursorPosition { x: last.0.round() as i32, y: last.1.round() as i32 });
+            return Ok(CursorPosition {
+                x: last.0.round() as i32,
+                y: last.1.round() as i32,
+            });
         }
         std::thread::sleep(POLL);
     }
@@ -427,21 +441,30 @@ fn wait_for_cursor_commit(x: i32, y: i32) -> Result<CursorPosition, InputError> 
 fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
     // Don't prompt on the action path — permission was already verified, and a
     // prompt here would violate health-as-value.
-    let settings = Settings { open_prompt_to_get_permissions: false, ..Settings::default() };
-    let mut enigo = Enigo::new(&settings)
-        .map_err(|e| InputError::InputFailed { detail: format!("enigo init failed: {e}") })?;
+    let settings = Settings {
+        open_prompt_to_get_permissions: false,
+        ..Settings::default()
+    };
+    let mut enigo = Enigo::new(&settings).map_err(|e| InputError::InputFailed {
+        detail: format!("enigo init failed: {e}"),
+    })?;
 
     let report = match action {
         InputAction::MouseMove { x, y } => {
             enigo
                 .move_mouse(x, y, Coordinate::Abs)
-                .map_err(|e| InputError::InputFailed { detail: format!("move_mouse failed: {e}") })?;
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("move_mouse failed: {e}"),
+                })?;
             // Completing only once the cursor readback matches means a
             // follow-up coordless click (the model's move-then-click pattern,
             // milliseconds apart in one tool turn) fires at the committed
             // point, never a stale one.
             let cursor = wait_for_cursor_commit(x, y)?;
-            ActionReport { cursor: Some(cursor), ..ActionReport::default() }
+            ActionReport {
+                cursor: Some(cursor),
+                ..ActionReport::default()
+            }
         }
         InputAction::MouseClick { button, x, y } => {
             // A coordinate-bearing click moves to the target first (the model's
@@ -449,37 +472,56 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
             // x and y are validated present-together upstream, so `if let`
             // on the pair is enough here.
             if let (Some(x), Some(y)) = (x, y) {
-                enigo.move_mouse(x, y, Coordinate::Abs).map_err(|e| InputError::InputFailed {
-                    detail: format!("move before click failed: {e}"),
-                })?;
+                enigo
+                    .move_mouse(x, y, Coordinate::Abs)
+                    .map_err(|e| InputError::InputFailed {
+                        detail: format!("move before click failed: {e}"),
+                    })?;
                 // enigo's button() clicks at the SYSTEM cursor, not at (x,y) —
                 // without this wait the click fires at the stale pre-move
                 // position (see wait_for_cursor_commit docs).
                 wait_for_cursor_commit(x, y)?;
             }
-            enigo.button(map_button(button), Direction::Click).map_err(|e| {
-                InputError::InputFailed { detail: format!("button click failed: {e}") }
-            })?;
+            enigo
+                .button(map_button(button), Direction::Click)
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("button click failed: {e}"),
+                })?;
             // Evidence: where the click really landed, and what took keyboard
             // focus — a click on a text field should read back that field.
-            let cursor = cursor_location()
-                .ok()
-                .map(|(px, py)| CursorPosition { x: px.round() as i32, y: py.round() as i32 });
-            ActionReport { cursor, focus: observe_focus_settled(), text_entered: None }
+            let cursor = cursor_location().ok().map(|(px, py)| CursorPosition {
+                x: px.round() as i32,
+                y: py.round() as i32,
+            });
+            ActionReport {
+                cursor,
+                focus: observe_focus_settled(),
+                text_entered: None,
+            }
         }
         InputAction::TypeText { text } => {
-            enigo
-                .text(&text)
-                .map_err(|e| InputError::InputFailed { detail: format!("text entry failed: {e}") })?;
+            enigo.text(&text).map_err(|e| InputError::InputFailed {
+                detail: format!("text entry failed: {e}"),
+            })?;
             let (focus, text_entered) = observe_text_entry(&text);
-            ActionReport { cursor: None, focus, text_entered }
+            ActionReport {
+                cursor: None,
+                focus,
+                text_entered,
+            }
         }
         InputAction::KeyPress { key } => {
             let k = key_from_str(&key)?;
             enigo
                 .key(k, Direction::Click)
-                .map_err(|e| InputError::InputFailed { detail: format!("key press failed: {e}") })?;
-            ActionReport { cursor: None, focus: observe_focus_settled(), text_entered: None }
+                .map_err(|e| InputError::InputFailed {
+                    detail: format!("key press failed: {e}"),
+                })?;
+            ActionReport {
+                cursor: None,
+                focus: observe_focus_settled(),
+                text_entered: None,
+            }
         }
     };
     // Diagnostic trail without content: the value excerpt stays out of logs.
@@ -574,7 +616,10 @@ mod tests {
         // Whenever posting is denied, HID must read as not-granted regardless of
         // AX — the exact case that produced silent no-op clicks.
         if !post {
-            assert!(!has_permission(), "posting denied must mean HID not granted");
+            assert!(
+                !has_permission(),
+                "posting denied must mean HID not granted"
+            );
         }
     }
 
@@ -668,12 +713,20 @@ mod tests {
         let backend: Arc<dyn InputControl> = Arc::new(MacosInput);
         // A mouse move is the least disruptive proof that the spawn_blocking →
         // enigo path round-trips without a !Send compile error or a runtime hang.
-        match backend.perform(InputAction::MouseMove { x: 200, y: 200 }).await {
+        match backend
+            .perform(InputAction::MouseMove { x: 200, y: 200 })
+            .await
+        {
             Ok(report) => {
-                assert!(backend.permission().granted, "input succeeded but permission reads false");
+                assert!(
+                    backend.permission().granted,
+                    "input succeeded but permission reads false"
+                );
                 // The move's report must carry the read-back cursor — the
                 // verification evidence, not an echo of the command.
-                let cursor = report.cursor.expect("a mouse-move report carries the cursor");
+                let cursor = report
+                    .cursor
+                    .expect("a mouse-move report carries the cursor");
                 assert!((cursor.x - 200).abs() <= 3 && (cursor.y - 200).abs() <= 3);
             }
             Err(err) => {
@@ -710,7 +763,10 @@ mod tests {
         }
         // Points well inside any plausible logical desktop, away from edges.
         for (cx, cy) in [(300, 300), (600, 400), (900, 500)] {
-            backend.perform(InputAction::MouseMove { x: cx, y: cy }).await.expect("move ok");
+            backend
+                .perform(InputAction::MouseMove { x: cx, y: cy })
+                .await
+                .expect("move ok");
             // Give the event loop a beat to settle the cursor.
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             let (rx, ry) = cursor_point();
@@ -756,13 +812,24 @@ mod tests {
             return;
         };
         let (cx, cy) = (t.x + t.width / 2, t.y + t.height / 2);
-        eprintln!("target {:?} box ({},{}) {}x{} → centre ({cx},{cy})", t.text, t.x, t.y, t.width, t.height);
+        eprintln!(
+            "target {:?} box ({},{}) {}x{} → centre ({cx},{cy})",
+            t.text, t.x, t.y, t.width, t.height
+        );
         let backend: Arc<dyn InputControl> = Arc::new(MacosInput);
-        backend.perform(InputAction::MouseMove { x: cx, y: cy }).await.expect("move ok");
+        backend
+            .perform(InputAction::MouseMove { x: cx, y: cy })
+            .await
+            .expect("move ok");
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         let (rx, ry) = cursor_point();
-        eprintln!("cursor landed at ({rx:.0},{ry:.0}); element box x∈[{},{}] y∈[{},{}]",
-            t.x, t.x + t.width, t.y, t.y + t.height);
+        eprintln!(
+            "cursor landed at ({rx:.0},{ry:.0}); element box x∈[{},{}] y∈[{},{}]",
+            t.x,
+            t.x + t.width,
+            t.y,
+            t.y + t.height
+        );
         assert!(
             rx >= t.x as f64 - 2.0
                 && rx <= (t.x + t.width) as f64 + 2.0
@@ -770,7 +837,10 @@ mod tests {
                 && ry <= (t.y + t.height) as f64 + 2.0,
             "cursor landed OUTSIDE the element box — coordinate space still wrong: \
              centre ({cx},{cy}) landed ({rx:.0},{ry:.0}), box ({},{})..({},{})",
-            t.x, t.y, t.x + t.width, t.y + t.height,
+            t.x,
+            t.y,
+            t.x + t.width,
+            t.y + t.height,
         );
     }
 
@@ -816,24 +886,35 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         let bounds = osascript("tell application \"Google Chrome\" to get bounds of front window");
-        let nums: Vec<i32> =
-            bounds.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let nums: Vec<i32> = bounds
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         assert_eq!(nums.len(), 4, "unexpected bounds reply: {bounds:?}");
         // Omnibox: past the nav buttons horizontally, tab-strip + half the
         // toolbar down — the same row OCR located "google.com" text on (+64).
         let (ax, ay) = (nums[0] + 320, nums[1] + 64);
-        eprintln!("TE probe: settle={settle}ms, window bounds={bounds}, clicking omnibox at ({ax},{ay})");
+        eprintln!(
+            "TE probe: settle={settle}ms, window bounds={bounds}, clicking omnibox at ({ax},{ay})"
+        );
 
         let backend: Arc<dyn InputControl> = Arc::new(MacosInput);
         let click_report = backend
-            .perform(InputAction::MouseClick { button: MouseButton::Left, x: Some(ax), y: Some(ay) })
+            .perform(InputAction::MouseClick {
+                button: MouseButton::Left,
+                x: Some(ax),
+                y: Some(ay),
+            })
             .await
             .expect("click");
         eprintln!("TE probe click report: {click_report:?}");
         // The report is the in-process verification surface the tool loop now
         // returns to the model — it must independently agree with the
         // AppleScript ground truth below: the click focused Chrome's omnibox.
-        let focus = click_report.focus.as_ref().expect("click report carries focus");
+        let focus = click_report
+            .focus
+            .as_ref()
+            .expect("click report carries focus");
         assert!(
             focus.app.as_deref().is_some_and(|a| a.contains("Chrome")),
             "click report must attribute focus to Chrome: {focus:?}"
@@ -855,7 +936,9 @@ mod tests {
             "TE probe post-click: cursor=({rx:.0},{ry:.0}) commanded=({ax},{ay}) frontmost={front:?} chrome-focused={focused:?}"
         );
         let type_report = backend
-            .perform(InputAction::TypeText { text: "farts".into() })
+            .perform(InputAction::TypeText {
+                text: "farts".into(),
+            })
             .await
             .expect("type");
         eprintln!("TE probe type report: {type_report:?}");
@@ -874,13 +957,17 @@ mod tests {
         );
         eprintln!("TE probe post-type: chrome-focused={focused:?}");
         let return_report = backend
-            .perform(InputAction::KeyPress { key: "return".into() })
+            .perform(InputAction::KeyPress {
+                key: "return".into(),
+            })
             .await
             .expect("return");
         eprintln!("TE probe return report: {return_report:?}");
         tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
 
-        let url = osascript("tell application \"Google Chrome\" to get URL of active tab of front window");
+        let url = osascript(
+            "tell application \"Google Chrome\" to get URL of active tab of front window",
+        );
         eprintln!("TE probe: final URL = {url}");
         assert!(
             url.contains("farts"),

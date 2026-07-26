@@ -43,3 +43,6 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+# Storybook static build (dev artifact, never shipped)
+storybook-static/

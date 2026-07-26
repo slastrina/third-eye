@@ -45,7 +45,11 @@ impl Lane {
         model_id: Option<String>,
         client: Arc<dyn LlmClient>,
     ) -> Self {
-        Self { name: name.into(), model_id, client }
+        Self {
+            name: name.into(),
+            model_id,
+            client,
+        }
     }
 
     fn model_label(&self) -> &str {
@@ -107,7 +111,12 @@ impl ModelRouter {
     pub fn with_guard(lanes: Vec<Lane>, guard: Arc<GuardState>) -> Self {
         assert!(!lanes.is_empty(), "ModelRouter requires at least one lane");
         let endpoint = lanes[0].client.endpoint().to_string();
-        Self { lanes: RwLock::new(lanes), active: RwLock::new(0), endpoint, guard }
+        Self {
+            lanes: RwLock::new(lanes),
+            active: RwLock::new(0),
+            endpoint,
+            guard,
+        }
     }
 
     /// The canonical thin/heavy pair against one OpenAI-compatible endpoint.
@@ -178,7 +187,10 @@ impl ModelRouter {
         let guarded = GuardedClient::new(Arc::new(client), self.guard.clone());
         lanes[idx].model_id = model;
         lanes[idx].client = Arc::new(guarded);
-        log::info!("llm: lane {name} re-pin {old} → {}", lanes[idx].model_label());
+        log::info!(
+            "llm: lane {name} re-pin {old} → {}",
+            lanes[idx].model_label()
+        );
         drop(lanes);
         Ok(self.info())
     }
@@ -223,7 +235,10 @@ impl ModelRouter {
             endpoint: self.endpoint.clone(),
             lanes: lanes
                 .iter()
-                .map(|l| LaneInfo { name: l.name.clone(), model_id: l.model_id.clone() })
+                .map(|l| LaneInfo {
+                    name: l.name.clone(),
+                    model_id: l.model_id.clone(),
+                })
                 .collect(),
         }
     }
@@ -237,7 +252,10 @@ impl ModelRouter {
     pub fn lane_client(&self, name: &str) -> Result<(String, Arc<dyn LlmClient>), String> {
         let lanes = self.lanes.read().unwrap();
         let idx = lane_index(&lanes, name)?;
-        Ok((lanes[idx].model_label().to_string(), lanes[idx].client.clone()))
+        Ok((
+            lanes[idx].model_label().to_string(),
+            lanes[idx].client.clone(),
+        ))
     }
 
     /// The shared guard telemetry this router's clients record into — the
@@ -251,7 +269,11 @@ impl ModelRouter {
         let lanes = self.lanes.read().unwrap();
         let idx = *self.active.read().unwrap();
         let lane = &lanes[idx];
-        (lane.name.clone(), lane.model_label().to_string(), lane.client.clone())
+        (
+            lane.name.clone(),
+            lane.model_label().to_string(),
+            lane.client.clone(),
+        )
     }
 }
 
@@ -261,7 +283,10 @@ impl ModelRouter {
 fn lane_index(lanes: &[Lane], name: &str) -> Result<usize, String> {
     lanes.iter().position(|l| l.name == name).ok_or_else(|| {
         let known: Vec<&str> = lanes.iter().map(|l| l.name.as_str()).collect();
-        format!("unknown lane \"{name}\" (known lanes: {})", known.join(", "))
+        format!(
+            "unknown lane \"{name}\" (known lanes: {})",
+            known.join(", ")
+        )
     })
 }
 
@@ -298,7 +323,9 @@ impl LlmClient for ModelRouter {
             "llm: routing (reasoning) via lane={lane} model={model} endpoint={}",
             client.endpoint()
         );
-        client.stream_chat_reasoning(request, on_token, on_reasoning).await
+        client
+            .stream_chat_reasoning(request, on_token, on_reasoning)
+            .await
     }
 
     async fn health(&self) -> LlmHealth {
@@ -334,11 +361,19 @@ mod tests {
 
     impl TaggedClient {
         fn ok(tag: &'static str) -> Arc<dyn LlmClient> {
-            Arc::new(Self { tag, online: true, fail_with: None })
+            Arc::new(Self {
+                tag,
+                online: true,
+                fail_with: None,
+            })
         }
 
         fn failing(tag: &'static str, err: LlmError) -> Arc<dyn LlmClient> {
-            Arc::new(Self { tag, online: false, fail_with: Some(err) })
+            Arc::new(Self {
+                tag,
+                online: false,
+                fail_with: Some(err),
+            })
         }
     }
 
@@ -357,18 +392,33 @@ mod tests {
                 return Err(err.clone());
             }
             on_token(self.tag);
-            Ok(StreamOutcome { text: self.tag.into(), token_count: 1, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: self.tag.into(),
+                token_count: 1,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: self.online, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: self.online,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
     fn thin_heavy_mock() -> ModelRouter {
         ModelRouter::new(vec![
-            Lane::new(THIN_LANE, Some("thin-1b".into()), TaggedClient::ok("thin-reply")),
-            Lane::new(HEAVY_LANE, Some("heavy-7b".into()), TaggedClient::ok("heavy-reply")),
+            Lane::new(
+                THIN_LANE,
+                Some("thin-1b".into()),
+                TaggedClient::ok("thin-reply"),
+            ),
+            Lane::new(
+                HEAVY_LANE,
+                Some("heavy-7b".into()),
+                TaggedClient::ok("heavy-reply"),
+            ),
         ])
     }
 
@@ -387,7 +437,11 @@ mod tests {
         let router = thin_heavy_mock();
         let (result, seen) = chat(&router).await;
         assert_eq!(result.unwrap().text, "thin-reply");
-        assert_eq!(seen, vec!["thin-reply"], "tokens must flow through the router");
+        assert_eq!(
+            seen,
+            vec!["thin-reply"],
+            "tokens must flow through the router"
+        );
     }
 
     #[tokio::test]
@@ -408,8 +462,14 @@ mod tests {
     async fn unknown_lane_is_rejected_naming_lane_and_known_set() {
         let router = thin_heavy_mock();
         let err = router.set_active("turbo").unwrap_err();
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
-        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
+        assert!(
+            err.contains("thin") && err.contains("heavy"),
+            "error must list known lanes: {err}"
+        );
 
         // The active lane must be unchanged after a rejected switch.
         assert_eq!(router.info().active_lane, THIN_LANE);
@@ -431,7 +491,10 @@ mod tests {
         )]);
         let (result, seen) = chat(&router).await;
         let err = result.unwrap_err();
-        assert_eq!(err, interrupted, "the router must not rewrap or lose error fields");
+        assert_eq!(
+            err, interrupted,
+            "the router must not rewrap or lose error fields"
+        );
         assert_eq!(err.partial_text(), Some("half an ans"));
         assert!(seen.is_empty());
     }
@@ -445,7 +508,10 @@ mod tests {
                 None,
                 TaggedClient::failing(
                     "heavy",
-                    LlmError::Offline { endpoint: "http://mock.invalid".into(), detail: "down".into() },
+                    LlmError::Offline {
+                        endpoint: "http://mock.invalid".into(),
+                        detail: "down".into(),
+                    },
                 ),
             ),
         ]);
@@ -489,9 +555,16 @@ mod tests {
         // carries its model id.
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
-        let router =
-            ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), Some("heavy-7b".into()), test_guard());
-        router.stream_chat(&req(vec![ChatMessage::user("quick one")]), &|_| {}).await.unwrap();
+        let router = ModelRouter::thin_heavy(
+            &endpoint,
+            Some("thin-1b".into()),
+            Some("heavy-7b".into()),
+            test_guard(),
+        );
+        router
+            .stream_chat(&req(vec![ChatMessage::user("quick one")]), &|_| {})
+            .await
+            .unwrap();
         assert_eq!(captured_body_json(&captured)["model"], "thin-1b");
     }
 
@@ -502,9 +575,15 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let router = ModelRouter::thin_heavy(&endpoint, None, None, test_guard());
-        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        router
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
-        assert!(!body.as_object().unwrap().contains_key("model"), "got: {body}");
+        assert!(
+            !body.as_object().unwrap().contains_key("model"),
+            "got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -514,13 +593,12 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let router = ModelRouter::thin_heavy(&endpoint, None, None, test_guard());
-        let request = req(vec![ChatMessage::user("hi")]).with_tools(vec![
-            crate::llm::ToolDefinition {
+        let request =
+            req(vec![ChatMessage::user("hi")]).with_tools(vec![crate::llm::ToolDefinition {
                 name: "memory_search".into(),
                 description: "d".into(),
                 parameters: serde_json::json!({"type": "object"}),
-            },
-        ]);
+            }]);
         router.stream_chat(&request, &|_| {}).await.unwrap();
         let body = captured_body_json(&captured);
         assert_eq!(body["tools"][0]["function"]["name"], "memory_search");
@@ -550,8 +628,13 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None, test_guard());
-        router.set_lane_model(THIN_LANE, Some("qwen2.5-14b".into())).unwrap();
-        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        router
+            .set_lane_model(THIN_LANE, Some("qwen2.5-14b".into()))
+            .unwrap();
+        router
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         assert_eq!(captured_body_json(&captured)["model"], "qwen2.5-14b");
     }
 
@@ -563,17 +646,28 @@ mod tests {
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let router = ModelRouter::thin_heavy(&endpoint, Some("thin-1b".into()), None, test_guard());
         router.set_lane_model(THIN_LANE, None).unwrap();
-        router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        router
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
-        assert!(!body.as_object().unwrap().contains_key("model"), "got: {body}");
+        assert!(
+            !body.as_object().unwrap().contains_key("model"),
+            "got: {body}"
+        );
     }
 
     #[test]
     fn set_lane_model_updates_info_and_returns_it() {
         let router = thin_heavy_mock();
-        let info = router.set_lane_model(HEAVY_LANE, Some("heavy-70b".into())).unwrap();
+        let info = router
+            .set_lane_model(HEAVY_LANE, Some("heavy-70b".into()))
+            .unwrap();
         assert_eq!(info.lanes[1].model_id.as_deref(), Some("heavy-70b"));
-        assert_eq!(router.info().lanes[1].model_id.as_deref(), Some("heavy-70b"));
+        assert_eq!(
+            router.info().lanes[1].model_id.as_deref(),
+            Some("heavy-70b")
+        );
         // The other lane and the active lane are untouched.
         assert_eq!(info.lanes[0].model_id.as_deref(), Some("thin-1b"));
         assert_eq!(info.active_lane, THIN_LANE);
@@ -582,9 +676,17 @@ mod tests {
     #[test]
     fn set_lane_model_rejects_unknown_lane_leaving_lanes_unchanged() {
         let router = thin_heavy_mock();
-        let err = router.set_lane_model("turbo", Some("x".into())).unwrap_err();
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
-        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+        let err = router
+            .set_lane_model("turbo", Some("x".into()))
+            .unwrap_err();
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
+        assert!(
+            err.contains("thin") && err.contains("heavy"),
+            "error must list known lanes: {err}"
+        );
         let info = router.info();
         assert_eq!(info.lanes[0].model_id.as_deref(), Some("thin-1b"));
         assert_eq!(info.lanes[1].model_id.as_deref(), Some("heavy-7b"));
@@ -619,9 +721,18 @@ mod tests {
     #[test]
     fn lane_client_rejects_unknown_lane_naming_known_set() {
         let router = thin_heavy_mock();
-        let err = router.lane_client("turbo").err().expect("unknown lane must be rejected");
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
-        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+        let err = router
+            .lane_client("turbo")
+            .err()
+            .expect("unknown lane must be rejected");
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
+        assert!(
+            err.contains("thin") && err.contains("heavy"),
+            "error must list known lanes: {err}"
+        );
     }
 
     #[tokio::test]
@@ -654,7 +765,10 @@ mod tests {
             }
 
             async fn health(&self) -> LlmHealth {
-                LlmHealth { online: true, endpoint: self.endpoint().into() }
+                LlmHealth {
+                    online: true,
+                    endpoint: self.endpoint().into(),
+                }
             }
         }
 
@@ -667,16 +781,23 @@ mod tests {
 
         let stream_router = router.clone();
         let handle = tokio::spawn(async move {
-            stream_router.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await
+            stream_router
+                .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+                .await
         });
         tokio::task::yield_now().await;
 
-        router.set_lane_model(THIN_LANE, Some("new".into())).unwrap();
+        router
+            .set_lane_model(THIN_LANE, Some("new".into()))
+            .unwrap();
         assert_eq!(router.info().lanes[0].model_id.as_deref(), Some("new"));
 
         gate.notify_one();
         let outcome = handle.await.unwrap().unwrap();
-        assert_eq!(outcome.text, "old-client-reply", "in-flight stream must finish on its snapshot");
+        assert_eq!(
+            outcome.text, "old-client-reply",
+            "in-flight stream must finish on its snapshot"
+        );
     }
 
     // --- M004 S05: the cloud-routing injection seam. set_lane_client swaps a
@@ -692,9 +813,15 @@ mod tests {
         let (before, _) = chat(&router).await;
         assert_eq!(before.unwrap().text, "heavy-reply");
 
-        router.set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud-reply")).unwrap();
+        router
+            .set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud-reply"))
+            .unwrap();
         let (after, seen) = chat(&router).await;
-        assert_eq!(after.unwrap().text, "cloud-reply", "the injected client must serve the lane");
+        assert_eq!(
+            after.unwrap().text,
+            "cloud-reply",
+            "the injected client must serve the lane"
+        );
         assert_eq!(seen, vec!["cloud-reply"]);
     }
 
@@ -704,7 +831,9 @@ mod tests {
         // so injecting a cloud client must leave it intact — set_lane_model can
         // then rebuild the same local model on opt-in-off.
         let router = thin_heavy_mock();
-        router.set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud")).unwrap();
+        router
+            .set_lane_client(HEAVY_LANE, TaggedClient::ok("cloud"))
+            .unwrap();
         assert_eq!(
             router.info().lanes[1].model_id.as_deref(),
             Some("heavy-7b"),
@@ -723,13 +852,30 @@ mod tests {
         let injected_guard = test_guard();
         let cloud = OpenAiClient::new(TEST_NET_1);
         let guarded = GuardedClient::new(Arc::new(cloud), injected_guard.clone());
-        router.set_lane_client(HEAVY_LANE, Arc::new(guarded)).unwrap();
+        router
+            .set_lane_client(HEAVY_LANE, Arc::new(guarded))
+            .unwrap();
         router.set_active(HEAVY_LANE).unwrap();
 
-        let err = router.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
-        assert_eq!(err.kind(), "guard-blocked", "the injected guarded client must still block");
-        assert_eq!(injected_guard.blocked_count(), 1, "the injected client's own guard fired");
-        assert_eq!(router_guard.blocked_count(), 0, "the router did not re-wrap with its guard");
+        let err = router
+            .stream_chat(&low_confidence_req(), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "guard-blocked",
+            "the injected guarded client must still block"
+        );
+        assert_eq!(
+            injected_guard.blocked_count(),
+            1,
+            "the injected client's own guard fired"
+        );
+        assert_eq!(
+            router_guard.blocked_count(),
+            0,
+            "the router did not re-wrap with its guard"
+        );
     }
 
     #[test]
@@ -737,10 +883,15 @@ mod tests {
         let router = thin_heavy_mock();
         let err = router
             .set_lane_client("turbo", TaggedClient::ok("x"))
-            .err()
-            .expect("unknown lane must be rejected");
-        assert!(err.contains("turbo"), "error must name the rejected lane: {err}");
-        assert!(err.contains("thin") && err.contains("heavy"), "error must list known lanes: {err}");
+            .expect_err("unknown lane must be rejected");
+        assert!(
+            err.contains("turbo"),
+            "error must name the rejected lane: {err}"
+        );
+        assert!(
+            err.contains("thin") && err.contains("heavy"),
+            "error must list known lanes: {err}"
+        );
         let info = router.info();
         assert_eq!(info.lanes[0].model_id.as_deref(), Some("thin-1b"));
         assert_eq!(info.lanes[1].model_id.as_deref(), Some("heavy-7b"));
@@ -765,7 +916,10 @@ mod tests {
         // The chat/tool-loop path: stream_chat on the router itself.
         let guard = test_guard();
         let router = ModelRouter::thin_heavy(TEST_NET_1, None, None, guard.clone());
-        let err = router.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        let err = router
+            .stream_chat(&low_confidence_req(), &|_| {})
+            .await
+            .unwrap_err();
         assert_eq!(
             err.kind(),
             "guard-blocked",
@@ -783,7 +937,10 @@ mod tests {
         let router =
             ModelRouter::thin_heavy(TEST_NET_1, Some("thin-test".into()), None, guard.clone());
         let (_, client) = router.lane_client(THIN_LANE).unwrap();
-        let err = client.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        let err = client
+            .stream_chat(&low_confidence_req(), &|_| {})
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "guard-blocked");
         assert_eq!(guard.blocked_count(), 1);
         assert_eq!(
@@ -799,9 +956,14 @@ mod tests {
         // be guarded too, or a re-pin would reopen the pipe.
         let guard = test_guard();
         let router = ModelRouter::thin_heavy(TEST_NET_1, None, None, guard.clone());
-        router.set_lane_model(THIN_LANE, Some("repinned".into())).unwrap();
-        let request = req(vec![ChatMessage::user("look at this")
-            .with_attachments(vec![crate::llm::Attachment { base64_png: "QUJD".into() }])]);
+        router
+            .set_lane_model(THIN_LANE, Some("repinned".into()))
+            .unwrap();
+        let request = req(vec![ChatMessage::user("look at this").with_attachments(
+            vec![crate::llm::Attachment {
+                base64_png: "QUJD".into(),
+            }],
+        )]);
         let err = router.stream_chat(&request, &|_| {}).await.unwrap_err();
         assert_eq!(err.kind(), "guard-blocked");
         assert_eq!(guard.blocked_count(), 1);
@@ -813,7 +975,10 @@ mod tests {
         // attempts the connect (offline after the connect timeout), while the
         // guarded paths above return guard-blocked without ever connecting.
         let client = OpenAiClient::new(TEST_NET_1);
-        let err = client.stream_chat(&low_confidence_req(), &|_| {}).await.unwrap_err();
+        let err = client
+            .stream_chat(&low_confidence_req(), &|_| {})
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
     }
 

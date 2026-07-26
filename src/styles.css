@@ -19,7 +19,7 @@ body,
   justify-content: center;
   height: 100%;
   padding: 15vh 16px 16px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--te-font);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -49,12 +49,13 @@ body,
 .overlay-panel {
   position: relative;
   width: 100%;
-  border-radius: 12px;
-  background: rgba(28, 28, 30, 0.82);
-  backdrop-filter: blur(24px);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  border-radius: var(--te-r-2xl);
+  background: var(--te-glass);
+  backdrop-filter: var(--te-blur);
+  -webkit-backdrop-filter: var(--te-blur);
+  box-shadow: var(--te-shadow-panel);
   padding: 12px;
-  border: 1px solid transparent;
+  border: 1px solid rgba(147, 218, 73, 0.22);
 }
 
 /* --- Overlay geometry: drag header + corner resize grip (M006/S01) --------- */
@@ -145,6 +146,19 @@ body,
   height: 100%;
   border-radius: 0;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* In a drawer the transcript owns the leftover vertical space instead of
+   stopping at the floating-mode 40vh cap — a full-height right/left drawer is
+   all chat, with the model row pushed to the panel bottom. min-height: 0 lets
+   the list shrink inside the flex column so ITS scrollbar (not the panel's)
+   handles overflow. */
+.overlay-root[data-edge] .chat-messages {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
 }
 
 /* --- Drawer mode: inner-edge resize handle (M006/S03) ----------------------
@@ -163,7 +177,7 @@ body,
 }
 
 .overlay-drawer-resize-edge:hover {
-  background: rgba(122, 162, 255, 0.28);
+  background: rgba(147, 218, 73, 0.28);
 }
 
 /* Left drawer docked at the left → inner edge is the panel's RIGHT side. */
@@ -203,38 +217,90 @@ body,
 }
 
 .overlay-root[data-state="visible-focused"] .overlay-panel {
-  border-color: rgba(122, 162, 255, 0.45);
+  border-color: rgba(147, 218, 73, 0.45);
+}
+
+/* Input row (2026-07 design): eye · large light input · esc chip. */
+.overlay-input-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 6px 8px;
+}
+
+.overlay-input-eye {
+  display: inline-flex;
+  flex: none;
+  color: #ffffff;
 }
 
 .overlay-input {
+  flex: 1;
   width: 100%;
   border: none;
   outline: none;
   background: transparent;
   color: rgba(255, 255, 255, 0.92);
-  font-size: 20px;
+  font-size: 19px;
+  font-weight: 300;
   line-height: 1.4;
-  caret-color: #7aa2ff;
+  caret-color: var(--te-green);
 }
 
 .overlay-input::placeholder {
   color: rgba(255, 255, 255, 0.35);
 }
 
+.overlay-esc-chip {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--te-text-ghost);
+  border: 1px solid var(--te-line-strong);
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+
+.model-on-device {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--te-green);
+  white-space: nowrap;
+}
+
 /* --- Tray: S07 stub notice banner (R010 — never silent) -------------------- */
 
+/* The DS Toast carries the notice chrome; this wrapper only lays out the
+   pill beside its dismiss control. */
 .tray-notice {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   margin-top: 10px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: rgba(122, 162, 255, 0.14);
-  border: 1px solid rgba(122, 162, 255, 0.4);
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 13px;
+}
+.tray-notice .te-toast {
+  flex: 1;
+  min-width: 0;
+}
+.tray-notice-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tray-notice-dismiss {
+  appearance: none;
+  border: none;
+  background: none;
+  margin: 0;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--te-text-ghost);
+  cursor: pointer;
+  border-radius: 6px;
+  flex: none;
+}
+.tray-notice-dismiss:hover {
+  color: var(--te-text-strong);
+  background: var(--te-fill-hover);
 }
 
 /* --- Screen capture: attach affordance (R004/R007/R008) ------------------- */
@@ -250,7 +316,7 @@ body,
   align-items: center;
   gap: 6px;
   border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 6px;
+  border-radius: var(--te-r-pill);
   background: transparent;
   color: rgba(255, 255, 255, 0.6);
   font-size: 12px;
@@ -273,7 +339,7 @@ body,
   height: 10px;
   border-radius: 50%;
   border: 2px solid rgba(255, 255, 255, 0.25);
-  border-top-color: #7aa2ff;
+  border-top-color: var(--te-green);
   animation: attach-spin 0.8s linear infinite;
 }
 
@@ -287,9 +353,9 @@ body,
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border-radius: 6px;
-  background: rgba(122, 162, 255, 0.18);
-  border: 1px solid rgba(122, 162, 255, 0.45);
+  border-radius: var(--te-r-pill);
+  background: rgba(147, 218, 73, 0.18);
+  border: 1px solid rgba(147, 218, 73, 0.45);
   color: rgba(255, 255, 255, 0.85);
   font-size: 12px;
   padding: 3px 8px;
@@ -333,86 +399,7 @@ body,
   gap: 6px;
 }
 
-/* First-run onboarding panel (M006): a one-time explainer over the overlay,
-   requesting Screen Recording + Accessibility with context. Wider than the
-   chat input so the two permission rows breathe. */
-.onboarding-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 20px;
-}
 
-.onboarding-title {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.95);
-}
-
-.onboarding-intro {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.5;
-  color: rgba(255, 255, 255, 0.72);
-}
-
-.onboarding-step {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-/* A granted step reads as settled — green edge, no more action needed. */
-.onboarding-step[data-step="granted"] {
-  border-color: rgba(120, 220, 150, 0.4);
-  background: rgba(120, 220, 150, 0.1);
-}
-
-.onboarding-step-text {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.onboarding-step-text span {
-  font-size: 12px;
-  line-height: 1.5;
-  color: rgba(255, 255, 255, 0.65);
-}
-
-.onboarding-step-status {
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.onboarding-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 4px;
-}
-
-/* Skip is deliberately quiet — a text button, not a primary action. */
-.onboarding-skip {
-  border: none;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 12px;
-  cursor: pointer;
-  padding: 5px 4px;
-}
-
-.onboarding-skip:hover {
-  color: rgba(255, 255, 255, 0.8);
-}
 
 /* Tag marking a user turn that carried a screenshot. */
 .chat-attached-tag {
@@ -420,7 +407,7 @@ body,
   margin-left: 8px;
   padding: 1px 6px;
   border-radius: 4px;
-  background: rgba(122, 162, 255, 0.3);
+  background: rgba(147, 218, 73, 0.3);
   color: rgba(210, 224, 255, 0.95);
   font-size: 11px;
   text-transform: uppercase;
@@ -509,7 +496,7 @@ body,
 .chat-user {
   align-self: flex-end;
   max-width: 85%;
-  background: rgba(122, 162, 255, 0.22);
+  background: rgba(147, 218, 73, 0.22);
   color: rgba(255, 255, 255, 0.95);
 }
 
@@ -652,8 +639,8 @@ body,
 }
 
 .model-lane[aria-pressed="true"] {
-  background: rgba(122, 162, 255, 0.25);
-  border-color: rgba(122, 162, 255, 0.6);
+  background: rgba(147, 218, 73, 0.25);
+  border-color: rgba(147, 218, 73, 0.6);
   color: rgba(255, 255, 255, 0.95);
 }
 
@@ -664,18 +651,17 @@ body,
 .settings-root {
   height: 100%;
   padding: 8px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--te-font);
   -webkit-user-select: none;
   user-select: none;
 }
 
 .settings-panel {
   height: 100%;
-  border-radius: 12px;
-  background: rgba(28, 28, 30, 0.94);
-  backdrop-filter: blur(24px);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--te-r-xl);
+  background: var(--te-navy-panel);
+  box-shadow: var(--te-shadow-modal);
+  border: 1px solid rgba(255, 255, 255, 0.11);
   padding: 16px;
   color: rgba(255, 255, 255, 0.92);
   display: flex;
@@ -754,7 +740,7 @@ body,
 }
 
 .settings-nav-item[aria-current="page"] {
-  background: rgba(122, 162, 255, 0.28);
+  background: rgba(147, 218, 73, 0.28);
   color: rgba(255, 255, 255, 0.98);
 }
 
@@ -898,7 +884,7 @@ body,
 .settings-toggle {
   width: 16px;
   height: 16px;
-  accent-color: #7aa2ff;
+  accent-color: var(--te-green);
 }
 
 .settings-hint {
@@ -968,7 +954,7 @@ body,
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(0, 0, 0, 0.35);
   color: rgba(255, 255, 255, 0.92);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--te-font-mono);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -1049,8 +1035,8 @@ body,
   margin: 8px 0;
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(122, 162, 255, 0.14);
-  border: 1px solid rgba(122, 162, 255, 0.35);
+  background: rgba(147, 218, 73, 0.14);
+  border: 1px solid rgba(147, 218, 73, 0.35);
   font-size: 12px;
   color: rgba(255, 255, 255, 0.9);
 }
@@ -1134,7 +1120,7 @@ body,
   box-sizing: border-box;
   padding: 6px 8px;
   border-radius: 6px;
-  border: 1px solid rgba(122, 162, 255, 0.5);
+  border: 1px solid rgba(147, 218, 73, 0.5);
   background: rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.92);
   font-size: 12px;
@@ -1213,7 +1199,7 @@ body,
   height: 15px;
   margin-left: 3px;
   vertical-align: text-bottom;
-  background: #7aa2ff;
+  background: var(--te-green);
   animation: chat-caret-blink 1s steps(1) infinite;
 }
 
@@ -1239,9 +1225,9 @@ body,
   max-width: 360px;
   padding: 8px 14px;
   border-radius: 10px;
-  background: rgba(28, 28, 30, 0.82);
+  background: var(--te-glass);
   backdrop-filter: blur(24px);
-  border: 1px solid rgba(122, 162, 255, 0.35);
+  border: 1px solid rgba(147, 218, 73, 0.35);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   color: rgba(255, 255, 255, 0.92);
   font-size: 13px;
@@ -1254,7 +1240,7 @@ body,
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #7aa2ff;
+  background: var(--te-green);
 }
 
 .nudge-message {
@@ -1280,4 +1266,11 @@ body,
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Stacked settings row (label above control — retention chips). */
+.settings-row--stack {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
 }

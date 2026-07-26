@@ -270,8 +270,8 @@ pub fn noted_frame_rgba(tick: usize) -> Vec<u8> {
             // The "+" spark sits at (0.60, -0.60): the eye outline at that
             // fx only spans |fy| ≤ ~0.29, so the mark never touches it.
             let (sx, sy) = (fx - 0.60, fy + 0.60);
-            let spark = (sx.abs() <= 0.07 && sy.abs() <= 0.20)
-                || (sy.abs() <= 0.07 && sx.abs() <= 0.20);
+            let spark =
+                (sx.abs() <= 0.07 && sy.abs() <= 0.20) || (sy.abs() <= 0.07 && sx.abs() <= 0.20);
             if (in_outer && !in_inner) || pupil || spark {
                 let i = ((y * n + x) * 4) as usize;
                 buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
@@ -354,8 +354,11 @@ pub enum ActivityClass {
 
 impl ActivityClass {
     /// Every class in ascending priority — indexes the per-class counts.
-    const ALL: [ActivityClass; CLASS_COUNT] =
-        [ActivityClass::Watching, ActivityClass::Working, ActivityClass::Noted];
+    const ALL: [ActivityClass; CLASS_COUNT] = [
+        ActivityClass::Watching,
+        ActivityClass::Working,
+        ActivityClass::Noted,
+    ];
 
     fn index(self) -> usize {
         self as usize
@@ -394,7 +397,9 @@ pub struct ActivityCounter {
 
 impl ActivityCounter {
     pub const fn new() -> Self {
-        Self { counts: [0; CLASS_COUNT] }
+        Self {
+            counts: [0; CLASS_COUNT],
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -404,7 +409,10 @@ impl ActivityCounter {
     /// The highest-priority class with a live activity — the frame family
     /// the animation should render right now. `None` when idle.
     pub fn dominant_class(&self) -> Option<ActivityClass> {
-        ActivityClass::ALL.into_iter().rev().find(|c| self.counts[c.index()] > 0)
+        ActivityClass::ALL
+            .into_iter()
+            .rev()
+            .find(|c| self.counts[c.index()] > 0)
     }
 
     pub fn begin(&mut self, class: ActivityClass) -> StatusChange {
@@ -443,9 +451,20 @@ struct TrayActivityInner {
     epoch: u64,
 }
 
+impl Default for TrayActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrayActivity {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(TrayActivityInner { counter: ActivityCounter::new(), epoch: 0 }) }
+        Self {
+            inner: Mutex::new(TrayActivityInner {
+                counter: ActivityCounter::new(),
+                epoch: 0,
+            }),
+        }
     }
 
     /// Returns the transition, the activity count after it, and the epoch
@@ -525,7 +544,10 @@ pub fn begin_activity(app: &AppHandle, kind: ActivityKind) -> ActivityGuard {
         // untracked but the caller's real work must not be blocked.
         None => log::debug!("tray: activity state unmanaged (kind={})", kind.as_str()),
     }
-    ActivityGuard { app: app.clone(), kind }
+    ActivityGuard {
+        app: app.clone(),
+        kind,
+    }
 }
 
 fn end_activity(app: &AppHandle, kind: ActivityKind) {
@@ -541,10 +563,16 @@ fn end_activity(app: &AppHandle, kind: ActivityKind) {
             set_tray_frame(app, resting_frame(app));
         }
         StatusChange::NoChange => {
-            log::debug!("tray: activity left (activities={activities}, kind={})", kind.as_str());
+            log::debug!(
+                "tray: activity left (activities={activities}, kind={})",
+                kind.as_str()
+            );
         }
         StatusChange::Underflow => {
-            log::error!("tray: activity underflow (kind={}) — end without begin ignored", kind.as_str());
+            log::error!(
+                "tray: activity underflow (kind={}) — end without begin ignored",
+                kind.as_str()
+            );
         }
         StatusChange::To(TrayStatus::Watching) => unreachable!("end() never starts watching"),
     }
@@ -553,14 +581,18 @@ fn end_activity(app: &AppHandle, kind: ActivityKind) {
 /// True when privacy mode is on — the managed [`crate::capture::PrivacyState`]
 /// is the single truth (S07); unmanaged state reads as off.
 fn privacy_enabled(app: &AppHandle) -> bool {
-    app.try_state::<crate::capture::PrivacyState>().map(|s| s.enabled()).unwrap_or(false)
+    app.try_state::<crate::capture::PrivacyState>()
+        .map(|s| s.enabled())
+        .unwrap_or(false)
 }
 
 /// True when the continuous watcher toggle is on — the managed
 /// [`crate::watcher::WatcherState`] is the single truth (M002 S01);
 /// unmanaged state reads as off.
 fn watcher_enabled(app: &AppHandle) -> bool {
-    app.try_state::<crate::watcher::WatcherState>().map(|s| s.enabled()).unwrap_or(false)
+    app.try_state::<crate::watcher::WatcherState>()
+        .map(|s| s.enabled())
+        .unwrap_or(false)
 }
 
 /// The frame the icon rests on when no activity runs: the privacy frame
@@ -579,7 +611,10 @@ fn resting_frame(app: &AppHandle) -> Vec<u8> {
 /// watching animation owns the icon and the next sleep transition picks up
 /// the right resting frame on its own.
 pub fn refresh_resting_frame(app: &AppHandle) {
-    let idle = app.try_state::<TrayActivity>().map(|s| s.count() == 0).unwrap_or(true);
+    let idle = app
+        .try_state::<TrayActivity>()
+        .map(|s| s.count() == 0)
+        .unwrap_or(true);
     if idle {
         set_tray_frame(app, resting_frame(app));
     }
@@ -603,10 +638,7 @@ fn class_frame(class: ActivityClass, tick: usize) -> Vec<u8> {
 fn spawn_animation(app: AppHandle, epoch: u64) {
     tauri::async_runtime::spawn(async move {
         let mut tick: usize = 0;
-        loop {
-            let Some(state) = app.try_state::<TrayActivity>() else {
-                break;
-            };
+        while let Some(state) = app.try_state::<TrayActivity>() {
             if state.epoch() != epoch {
                 break;
             }
@@ -683,9 +715,14 @@ pub struct TrayUi {
 pub fn init(app: &AppHandle) -> Result<(), String> {
     let err = |e: tauri::Error| e.to_string();
 
-    let activate =
-        MenuItem::with_id(app, MENU_ID_ACTIVATE, "Activate Third Eye", true, None::<&str>)
-            .map_err(err)?;
+    let activate = MenuItem::with_id(
+        app,
+        MENU_ID_ACTIVATE,
+        "Activate Third Eye",
+        true,
+        None::<&str>,
+    )
+    .map_err(err)?;
     // Checked state comes from the OS-owned launcher entry, so it reflects
     // reality even across restarts and out-of-band changes.
     let autostart_item = CheckMenuItem::with_id(
@@ -716,14 +753,21 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         .map_err(err)?;
         hotkey_items.push((preset, item));
     }
-    let hotkey_refs: Vec<&dyn IsMenuItem<Wry>> =
-        hotkey_items.iter().map(|(_, item)| item as &dyn IsMenuItem<Wry>).collect();
+    let hotkey_refs: Vec<&dyn IsMenuItem<Wry>> = hotkey_items
+        .iter()
+        .map(|(_, item)| item as &dyn IsMenuItem<Wry>)
+        .collect();
     let hotkey_menu = Submenu::with_items(app, "Hotkey", true, &hotkey_refs).map_err(err)?;
     let settings =
         MenuItem::with_id(app, MENU_ID_SETTINGS, "Settings…", true, None::<&str>).map_err(err)?;
-    let models =
-        MenuItem::with_id(app, MENU_ID_CONFIGURE_MODELS, "Configure Models…", true, None::<&str>)
-            .map_err(err)?;
+    let models = MenuItem::with_id(
+        app,
+        MENU_ID_CONFIGURE_MODELS,
+        "Configure Models…",
+        true,
+        None::<&str>,
+    )
+    .map_err(err)?;
     // Checked state comes from the shared PrivacyState, which setup()
     // seeded from settings.json before building the tray — so the item
     // reflects the persisted toggle across restarts (S07).
@@ -768,11 +812,24 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     .map_err(err)?;
 
     // The initial icon honors persisted privacy mode (applied before init).
+    // Left-click toggles the tray-panel webview (2026-07 redesign); the
+    // native menu stays as the right-click fallback (Quit, Autostart, …).
     let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::new_owned(resting_frame(app), ICON_SIZE, ICON_SIZE))
         .tooltip("Third Eye")
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                position,
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_tray_panel(tray.app_handle(), position.x, position.y);
+            }
+        })
         .on_menu_event(|app, event| on_menu_event(app, event.id().as_ref()));
     // Template rendering keeps the white-on-transparent frames legible on
     // both light and dark menu bars.
@@ -780,7 +837,12 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     let builder = builder.icon_as_template(true);
     builder.build(app).map_err(err)?;
 
-    app.manage(TrayUi { autostart_item, hotkey_items, privacy_item, watcher_item });
+    app.manage(TrayUi {
+        autostart_item,
+        hotkey_items,
+        privacy_item,
+        watcher_item,
+    });
 
     log::info!(
         "tray: initialized (menu: {MENU_ID_ACTIVATE}, {MENU_ID_AUTOSTART}, \
@@ -790,6 +852,138 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         hotkey::HOTKEY_PRESETS.len()
     );
     Ok(())
+}
+
+/// Label of the pre-declared tray-panel window (tauri.conf.json).
+pub const TRAY_PANEL_LABEL: &str = "tray-panel";
+
+/// Logical width of the tray panel (matches the webview's card width).
+pub const TRAY_PANEL_WIDTH: f64 = 336.0;
+/// Gap between the click point / screen edges and the panel.
+pub const TRAY_PANEL_MARGIN: f64 = 8.0;
+
+/// Pure: the panel's top-left logical position for a tray click at
+/// (`click_x`, `click_y`) on a monitor spanning `mon_x..mon_x + mon_w`.
+/// Centered under the click, clamped inside the monitor with a margin —
+/// the centered-fallback the spec allows on platforms where the click
+/// coordinate is unreliable is just this with the monitor center as the
+/// click. Y sits below the click (the menu bar) by the margin.
+pub fn tray_panel_position(click_x: f64, click_y: f64, mon_x: f64, mon_w: f64) -> (f64, f64) {
+    let min_x = mon_x + TRAY_PANEL_MARGIN;
+    let max_x = (mon_x + mon_w - TRAY_PANEL_WIDTH - TRAY_PANEL_MARGIN).max(min_x);
+    let x = (click_x - TRAY_PANEL_WIDTH / 2.0).clamp(min_x, max_x);
+    (x, click_y + TRAY_PANEL_MARGIN)
+}
+
+/// One-time setup (Tauri setup hook): convert the tray-panel window into a
+/// nonactivating never-key panel (hud.rs helper — same posture: buttons
+/// only, showing it must never activate the app under the Accessory
+/// policy). Fatal on failure, like the overlay/settings conversions.
+pub fn init_panel(app: &AppHandle) -> Result<(), String> {
+    crate::hud::convert_never_key_panel(app, TRAY_PANEL_LABEL, 1)?;
+    #[cfg(target_os = "macos")]
+    outside_click::install(app);
+    Ok(())
+}
+
+/// Outside-click dismiss for the tray panel (follow-up): a permanent global
+/// NSEvent mouse monitor installed once at setup. Global monitors observe
+/// only events delivered to OTHER applications, so clicks inside the panel
+/// (or on the tray icon, which is our own NSStatusItem) never fire it —
+/// exactly the "clicked elsewhere" signal. The handler is a visibility
+/// check + hide; keeping the monitor permanent avoids install/remove races
+/// with its own callback.
+#[cfg(target_os = "macos")]
+mod outside_click {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    use tauri::{AppHandle, Manager};
+
+    use super::TRAY_PANEL_LABEL;
+
+    pub fn install(app: &AppHandle) {
+        let handler_app = app.clone();
+        let result = app.run_on_main_thread(move || {
+            let block = RcBlock::new(move |_event: std::ptr::NonNull<NSEvent>| {
+                let visible = handler_app
+                    .get_webview_window(TRAY_PANEL_LABEL)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                if visible {
+                    if let Err(e) = crate::hud::panel_hide(&handler_app, TRAY_PANEL_LABEL) {
+                        log::warn!("tray: outside-click dismiss failed: {e}");
+                    }
+                }
+            });
+            let mask = NSEventMask::LeftMouseDown
+                | NSEventMask::RightMouseDown
+                | NSEventMask::OtherMouseDown;
+            // The returned monitor token is deliberately leaked: the monitor
+            // lives for the app's lifetime.
+            let monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+            match monitor {
+                Some(token) => {
+                    std::mem::forget(token);
+                    log::debug!("tray: outside-click dismiss monitor installed");
+                }
+                None => log::warn!(
+                    "tray: global mouse monitor unavailable — panel dismisses via tray/✕ only"
+                ),
+            }
+        });
+        if let Err(e) = result {
+            log::warn!("tray: outside-click monitor dispatch failed: {e}");
+        }
+    }
+}
+
+/// Toggle the tray-panel webview at the clicked tray icon. Hidden→shown at
+/// the anchored position; shown→hidden. Failures are logged, never fatal —
+/// the right-click menu remains the fallback surface.
+fn toggle_tray_panel(app: &AppHandle, click_x: f64, click_y: f64) {
+    let Some(window) = app.get_webview_window(TRAY_PANEL_LABEL) else {
+        log::warn!("tray: panel window '{TRAY_PANEL_LABEL}' missing from tauri.conf.json");
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        if let Err(e) = crate::hud::panel_hide(app, TRAY_PANEL_LABEL) {
+            log::warn!("tray: panel hide failed: {e}");
+        }
+        return;
+    }
+    // The click arrives in physical pixels; anchor within the monitor under
+    // the click (fallback: primary monitor — the spec's fallback posture).
+    let monitor = app
+        .monitor_from_point(click_x, click_y)
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let (x, y) = match monitor {
+        Some(monitor) => {
+            let scale = monitor.scale_factor();
+            let size = monitor.size().to_logical::<f64>(scale);
+            let origin = monitor.position().to_logical::<f64>(scale);
+            tray_panel_position(click_x / scale, click_y / scale, origin.x, size.width)
+        }
+        None => {
+            log::warn!("tray: no monitor found for panel anchor; using click as-is");
+            (click_x, click_y + TRAY_PANEL_MARGIN)
+        }
+    };
+    if let Err(e) = window.set_position(tauri::LogicalPosition::new(x, y)) {
+        log::warn!("tray: panel position failed: {e}");
+        return;
+    }
+    if let Err(e) = crate::hud::panel_show(app, TRAY_PANEL_LABEL) {
+        log::warn!("tray: panel show failed: {e}");
+    }
+}
+
+/// Hide the tray panel — invoked by the panel webview when one of its
+/// actions navigates elsewhere (Summon / Settings) or the ✕ closes it.
+#[tauri::command]
+pub fn hide_tray_panel(app: AppHandle) -> Result<(), String> {
+    crate::hud::panel_hide(&app, TRAY_PANEL_LABEL)
 }
 
 fn on_menu_event(app: &AppHandle, id: &str) {
@@ -842,7 +1036,12 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             // Summon first so the banner lands on a visible overlay, but emit
             // even if summoning failed — a stub click is never silent.
             summon(app, feature);
-            match app.emit(NOTICE_EVENT, NoticePayload { feature: feature.into() }) {
+            match app.emit(
+                NOTICE_EVENT,
+                NoticePayload {
+                    feature: feature.into(),
+                },
+            ) {
                 Ok(()) => log::info!("tray: emitted {NOTICE_EVENT} for '{feature}'"),
                 Err(e) => log::error!("tray: failed to emit {NOTICE_EVENT} for '{feature}': {e}"),
             }
@@ -921,7 +1120,10 @@ fn summon(app: &AppHandle, cause: &str) {
             return;
         }
     }
-    log::info!("tray: summoned overlay ({cause}, from={})", current.as_str());
+    log::info!(
+        "tray: summoned overlay ({cause}, from={})",
+        current.as_str()
+    );
 }
 
 #[cfg(test)]
@@ -930,13 +1132,39 @@ mod tests {
     use OverlayState::*;
 
     #[test]
+    fn tray_panel_position_centers_under_the_click_and_clamps_to_the_monitor() {
+        // Center of a wide monitor: panel centered under the click, margin below.
+        let (x, y) = tray_panel_position(960.0, 30.0, 0.0, 1920.0);
+        assert_eq!(x, 960.0 - TRAY_PANEL_WIDTH / 2.0);
+        assert_eq!(y, 30.0 + TRAY_PANEL_MARGIN);
+        // Click near the right edge (the usual menu-bar spot): clamped inside.
+        let (x, _) = tray_panel_position(1900.0, 24.0, 0.0, 1920.0);
+        assert_eq!(x, 1920.0 - TRAY_PANEL_WIDTH - TRAY_PANEL_MARGIN);
+        // Secondary monitor at a negative origin: clamp respects its bounds.
+        let (x, _) = tray_panel_position(-2500.0, 24.0, -2560.0, 2560.0);
+        assert!(x >= -2560.0 + TRAY_PANEL_MARGIN);
+        // Degenerate skinny monitor: never panics, pins to the left margin.
+        let (x, _) = tray_panel_position(50.0, 24.0, 0.0, 100.0);
+        assert_eq!(x, TRAY_PANEL_MARGIN);
+    }
+
+    #[test]
+    fn tray_panel_window_is_declared_in_tauri_conf() {
+        let conf = include_str!("../tauri.conf.json");
+        assert!(conf.contains(&format!("\"label\": \"{TRAY_PANEL_LABEL}\"")));
+    }
+
+    #[test]
     fn every_menu_id_maps_to_its_action() {
         assert_eq!(menu_action(MENU_ID_ACTIVATE), MenuAction::Activate);
         assert_eq!(menu_action(MENU_ID_AUTOSTART), MenuAction::ToggleAutostart);
         // S07: both settings entries open the real settings window — no menu
         // id maps to the stub Notice action anymore.
         assert_eq!(menu_action(MENU_ID_SETTINGS), MenuAction::OpenSettings);
-        assert_eq!(menu_action(MENU_ID_CONFIGURE_MODELS), MenuAction::OpenSettings);
+        assert_eq!(
+            menu_action(MENU_ID_CONFIGURE_MODELS),
+            MenuAction::OpenSettings
+        );
         assert_eq!(menu_action(MENU_ID_PRIVACY_MODE), MenuAction::TogglePrivacy);
         assert_eq!(menu_action(MENU_ID_WATCH_SCREEN), MenuAction::ToggleWatcher);
         assert_eq!(menu_action(MENU_ID_QUIT), MenuAction::Quit);
@@ -945,9 +1173,15 @@ mod tests {
     #[test]
     fn unknown_menu_id_maps_to_no_action() {
         // Q7: a stale or foreign menu id must never trigger a real action.
-        for bad in
-            ["", "settngs", "ACTIVATE", "quit ", "tray://notice", "launch-at-login ", "watch-screen "]
-        {
+        for bad in [
+            "",
+            "settngs",
+            "ACTIVATE",
+            "quit ",
+            "tray://notice",
+            "launch-at-login ",
+            "watch-screen ",
+        ] {
             assert_eq!(menu_action(bad), MenuAction::Ignore, "id: {bad:?}");
         }
     }
@@ -982,7 +1216,9 @@ mod tests {
         for start in [Hidden, VisibleIdle, VisibleFocused] {
             let mut s = start;
             for &event in summon_events(start) {
-                s = s.apply(event).unwrap_or_else(|e| panic!("from {start:?}: {e}"));
+                s = s
+                    .apply(event)
+                    .unwrap_or_else(|e| panic!("from {start:?}: {e}"));
             }
             assert_eq!(s, VisibleFocused, "starting at {start:?}");
         }
@@ -997,7 +1233,10 @@ mod tests {
 
     #[test]
     fn notice_payload_serializes_feature_field() {
-        let v = serde_json::to_value(NoticePayload { feature: "settings".into() }).unwrap();
+        let v = serde_json::to_value(NoticePayload {
+            feature: "settings".into(),
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({ "feature": "settings" }));
     }
 
@@ -1061,7 +1300,11 @@ mod tests {
         assert_ne!(watching_frame_rgba(0), watching_frame_rgba(1));
         assert_ne!(watching_frame_rgba(1), watching_frame_rgba(3));
         for tick in 0..PUPIL_CYCLE.len() {
-            assert_ne!(watching_frame_rgba(tick), sleeping_frame_rgba(), "tick {tick}");
+            assert_ne!(
+                watching_frame_rgba(tick),
+                sleeping_frame_rgba(),
+                "tick {tick}"
+            );
         }
     }
 
@@ -1071,15 +1314,23 @@ mod tests {
         assert_eq!(watching_frame_rgba(0), watching_frame_rgba(period));
         assert_eq!(watching_frame_rgba(3), watching_frame_rgba(3 + 2 * period));
         // A long-running animation must not misbehave at large tick values.
-        assert_eq!(watching_frame_rgba(usize::MAX % period), watching_frame_rgba(usize::MAX));
+        assert_eq!(
+            watching_frame_rgba(usize::MAX % period),
+            watching_frame_rgba(usize::MAX)
+        );
     }
 
     #[test]
     fn tray_status_serializes_lowercase_with_matching_as_str() {
-        for (status, name) in [(TrayStatus::Watching, "watching"), (TrayStatus::Sleeping, "sleeping")]
-        {
+        for (status, name) in [
+            (TrayStatus::Watching, "watching"),
+            (TrayStatus::Sleeping, "sleeping"),
+        ] {
             assert_eq!(status.as_str(), name);
-            assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!(name));
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(name)
+            );
         }
         assert_eq!(ActivityKind::Stream.as_str(), "stream");
         assert_eq!(ActivityKind::Capture.as_str(), "capture");
@@ -1103,9 +1354,15 @@ mod tests {
     #[test]
     fn counter_wakes_on_first_activity_and_sleeps_on_last() {
         let mut c = ActivityCounter::new();
-        assert_eq!(c.begin(ActivityClass::Watching), StatusChange::To(TrayStatus::Watching));
+        assert_eq!(
+            c.begin(ActivityClass::Watching),
+            StatusChange::To(TrayStatus::Watching)
+        );
         assert_eq!(c.count(), 1);
-        assert_eq!(c.end(ActivityClass::Watching), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(
+            c.end(ActivityClass::Watching),
+            StatusChange::To(TrayStatus::Sleeping)
+        );
         assert_eq!(c.count(), 0);
     }
 
@@ -1114,11 +1371,17 @@ mod tests {
         // A capture during a stream must not flip the icon to sleeping when
         // it finishes first — cross-class overlap counts as one wake span.
         let mut c = ActivityCounter::new();
-        assert_eq!(c.begin(ActivityClass::Working), StatusChange::To(TrayStatus::Watching));
+        assert_eq!(
+            c.begin(ActivityClass::Working),
+            StatusChange::To(TrayStatus::Watching)
+        );
         assert_eq!(c.begin(ActivityClass::Watching), StatusChange::NoChange);
         assert_eq!(c.end(ActivityClass::Watching), StatusChange::NoChange);
         assert_eq!(c.count(), 1);
-        assert_eq!(c.end(ActivityClass::Working), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(
+            c.end(ActivityClass::Working),
+            StatusChange::To(TrayStatus::Sleeping)
+        );
     }
 
     #[test]
@@ -1150,8 +1413,14 @@ mod tests {
         assert_eq!(c.end(ActivityClass::Watching), StatusChange::Underflow);
         assert_eq!(c.count(), 0);
         // The counter still works normally afterwards.
-        assert_eq!(c.begin(ActivityClass::Watching), StatusChange::To(TrayStatus::Watching));
-        assert_eq!(c.end(ActivityClass::Watching), StatusChange::To(TrayStatus::Sleeping));
+        assert_eq!(
+            c.begin(ActivityClass::Watching),
+            StatusChange::To(TrayStatus::Watching)
+        );
+        assert_eq!(
+            c.end(ActivityClass::Watching),
+            StatusChange::To(TrayStatus::Sleeping)
+        );
     }
 
     #[test]
@@ -1185,8 +1454,15 @@ mod tests {
 
         // The sleep transition bumps it: an animation task spawned with e1
         // sees a stale epoch and exits.
-        assert_eq!(a.end(ActivityClass::Watching), (StatusChange::To(TrayStatus::Sleeping), 0));
-        assert_ne!(a.epoch(), e1, "sleep must invalidate the watching animation");
+        assert_eq!(
+            a.end(ActivityClass::Watching),
+            (StatusChange::To(TrayStatus::Sleeping), 0)
+        );
+        assert_ne!(
+            a.epoch(),
+            e1,
+            "sleep must invalidate the watching animation"
+        );
 
         // The next watch cycle gets a fresh epoch, distinct from both.
         let (_, _, e3) = a.begin(ActivityClass::Watching);
@@ -1227,7 +1503,11 @@ mod tests {
         for w in 0..WORK_ORBIT.len() {
             let working = working_frame_rgba(w);
             for s in 0..PUPIL_CYCLE.len() {
-                assert_ne!(working, watching_frame_rgba(s), "working {w} vs watching {s}");
+                assert_ne!(
+                    working,
+                    watching_frame_rgba(s),
+                    "working {w} vs watching {s}"
+                );
             }
             assert_ne!(working, sleeping_frame_rgba(), "working {w} vs sleeping");
             assert_ne!(working, privacy_frame_rgba(), "working {w} vs privacy");
@@ -1242,7 +1522,10 @@ mod tests {
         // The pulse is the animation: consecutive ticks differ, the cycle
         // repeats.
         assert_ne!(noted_frame_rgba(0), noted_frame_rgba(1));
-        assert_eq!(noted_frame_rgba(0), noted_frame_rgba(NOTED_PUPIL_RADII.len()));
+        assert_eq!(
+            noted_frame_rgba(0),
+            noted_frame_rgba(NOTED_PUPIL_RADII.len())
+        );
     }
 
     #[test]
@@ -1263,6 +1546,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // the constant relation IS the documented claim
     fn noted_flash_spans_multiple_animation_frames() {
         // The flash must outlive at least two frame intervals or it could
         // come and go between ticks without ever being drawn.

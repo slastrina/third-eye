@@ -102,7 +102,11 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
     // --- mark_spawning: the launch task's first transition ------------------
     state.mark_spawning();
     let s = state.status();
-    assert_eq!(s.phase, McpPhase::Spawning, "launch marks spawning before the child comes up");
+    assert_eq!(
+        s.phase,
+        McpPhase::Spawning,
+        "launch marks spawning before the child comes up"
+    );
     assert_eq!(s.tool_count, 0, "no tools reachable while spawning");
 
     // --- spawn a REAL child + bounded handshake -----------------------------
@@ -111,7 +115,10 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
         .await
         .expect("MCP initialize handshake did not complete before timeout (silent hang?)")
         .expect("MCP initialize handshake returned an error");
-    eprintln!("[handshake] OK — peer_info={:?}", client.peer_info().map(|i| i.server_info.clone()));
+    eprintln!(
+        "[handshake] OK — peer_info={:?}",
+        client.peer_info().map(|i| i.server_info.clone())
+    );
 
     // --- tools/list via the production McpExecutor::connect path ------------
     // This is the exact seam `mcp_spawn::launch` uses: connect performs the real
@@ -120,13 +127,22 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
         .await
         .expect("McpExecutor::connect must complete tools/list against the real server");
     let tool_count = executor.definitions().len();
-    assert!(tool_count > 0, "the reference server must advertise at least one tool");
     assert!(
-        executor.definitions().iter().all(|d| d.name.starts_with(MCP_TOOL_PREFIX)),
+        tool_count > 0,
+        "the reference server must advertise at least one tool"
+    );
+    assert!(
+        executor
+            .definitions()
+            .iter()
+            .all(|d| d.name.starts_with(MCP_TOOL_PREFIX)),
         "every advertised tool is namespaced under mcp__ (no built-in collision)"
     );
     assert!(
-        executor.definitions().iter().any(|d| d.name == format!("{MCP_TOOL_PREFIX}echo")),
+        executor
+            .definitions()
+            .iter()
+            .any(|d| d.name == format!("{MCP_TOOL_PREFIX}echo")),
         "the reference server-everything must advertise an echo tool"
     );
 
@@ -138,10 +154,19 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
 
     let s = state.status();
     assert_eq!(s.phase, McpPhase::Ready, "a handshaked child is ready");
-    assert_eq!(s.tool_count, tool_count, "ready records the advertised tool count");
+    assert_eq!(
+        s.tool_count, tool_count,
+        "ready records the advertised tool count"
+    );
     assert_eq!(s.last_error, None, "a healthy child carries no error");
-    assert!(s.updated_at > 0, "a lifecycle transition stamps a real timestamp");
-    assert!(state.peer().is_some(), "the injected peer lights up the gate's Some(peer) branch");
+    assert!(
+        s.updated_at > 0,
+        "a lifecycle transition stamps a real timestamp"
+    );
+    assert!(
+        state.peer().is_some(),
+        "the injected peer lights up the gate's Some(peer) branch"
+    );
     eprintln!("[ready] OK — {tool_count} tools injected, health=ready");
 
     // --- tools reach the agent: a REAL echo call through the guarded gate ---
@@ -154,11 +179,20 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
         Arc::new(Mutex::new(McpAllowlist::new())),
         Arc::new(NeverPrompt),
     );
-    let outcome = tokio::time::timeout(OP_TIMEOUT, auto_gate.execute(&echo_call("hi from S04 live")))
-        .await
-        .expect("gate-driven echo call timed out");
-    assert!(outcome.ok, "the real echo round-trip through the gate must be ok: {outcome:?}");
-    assert_eq!(outcome.failure, None, "a successful gated call carries no failure kind");
+    let outcome = tokio::time::timeout(
+        OP_TIMEOUT,
+        auto_gate.execute(&echo_call("hi from S04 live")),
+    )
+    .await
+    .expect("gate-driven echo call timed out");
+    assert!(
+        outcome.ok,
+        "the real echo round-trip through the gate must be ok: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.failure, None,
+        "a successful gated call carries no failure kind"
+    );
     assert!(
         outcome.content.contains("hi from S04 live"),
         "the server's echoed payload must ride back through the guarded call_tool: {:?}",
@@ -198,7 +232,9 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
     // and awaits waiting(); the exit hook takes the stored token and cancels it.
     // A clean app exit MUST classify as QuitReason::Cancelled (no crash mark).
     let supervisor = tokio::spawn(async move { client.waiting().await });
-    let token = state.take_shutdown_handle().expect("a spawned child stored a shutdown handle");
+    let token = state
+        .take_shutdown_handle()
+        .expect("a spawned child stored a shutdown handle");
     assert!(
         state.take_shutdown_handle().is_none(),
         "the handle is taken exactly once so the child is cancelled once"
@@ -216,7 +252,10 @@ async fn mcp_lifecycle_ready_tools_reach_agent_then_clean_shutdown() {
     );
     // supervise()'s clean-shutdown branch clears the (now dead) peer.
     state.clear_peer();
-    assert!(state.peer().is_none(), "the peer is cleared after a clean shutdown");
+    assert!(
+        state.peer().is_none(),
+        "the peer is cleared after a clean shutdown"
+    );
     eprintln!("[shutdown] OK — QuitReason::Cancelled, peer cleared (portable R020 path)");
 }
 
@@ -281,12 +320,24 @@ async fn mcp_lifecycle_mid_session_crash_degrades_not_panic() {
 
     // supervise()'s crash branch: degrade to "tools unavailable" — never a panic.
     state.clear_peer();
-    state.mark_crashed(format!("MCP reference server (pid {pid}) exited mid-session (SIGKILL)"));
+    state.mark_crashed(format!(
+        "MCP reference server (pid {pid}) exited mid-session (SIGKILL)"
+    ));
     let s = state.status();
-    assert_eq!(s.phase, McpPhase::Crashed, "a mid-session drop degrades to crashed");
+    assert_eq!(
+        s.phase,
+        McpPhase::Crashed,
+        "a mid-session drop degrades to crashed"
+    );
     assert_eq!(s.tool_count, 0, "crashed tools degrade to unavailable");
-    assert!(s.last_error.is_some(), "the crash cause is named on the health line");
-    assert!(state.peer().is_none(), "the dead peer is cleared so the next run degrades");
+    assert!(
+        s.last_error.is_some(),
+        "the crash cause is named on the health line"
+    );
+    assert!(
+        state.peer().is_none(),
+        "the dead peer is cleared so the next run degrades"
+    );
     eprintln!("[degrade] OK — health=crashed, peer cleared, app still running");
 
     // --- an in-flight call after the crash rides back a typed error ---------
@@ -296,7 +347,10 @@ async fn mcp_lifecycle_mid_session_crash_degrades_not_panic() {
     let after = tokio::time::timeout(OP_TIMEOUT, executor.execute(&echo_call("post-crash")))
         .await
         .expect("post-crash call must resolve to a typed outcome, not hang");
-    assert!(!after.ok, "a call to a dead child cannot succeed: {after:?}");
+    assert!(
+        !after.ok,
+        "a call to a dead child cannot succeed: {after:?}"
+    );
     assert_eq!(
         after.failure.as_deref(),
         Some(MCP_TRANSPORT_ERROR_KIND),

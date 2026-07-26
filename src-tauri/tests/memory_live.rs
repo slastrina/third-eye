@@ -105,9 +105,13 @@ fn memory_db_file_is_text_only() {
         "memories table missing from {tables:?}"
     );
     for table in &tables {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
         let cols: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
@@ -161,13 +165,19 @@ fn memory_db_file_is_text_only() {
         "raw db file contains a PNG signature"
     );
     assert!(
-        !bytes.windows(base64_png_prefix.len()).any(|w| w == base64_png_prefix),
+        !bytes
+            .windows(base64_png_prefix.len())
+            .any(|w| w == base64_png_prefix),
         "raw db file contains base64-encoded PNG data"
     );
 }
 
 fn observation(text: &str, app: &str, at: u64) -> TextObservation {
-    TextObservation { text: text.into(), app_context: Some(app.into()), captured_at: at }
+    TextObservation {
+        text: text.into(),
+        app_context: Some(app.into()),
+        captured_at: at,
+    }
 }
 
 /// Two clearly distinct work topics, each yielding one full ingest batch of
@@ -225,7 +235,9 @@ async fn live_distill_and_recall_against_lm_studio() {
         Arc::new(GuardState::new()),
     ));
     // Sanity: the lane resolves before spending time on the loop.
-    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+        .lane_client(THIN_LANE)
+        .expect("thin lane must resolve");
 
     let scratch = ScratchDb::new("live-recall");
     let store = Arc::new(MemoryStore::open(&scratch.path).expect("open store"));
@@ -252,7 +264,10 @@ async fn live_distill_and_recall_against_lm_studio() {
         "live distillation failed: {:?}",
         status.last_error
     );
-    assert!(status.distilled_count >= 1, "at least one batch must distill");
+    assert!(
+        status.distilled_count >= 1,
+        "at least one batch must distill"
+    );
     let stored = store.list(20, 0).expect("list stored memories");
     assert!(!stored.is_empty(), "distilled summaries must be stored");
     for rec in &stored {
@@ -272,9 +287,16 @@ async fn live_distill_and_recall_against_lm_studio() {
     for rec in &outcome.results {
         eprintln!("search hit {}: {}", rec.id, rec.summary);
     }
-    assert_eq!(outcome.mode, SearchMode::Semantic, "live embeddings must not degrade");
+    assert_eq!(
+        outcome.mode,
+        SearchMode::Semantic,
+        "live embeddings must not degrade"
+    );
     assert!(outcome.degrade_reason.is_none());
-    let top = outcome.results.first().expect("topical search must return results");
+    let top = outcome
+        .results
+        .first()
+        .expect("topical search must return results");
     let top_lower = top.summary.to_lowercase();
     assert!(
         ["sourdough", "bread", "baking", "dough", "loaf"]
@@ -300,7 +322,9 @@ fn live_router() -> Arc<ModelRouter> {
         Arc::new(GuardState::new()),
     ));
     // Sanity: the lane resolves before spending time on a live round-trip.
-    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+        .lane_client(THIN_LANE)
+        .expect("thin lane must resolve");
     router
 }
 
@@ -360,11 +384,17 @@ async fn live_chat_exchange_distills_to_source_chat_memory_and_recalls() {
         "live chat distillation failed: {:?}",
         status.last_error
     );
-    assert_eq!(status.buffered, 0, "the exchange must not be retained after success");
+    assert_eq!(
+        status.buffered, 0,
+        "the exchange must not be retained after success"
+    );
 
     let stored = store.list(10, 0).expect("list stored memories");
     for rec in &stored {
-        eprintln!("stored chat memory {} (source={:?}): {}", rec.id, rec.source, rec.summary);
+        eprintln!(
+            "stored chat memory {} (source={:?}): {}",
+            rec.id, rec.source, rec.summary
+        );
     }
     assert_eq!(stored.len(), 1, "one exchange → exactly one stored memory");
     let memory = &stored[0];
@@ -386,8 +416,15 @@ async fn live_chat_exchange_distills_to_source_chat_memory_and_recalls() {
         "chat recall outcome: mode={:?} degrade={:?}",
         outcome.mode, outcome.degrade_reason
     );
-    assert_eq!(outcome.mode, SearchMode::Semantic, "live embeddings must not degrade");
-    let top = outcome.results.first().expect("recall must return the chat memory");
+    assert_eq!(
+        outcome.mode,
+        SearchMode::Semantic,
+        "live embeddings must not degrade"
+    );
+    let top = outcome
+        .results
+        .first()
+        .expect("recall must return the chat memory");
     assert_eq!(top.id, memory.id, "top hit must be the stored chat memory");
 }
 
@@ -466,7 +503,11 @@ async fn live_multi_topic_session_summary_distills_and_recalls() {
         ),
     ];
     let threshold = chat_ingest::SESSION_SUMMARY_THRESHOLD;
-    assert_eq!(script.len(), threshold, "script must be exactly one session's worth");
+    assert_eq!(
+        script.len(),
+        threshold,
+        "script must be exactly one session's worth"
+    );
 
     let scratch = ScratchDb::new("live-session-summary");
     let store = Arc::new(MemoryStore::open(&scratch.path).expect("open store"));
@@ -503,7 +544,10 @@ async fn live_multi_topic_session_summary_distills_and_recalls() {
         "live session distillation failed: {:?}",
         status.last_error
     );
-    assert_eq!(status.buffered, 0, "no exchange may be retained after a clean session");
+    assert_eq!(
+        status.buffered, 0,
+        "no exchange may be retained after a clean session"
+    );
 
     let stored = store.list(20, 0).expect("list stored memories");
     for rec in &stored {
@@ -567,7 +611,11 @@ async fn live_multi_topic_session_summary_distills_and_recalls() {
     for rec in &outcome.results {
         eprintln!("session recall hit {}: {}", rec.id, rec.summary);
     }
-    assert_eq!(outcome.mode, SearchMode::Semantic, "live embeddings must not degrade");
+    assert_eq!(
+        outcome.mode,
+        SearchMode::Semantic,
+        "live embeddings must not degrade"
+    );
     assert!(outcome.degrade_reason.is_none());
     assert!(
         outcome.results.iter().any(|r| r.id == summary.id),
@@ -600,11 +648,18 @@ async fn live_trivial_exchange_stores_nothing() {
 
     let status = state.status();
     eprintln!("live trivial ingest status: {status:?}");
-    assert!(status.last_error.is_none(), "trivial distillation errored: {:?}", status.last_error);
+    assert!(
+        status.last_error.is_none(),
+        "trivial distillation errored: {:?}",
+        status.last_error
+    );
     let stored = store.list(10, 0).expect("list stored memories");
     assert!(
         stored.is_empty(),
         "model over-summarized a greeting instead of replying NOTHING; it stored: {:?}",
-        stored.iter().map(|r| r.summary.as_str()).collect::<Vec<_>>()
+        stored
+            .iter()
+            .map(|r| r.summary.as_str())
+            .collect::<Vec<_>>()
     );
 }

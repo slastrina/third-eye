@@ -1,0 +1,115 @@
+/* Toggle + RadioCard styles (design: 38×22 switch, ring-dot cards). */
+
+.te-toggle {
+  appearance: none;
+  border: none;
+  background: none;
+  margin: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--te-font);
+  cursor: pointer;
+}
+.te-toggle:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.te-toggle__track {
+  width: 38px;
+  height: 22px;
+  border-radius: var(--te-r-pill);
+  background: rgba(255, 255, 255, 0.2);
+  position: relative;
+  flex: none;
+  transition: background 0.2s ease;
+}
+.te-light .te-toggle__track {
+  background: var(--te-light-line-strong);
+}
+.te-toggle[data-on] .te-toggle__track {
+  background: var(--te-green);
+}
+
+.te-toggle__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  transition: left 0.2s ease;
+}
+.te-toggle[data-on] .te-toggle__knob {
+  left: 18px;
+}
+
+.te-toggle__label {
+  font-size: 13px;
+  color: var(--te-c-text);
+}
+
+/* ── RadioCards ─────────────────────────────────────────────────────── */
+
+.te-radiocards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.te-radiocard {
+  appearance: none;
+  margin: 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  text-align: left;
+  font-family: var(--te-font);
+  border: 1px solid var(--te-c-border);
+  border-radius: var(--te-r-md);
+  padding: 11px 13px;
+  cursor: pointer;
+  background: transparent;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.te-radiocard:hover {
+  border-color: var(--te-c-border-strong);
+}
+.te-radiocard[data-selected] {
+  border-color: rgba(147, 218, 73, 0.5);
+  background: rgba(147, 218, 73, 0.08);
+}
+
+.te-radiocard__ring {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--te-c-text-faint);
+  background: transparent;
+  flex: none;
+  margin-top: 1px;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.te-radiocard[data-selected] .te-radiocard__ring {
+  border-color: var(--te-green);
+  background: var(--te-green);
+}
+
+.te-radiocard__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.te-radiocard__label {
+  font-size: 13px;
+  color: var(--te-c-text);
+  display: block;
+}
+.te-radiocard__sub {
+  font-size: 11.5px;
+  color: var(--te-c-text-muted);
+}

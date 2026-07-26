@@ -22,7 +22,11 @@ fn fixtures_root() -> PathBuf {
 #[test]
 fn discovers_only_the_good_packs_from_a_real_fixtures_directory() {
     let root = fixtures_root();
-    assert!(root.is_dir(), "fixtures dir must exist at {}", root.display());
+    assert!(
+        root.is_dir(),
+        "fixtures dir must exist at {}",
+        root.display()
+    );
 
     let skills: Vec<Skill> = discover_skills(&root);
 
@@ -38,13 +42,17 @@ fn discovers_only_the_good_packs_from_a_real_fixtures_directory() {
 
     // The loaded body is the instruction text after the frontmatter, trimmed —
     // this is what reaches the agent's context.
-    let good = skills.iter().find(|s| s.name == "good-skill").expect("good-skill loaded");
+    let good = skills
+        .iter()
+        .find(|s| s.name == "good-skill")
+        .expect("good-skill loaded");
     assert!(
         good.description.starts_with("A well-formed fixture skill."),
         "description comes from the frontmatter"
     );
     assert!(
-        good.body.contains("instruction text that loads into the agent's context"),
+        good.body
+            .contains("instruction text that loads into the agent's context"),
         "body is the Markdown after the frontmatter"
     );
     assert!(

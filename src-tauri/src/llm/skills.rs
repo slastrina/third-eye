@@ -91,7 +91,10 @@ impl std::fmt::Display for SkillError {
                 write!(f, "malformed-yaml: {detail}")
             }
             SkillError::MissingField { field } => {
-                write!(f, "missing-field: required frontmatter field '{field}' is absent or blank")
+                write!(
+                    f,
+                    "missing-field: required frontmatter field '{field}' is absent or blank"
+                )
             }
         }
     }
@@ -152,14 +155,21 @@ fn split_frontmatter(markdown: &str) -> Result<(String, String), SkillError> {
 pub fn parse_skill(markdown: &str) -> Result<Skill, SkillError> {
     let (yaml, body) = split_frontmatter(markdown)?;
 
-    let raw: RawFrontmatter = serde_yml::from_str(&yaml)
-        .map_err(|e| SkillError::MalformedYaml { detail: e.to_string() })?;
+    let raw: RawFrontmatter =
+        serde_yml::from_str(&yaml).map_err(|e| SkillError::MalformedYaml {
+            detail: e.to_string(),
+        })?;
 
     let name = non_blank(raw.name).ok_or(SkillError::MissingField { field: "name" })?;
-    let description =
-        non_blank(raw.description).ok_or(SkillError::MissingField { field: "description" })?;
+    let description = non_blank(raw.description).ok_or(SkillError::MissingField {
+        field: "description",
+    })?;
 
-    Ok(Skill { name, description, body: body.trim().to_string() })
+    Ok(Skill {
+        name,
+        description,
+        body: body.trim().to_string(),
+    })
 }
 
 /// A required string field is usable only when present and non-blank; a blank
@@ -193,7 +203,10 @@ pub fn discover_skills(dir: &Path) -> Vec<Skill> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            log::warn!("skills: cannot read discovery dir {}: {e}; no skills loaded", dir.display());
+            log::warn!(
+                "skills: cannot read discovery dir {}: {e}; no skills loaded",
+                dir.display()
+            );
             return Vec::new();
         }
     };
@@ -204,7 +217,10 @@ pub fn discover_skills(dir: &Path) -> Vec<Skill> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                log::warn!("skills: skipping unreadable entry in {}: {e}", dir.display());
+                log::warn!(
+                    "skills: skipping unreadable entry in {}: {e}",
+                    dir.display()
+                );
                 continue;
             }
         };
@@ -218,14 +234,20 @@ pub fn discover_skills(dir: &Path) -> Vec<Skill> {
         if !skill_file.exists() {
             // A pack directory with no SKILL.md is not an error — it just isn't
             // a skill. Debug-level so it never noises the warn stream.
-            log::debug!("skills: {} has no {SKILL_FILE_NAME}; skipping", path.display());
+            log::debug!(
+                "skills: {} has no {SKILL_FILE_NAME}; skipping",
+                path.display()
+            );
             continue;
         }
 
         let markdown = match std::fs::read_to_string(&skill_file) {
             Ok(text) => text,
             Err(e) => {
-                log::warn!("skills: cannot read {}: {e}; skipping", skill_file.display());
+                log::warn!(
+                    "skills: cannot read {}: {e}; skipping",
+                    skill_file.display()
+                );
                 continue;
             }
         };
@@ -233,13 +255,21 @@ pub fn discover_skills(dir: &Path) -> Vec<Skill> {
         match parse_skill(&markdown) {
             Ok(skill) => skills.push(skill),
             Err(err) => {
-                log::warn!("skills: skipping {} ({}): {err}", skill_file.display(), err.kind());
+                log::warn!(
+                    "skills: skipping {} ({}): {err}",
+                    skill_file.display(),
+                    err.kind()
+                );
             }
         }
     }
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    log::info!("skills: loaded {} skill(s) from {}", skills.len(), dir.display());
+    log::info!(
+        "skills: loaded {} skill(s) from {}",
+        skills.len(),
+        dir.display()
+    );
     skills
 }
 
@@ -265,7 +295,10 @@ Build resilient applications.\n";
             "Master error handling patterns. Use when implementing error handling."
         );
         // Body is the Markdown after the frontmatter, trimmed.
-        assert_eq!(skill.body, "# Error Handling\n\nBuild resilient applications.");
+        assert_eq!(
+            skill.body,
+            "# Error Handling\n\nBuild resilient applications."
+        );
     }
 
     #[test]
@@ -313,7 +346,12 @@ something_new: 42\n\
     fn missing_required_description_is_skipped_via_missing_field() {
         let md = "---\nname: has-name-only\n---\nbody\n";
         let err = parse_skill(md).expect_err("missing description must error");
-        assert_eq!(err, SkillError::MissingField { field: "description" });
+        assert_eq!(
+            err,
+            SkillError::MissingField {
+                field: "description"
+            }
+        );
     }
 
     #[test]
@@ -340,11 +378,23 @@ something_new: 42\n\
     #[test]
     fn error_kind_is_stable_for_every_variant() {
         assert_eq!(
-            SkillError::MissingFrontmatter { detail: String::new() }.kind(),
+            SkillError::MissingFrontmatter {
+                detail: String::new()
+            }
+            .kind(),
             "missing-frontmatter"
         );
-        assert_eq!(SkillError::MalformedYaml { detail: String::new() }.kind(), "malformed-yaml");
-        assert_eq!(SkillError::MissingField { field: "name" }.kind(), "missing-field");
+        assert_eq!(
+            SkillError::MalformedYaml {
+                detail: String::new()
+            }
+            .kind(),
+            "malformed-yaml"
+        );
+        assert_eq!(
+            SkillError::MissingField { field: "name" }.kind(),
+            "missing-field"
+        );
     }
 
     // ---- discovery seam (directory fixtures built in a temp dir) ----
@@ -352,8 +402,10 @@ something_new: 42\n\
     /// Build an isolated temp directory unique to this test, returning its path.
     /// Cleaned up by the caller with `std::fs::remove_dir_all`.
     fn temp_skills_root(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("third_eye_skills_test_{}_{tag}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "third_eye_skills_test_{}_{tag}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp skills root");
         root
@@ -367,8 +419,8 @@ something_new: 42\n\
 
     #[test]
     fn discover_returns_empty_for_a_missing_directory() {
-        let missing = std::env::temp_dir()
-            .join(format!("third_eye_skills_absent_{}", std::process::id()));
+        let missing =
+            std::env::temp_dir().join(format!("third_eye_skills_absent_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(discover_skills(&missing).is_empty());
     }
@@ -388,7 +440,11 @@ something_new: 42\n\
             "---\nname: good-two\ndescription: second good skill\n---\n# Two\nbody two\n",
         );
         // Malformed frontmatter (bad YAML) — must be skipped, not fatal.
-        write_pack(&root, "malformed", "---\ndescription: [unterminated\n---\nbody\n");
+        write_pack(
+            &root,
+            "malformed",
+            "---\ndescription: [unterminated\n---\nbody\n",
+        );
         // Missing required name — must be skipped.
         write_pack(&root, "no-name", "---\ndescription: nameless\n---\nbody\n");
         // No frontmatter at all — must be skipped.
@@ -399,7 +455,11 @@ something_new: 42\n\
         let skills = discover_skills(&root);
 
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["good-one", "good-two"], "only the good packs load, sorted by name");
+        assert_eq!(
+            names,
+            vec!["good-one", "good-two"],
+            "only the good packs load, sorted by name"
+        );
         assert_eq!(skills[0].description, "first good skill");
         assert_eq!(skills[0].body, "# One\nbody one");
 

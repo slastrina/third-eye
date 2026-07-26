@@ -143,7 +143,10 @@ pub fn memory_list(
     offset: Option<usize>,
 ) -> Result<Vec<MemoryRecord>, MemoryError> {
     let store = require_store(&memory)?;
-    store.list(clamp_limit(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT), offset.unwrap_or(0))
+    store.list(
+        clamp_limit(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
+        offset.unwrap_or(0),
+    )
 }
 
 /// Replace one memory's summary text. The store bumps `updated_at_ms`,
@@ -201,12 +204,18 @@ pub fn apply_chat_memory_enabled(
     match crate::config::save_chat_memory_enabled(app, desired) {
         Ok(()) => {
             log::info!("memory: chat memory enabled={desired} via={via}");
-            ChatMemoryStatus { enabled: desired, error: None }
+            ChatMemoryStatus {
+                enabled: desired,
+                error: None,
+            }
         }
         Err(e) => {
             chat.set_enabled(previous);
             log::error!("memory: {e}");
-            ChatMemoryStatus { enabled: previous, error: Some(e) }
+            ChatMemoryStatus {
+                enabled: previous,
+                error: Some(e),
+            }
         }
     }
 }
@@ -219,11 +228,107 @@ pub fn set_chat_memory_enabled(app: tauri::AppHandle, enable: bool) -> ChatMemor
     apply_chat_memory_enabled(&app, enable, "ipc")
 }
 
+/// Retention setting snapshot (health-as-value): the effective value plus any
+/// persist failure from the last write. Serialized camelCase like its peers.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRetentionStatus {
+    pub retention: String,
+    pub error: Option<String>,
+}
+
+/// Read the effective memory-retention setting (tour step "Memory" +
+/// Settings). Absent/garbage store values resolve to the default — the UI
+/// never sees an out-of-contract value.
+#[tauri::command]
+pub fn memory_retention(app: tauri::AppHandle) -> MemoryRetentionStatus {
+    let retention = crate::config::load_memory_retention(&app)
+        .unwrap_or(crate::config::MEMORY_RETENTION_DEFAULT);
+    MemoryRetentionStatus {
+        retention: retention.into(),
+        error: None,
+    }
+}
+
+/// Retention enforcement: prune memories older than the effective window.
+/// "forever" (and any garbage value, defense in depth) prunes nothing. Runs
+/// at startup (lib.rs setup, once the store is installed) and after every
+/// successful retention write. A store/prune failure is logged, never fatal —
+/// enforcement retries at the next trigger.
+pub fn apply_retention(app: &tauri::AppHandle) {
+    let retention = crate::config::load_memory_retention(app)
+        .unwrap_or(crate::config::MEMORY_RETENTION_DEFAULT);
+    let Some(window_ms) = crate::config::memory_retention_window_ms(retention) else {
+        return; // forever — nothing to prune
+    };
+    let state = app.state::<MemoryState>();
+    let Some(store) = state.store() else {
+        log::debug!("memory: retention enforcement skipped (store unavailable)");
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match store.prune_created_before(now_ms - window_ms) {
+        Ok(removed) if removed > 0 => {
+            log::info!("memory: retention ({retention}) removed {removed} expired memories");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("memory: retention prune failed: {e:?}"),
+    }
+}
+
+/// Persist the memory-retention setting. Never rejects: an out-of-contract
+/// value or persist failure returns the still-effective value with the error
+/// as data (set_chat_memory_enabled contract). A successful write enforces
+/// the new window immediately (prune runs before the response returns, so a
+/// tightened setting is visible in the very next memory list).
+#[tauri::command]
+pub fn set_memory_retention(app: tauri::AppHandle, retention: String) -> MemoryRetentionStatus {
+    let Some(valid) = crate::config::parse_memory_retention(&retention) else {
+        let effective = crate::config::load_memory_retention(&app)
+            .unwrap_or(crate::config::MEMORY_RETENTION_DEFAULT);
+        let error = format!(
+            "invalid retention {retention:?}; expected one of {:?}",
+            crate::config::MEMORY_RETENTION_VALUES
+        );
+        log::warn!("memory: {error}");
+        return MemoryRetentionStatus {
+            retention: effective.into(),
+            error: Some(error),
+        };
+    };
+    match crate::config::save_memory_retention(&app, valid) {
+        Ok(()) => {
+            log::info!("memory: retention set to {valid}");
+            apply_retention(&app);
+            MemoryRetentionStatus {
+                retention: valid.into(),
+                error: None,
+            }
+        }
+        Err(e) => {
+            let effective = crate::config::load_memory_retention(&app)
+                .unwrap_or(crate::config::MEMORY_RETENTION_DEFAULT);
+            log::error!("memory: {e}");
+            MemoryRetentionStatus {
+                retention: effective.into(),
+                error: Some(e),
+            }
+        }
+    }
+}
+
 /// Memory health snapshot — never rejects (health-as-value, R006). Safe to
 /// poll from any surface.
 #[tauri::command]
 pub fn memory_status(memory: State<'_, MemoryState>) -> MemoryStatus {
-    let status = build_status(memory.store(), memory.ingest().status(), memory.chat_ingest().status());
+    let status = build_status(
+        memory.store(),
+        memory.ingest().status(),
+        memory.chat_ingest().status(),
+    );
     log::debug!(
         "memory: status available={} count={:?} buffered={}",
         status.available,
@@ -250,7 +355,12 @@ mod tests {
     }
 
     fn empty_chat_ingest() -> ChatIngestStatus {
-        ChatIngestStatus { buffered: 0, ingested_count: 0, last_error: None, enabled: true }
+        ChatIngestStatus {
+            buffered: 0,
+            ingested_count: 0,
+            last_error: None,
+            enabled: true,
+        }
     }
 
     fn seeded_store() -> Arc<MemoryStore> {
@@ -278,7 +388,10 @@ mod tests {
         }
 
         async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-            Err(LlmError::Offline { endpoint: self.endpoint().into(), detail: "down".into() })
+            Err(LlmError::Offline {
+                endpoint: self.endpoint().into(),
+                detail: "down".into(),
+            })
         }
     }
 
@@ -310,11 +423,17 @@ mod tests {
         assert_eq!(v["available"], true);
         assert_eq!(v["count"], 1);
         assert!(v["dbPath"].is_null());
-        assert!(v.get("storeError").is_none(), "None storeError must be omitted");
+        assert!(
+            v.get("storeError").is_none(),
+            "None storeError must be omitted"
+        );
         assert_eq!(v["ingest"]["buffered"], 0);
         assert_eq!(v["ingest"]["distilledCount"], 0);
         assert!(v["ingest"]["lastDistillAtMs"].is_null());
-        assert!(v.get("chatIngest").is_some(), "chatIngest must ride alongside ingest");
+        assert!(
+            v.get("chatIngest").is_some(),
+            "chatIngest must ride alongside ingest"
+        );
     }
 
     #[test]
@@ -337,14 +456,21 @@ mod tests {
         assert_eq!(v["chatIngest"]["lastError"]["kind"], "offline");
         // S03 additive field: the exact wire key is "enabled".
         assert_eq!(v["chatIngest"]["enabled"], false);
-        assert!(v["chatIngest"].get("enabled").is_some(), "wire key must be \"enabled\"");
+        assert!(
+            v["chatIngest"].get("enabled").is_some(),
+            "wire key must be \"enabled\""
+        );
     }
 
     #[test]
     fn chat_memory_status_serializes_camel_case_with_explicit_null_error() {
         // The TS contract is `error: string | null` (mirrors PrivacyStatus):
         // None must serialize as an explicit null, never be omitted.
-        let v = serde_json::to_value(ChatMemoryStatus { enabled: true, error: None }).unwrap();
+        let v = serde_json::to_value(ChatMemoryStatus {
+            enabled: true,
+            error: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({ "enabled": true, "error": null }));
         let v = serde_json::to_value(ChatMemoryStatus {
             enabled: false,
@@ -368,7 +494,11 @@ mod tests {
         assert!(!state.enabled());
         state.set_enabled(previous);
         assert!(state.enabled(), "rollback restores the prior value");
-        assert_eq!(state.status().ingested_count, 0, "counters untouched by the flip");
+        assert_eq!(
+            state.status().ingested_count,
+            0,
+            "counters untouched by the flip"
+        );
     }
 
     #[test]
@@ -383,10 +513,19 @@ mod tests {
     #[test]
     fn limits_clamp_to_default_and_max() {
         assert_eq!(clamp_limit(None, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT), 8);
-        assert_eq!(clamp_limit(Some(3), DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT), 3);
-        assert_eq!(clamp_limit(Some(10_000), DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT), 50);
+        assert_eq!(
+            clamp_limit(Some(3), DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+            3
+        );
+        assert_eq!(
+            clamp_limit(Some(10_000), DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+            50
+        );
         assert_eq!(clamp_limit(Some(0), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT), 0);
-        assert_eq!(clamp_limit(Some(10_000), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT), 500);
+        assert_eq!(
+            clamp_limit(Some(10_000), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
+            500
+        );
     }
 
     #[tokio::test]
@@ -394,7 +533,9 @@ mod tests {
         // The command body is `require_store` + clamp + this call; the
         // degrade contract it forwards is what S04 renders.
         let store = seeded_store();
-        let outcome = search(&store, &DownEmbedder, "broadcast lag", 8).await.unwrap();
+        let outcome = search(&store, &DownEmbedder, "broadcast lag", 8)
+            .await
+            .unwrap();
         let v = serde_json::to_value(&outcome).unwrap();
         assert_eq!(v["mode"], "keyword");
         assert_eq!(v["degradeReason"]["kind"], "offline");

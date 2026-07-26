@@ -405,3 +405,27 @@ test("a db failure on wipe surfaces as a dismissible banner and keeps the store"
   await banner.getByRole("button", { name: "Dismiss" }).click();
   await expect(memory.locator(".settings-error")).toHaveCount(0);
 });
+
+// ---------------------------------------------------------------------------
+// Memory window (2026-07 redesign, surface 5): the standalone ?view=memory
+// surface. Outside Tauri every invoke rejects, so these prove the honest
+// degrade: empty states, never fabricated moments/facts (no-fake-data).
+// ---------------------------------------------------------------------------
+
+test("memory window renders its shell with honest empty states outside the app", async ({ page }) => {
+  await page.goto("/?view=memory");
+  const card = page.locator(".memwin-card");
+  await expect(card).toBeVisible();
+  // Header: title + filter; the retention badge is absent (IPC rejected —
+  // nothing is claimed).
+  await expect(card.locator(".memwin-title")).toHaveText("Memory");
+  await expect(card.locator(".memwin-badge")).toHaveCount(0);
+  // Timeline tab: unavailable posture, not an invented timeline.
+  await expect(card.locator(".memwin-empty")).toContainText("unavailable outside the app");
+  // Tabs switch; Learned degrades the same way; Recall shows its input.
+  await card.getByRole("tab", { name: "Learned" }).click();
+  await expect(card.locator(".memwin-empty")).toContainText("unavailable outside the app");
+  await card.getByRole("tab", { name: "Recall" }).click();
+  await expect(card.getByLabel("Search your memory")).toBeVisible();
+  await expect(card.locator(".memwin-recall-results")).toHaveCount(0);
+});

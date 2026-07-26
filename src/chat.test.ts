@@ -45,7 +45,19 @@ import {
   type ModelInfo,
   type NudgePayload,
   type PrivacyStatus,
+  isLocalEndpoint,
 } from "./chat";
+
+describe("isLocalEndpoint", () => {
+  it("claims on-device only for loopback hosts; unparseable never claims", () => {
+    expect(isLocalEndpoint("http://localhost:1234")).toBe(true);
+    expect(isLocalEndpoint("http://127.0.0.1:1234/v1")).toBe(true);
+    expect(isLocalEndpoint("http://[::1]:8080")).toBe(true);
+    expect(isLocalEndpoint("https://api.example.com/v1")).toBe(false);
+    expect(isLocalEndpoint("http://192.168.1.10:1234")).toBe(false);
+    expect(isLocalEndpoint("not a url")).toBe(false);
+  });
+});
 
 const ENDPOINT = "http://192.168.182.224:1234";
 

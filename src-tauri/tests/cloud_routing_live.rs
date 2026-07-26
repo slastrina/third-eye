@@ -85,14 +85,18 @@ async fn spawn_mock_provider() -> MockProvider {
     let conns = connections.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = listener.accept().await else { break };
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
             // Count at accept: a connection reaching TLS means the client
             // actually opened a socket to us.
             conns.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             let cap = cap.clone();
             tokio::spawn(async move {
-                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
                 let mut buf: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
                 while !request_complete(&buf) {
@@ -109,17 +113,29 @@ async fn spawn_mock_provider() -> MockProvider {
         }
     });
 
-    MockProvider { addr, captured, connections }
+    MockProvider {
+        addr,
+        captured,
+        connections,
+    }
 }
 
 /// True once `buf` holds the full request: complete headers plus
 /// `content-length` bytes of body.
 fn request_complete(buf: &[u8]) -> bool {
     let text = String::from_utf8_lossy(buf);
-    let Some(header_end) = text.find("\r\n\r\n") else { return false };
+    let Some(header_end) = text.find("\r\n\r\n") else {
+        return false;
+    };
     let content_length = text
         .lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:")?.trim().parse::<usize>().ok())
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")?
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
         .unwrap_or(0);
     buf.len() >= header_end + 4 + content_length
 }
@@ -142,7 +158,10 @@ fn sse_completion_response() -> Vec<u8> {
 }
 
 fn sse_token(token: &str) -> String {
-    format!("data: {}\n\n", serde_json::json!({ "choices": [{ "delta": { "content": token } }] }))
+    format!(
+        "data: {}\n\n",
+        serde_json::json!({ "choices": [{ "delta": { "content": token } }] })
+    )
 }
 
 /// A keystore pointed at a unique per-run service, drop-guarded so the real OS
@@ -157,7 +176,9 @@ impl TestStore {
             "com.slastrina.thirdeye.test.cloudroute.{tag}.{}.{nanos}",
             std::process::id()
         );
-        Self { store: KeyStore::with_service(&service) }
+        Self {
+            store: KeyStore::with_service(&service),
+        }
     }
 }
 
@@ -181,7 +202,10 @@ fn test_transport(addr: SocketAddr) -> CloudTransport {
 }
 
 fn now_nanos() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 /// The heavy lane's *local* client stand-in: answers with a fixed tag and counts
@@ -195,7 +219,12 @@ struct LocalHeavy {
 impl LocalHeavy {
     fn new() -> (Arc<Self>, Arc<AtomicUsize>) {
         let served = Arc::new(AtomicUsize::new(0));
-        (Arc::new(Self { served: served.clone() }), served)
+        (
+            Arc::new(Self {
+                served: served.clone(),
+            }),
+            served,
+        )
     }
 }
 
@@ -212,11 +241,18 @@ impl LlmClient for LocalHeavy {
     ) -> Result<StreamOutcome, LlmError> {
         self.served.fetch_add(1, Ordering::SeqCst);
         on_token("local-heavy-reply");
-        Ok(StreamOutcome { text: "local-heavy-reply".into(), token_count: 1, tool_calls: Vec::new() })
+        Ok(StreamOutcome {
+            text: "local-heavy-reply".into(),
+            token_count: 1,
+            tool_calls: Vec::new(),
+        })
     }
 
     async fn health(&self) -> LlmHealth {
-        LlmHealth { online: true, endpoint: self.endpoint().into() }
+        LlmHealth {
+            online: true,
+            endpoint: self.endpoint().into(),
+        }
     }
 }
 
@@ -235,11 +271,18 @@ impl LlmClient for InertThin {
         _request: &ChatRequest,
         _on_token: TokenSink<'_>,
     ) -> Result<StreamOutcome, LlmError> {
-        Ok(StreamOutcome { text: "thin".into(), token_count: 0, tool_calls: Vec::new() })
+        Ok(StreamOutcome {
+            text: "thin".into(),
+            token_count: 0,
+            tool_calls: Vec::new(),
+        })
     }
 
     async fn health(&self) -> LlmHealth {
-        LlmHealth { online: true, endpoint: self.endpoint().into() }
+        LlmHealth {
+            online: true,
+            endpoint: self.endpoint().into(),
+        }
     }
 }
 
@@ -293,7 +336,9 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
     router
         .set_lane_client(HEAVY_LANE, cloud)
         .expect("heavy lane accepts the injected cloud client");
-    router.set_active(HEAVY_LANE).expect("heavy lane is a construction invariant");
+    router
+        .set_active(HEAVY_LANE)
+        .expect("heavy lane is a construction invariant");
 
     // A user message carrying a redactable content secret distinct from the API
     // key: after redaction the wire must show the placeholder, never the raw
@@ -302,21 +347,38 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
     let seen = Mutex::new(String::new());
     let outcome = router
         .stream_chat(
-            &ChatRequest::new(vec![ChatMessage::user(format!("password: {content_secret}"))]),
+            &ChatRequest::new(vec![ChatMessage::user(format!(
+                "password: {content_secret}"
+            ))]),
             &|t| seen.lock().unwrap().push_str(t),
         )
         .await
         .expect("streamed completion arrives through the routed heavy lane");
 
     // (a) The streamed OpenAI-shape SSE completion arrived through the router.
-    assert_eq!(outcome.text, "Hello", "two content deltas accumulate to 'Hello'");
+    assert_eq!(
+        outcome.text, "Hello",
+        "two content deltas accumulate to 'Hello'"
+    );
     assert_eq!(outcome.token_count, 2);
-    assert_eq!(*seen.lock().unwrap(), "Hello", "tokens were delivered in order");
-    assert_eq!(mock.connection_count(), 1, "exactly one TLS connection served the routed stream");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "Hello",
+        "tokens were delivered in order"
+    );
+    assert_eq!(
+        mock.connection_count(),
+        1,
+        "exactly one TLS connection served the routed stream"
+    );
 
     // Inspect the decrypted request the mock actually received.
     let captured = mock.captured();
-    assert_eq!(captured.len(), 1, "the mock captured exactly one routed request");
+    assert_eq!(
+        captured.len(),
+        1,
+        "the mock captured exactly one routed request"
+    );
     let raw = &captured[0];
     let wire = String::from_utf8_lossy(raw).to_string();
     let wire_lower = wire.to_ascii_lowercase();
@@ -327,14 +389,18 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
         "redacted placeholder must be on the decrypted wire: {wire}"
     );
     assert!(
-        !raw.windows(content_secret.len()).any(|w| w == content_secret.as_bytes()),
+        !raw.windows(content_secret.len())
+            .any(|w| w == content_secret.as_bytes()),
         "the seeded content secret must NEVER appear on the routed wire"
     );
 
     // (c) Bearer auth on the real TLS wire — the key rides the Authorization
     // header (headers are not redacted; only message content is).
     assert!(
-        wire_lower.contains(&format!("authorization: bearer {}", api_key.to_ascii_lowercase())),
+        wire_lower.contains(&format!(
+            "authorization: bearer {}",
+            api_key.to_ascii_lowercase()
+        )),
         "the API key must ride as an Authorization: Bearer header on the routed TLS wire"
     );
 
@@ -344,7 +410,11 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
         1,
         "one password redaction must be counted on the routed forward"
     );
-    assert_eq!(guard.blocked_count(), 0, "a clean routed forward blocks nothing");
+    assert_eq!(
+        guard.blocked_count(),
+        0,
+        "a clean routed forward blocks nothing"
+    );
 
     // (d) An attachment-carrying routed request is blocked typed, with ZERO new
     // mock connections — the guard refuses before the inner client's socket
@@ -352,7 +422,9 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
     // the Settings data-guard-blocked row renders).
     let connections_before = mock.connection_count();
     let attachment_req = ChatRequest::new(vec![ChatMessage::user("what is on my screen?")
-        .with_attachments(vec![Attachment { base64_png: "QUJD".into() }])]);
+        .with_attachments(vec![Attachment {
+            base64_png: "QUJD".into(),
+        }])]);
     let err = router
         .stream_chat(&attachment_req, &|_| {})
         .await
@@ -364,7 +436,11 @@ async fn routed_heavy_lane_redacts_on_wire_carries_bearer_and_blocks_attachments
         "the blocked attachment request must open ZERO new TLS connections"
     );
 
-    assert_eq!(guard.blocked_count(), 1, "the routed attachment block was counted on the shared guard");
+    assert_eq!(
+        guard.blocked_count(),
+        1,
+        "the routed attachment block was counted on the shared guard"
+    );
     let snapshot = guard.snapshot();
     assert_eq!(snapshot.blocked_count, 1);
     assert_eq!(
@@ -402,7 +478,9 @@ async fn opt_in_off_leaves_heavy_lane_local_with_zero_cloud_connections() {
     assert_eq!(refused.kind(), "optin-disabled");
 
     // Route a heavy-lane request: it must be served by the LOCAL client.
-    router.set_active(HEAVY_LANE).expect("heavy lane is a construction invariant");
+    router
+        .set_active(HEAVY_LANE)
+        .expect("heavy lane is a construction invariant");
     let seen = Mutex::new(String::new());
     let outcome = router
         .stream_chat(
@@ -412,9 +490,16 @@ async fn opt_in_off_leaves_heavy_lane_local_with_zero_cloud_connections() {
         .await
         .expect("the local heavy lane serves the routed request");
 
-    assert_eq!(outcome.text, "local-heavy-reply", "opt-in off keeps the heavy lane local");
+    assert_eq!(
+        outcome.text, "local-heavy-reply",
+        "opt-in off keeps the heavy lane local"
+    );
     assert_eq!(*seen.lock().unwrap(), "local-heavy-reply");
-    assert_eq!(local_served.load(Ordering::SeqCst), 1, "the local heavy client served the request");
+    assert_eq!(
+        local_served.load(Ordering::SeqCst),
+        1,
+        "the local heavy client served the request"
+    );
     assert_eq!(
         mock.connection_count(),
         0,

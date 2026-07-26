@@ -153,8 +153,14 @@ mod tests {
         // The offline-first default: opt-in off is always local, even with a
         // provider selected (a stale selection must never reach cloud).
         assert_eq!(heavy_route(false, None), HeavyRoute::Local);
-        assert_eq!(heavy_route(false, Some(CloudProvider::Openai)), HeavyRoute::Local);
-        assert_eq!(heavy_route(false, Some(CloudProvider::Anthropic)), HeavyRoute::Local);
+        assert_eq!(
+            heavy_route(false, Some(CloudProvider::Openai)),
+            HeavyRoute::Local
+        );
+        assert_eq!(
+            heavy_route(false, Some(CloudProvider::Anthropic)),
+            HeavyRoute::Local
+        );
     }
 
     #[test]

@@ -63,7 +63,11 @@ impl OpenAiEmbedder {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client construction cannot fail with static config");
-        Self { endpoint, model: EMBED_MODEL.to_string(), http }
+        Self {
+            endpoint,
+            model: EMBED_MODEL.to_string(),
+            http,
+        }
     }
 
     /// Override the embedding model id (tests, future configurability).
@@ -73,7 +77,10 @@ impl OpenAiEmbedder {
     }
 
     fn offline(&self, detail: impl Into<String>) -> LlmError {
-        LlmError::Offline { endpoint: self.endpoint.clone(), detail: detail.into() }
+        LlmError::Offline {
+            endpoint: self.endpoint.clone(),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -100,14 +107,20 @@ impl Embedder for OpenAiEmbedder {
         if !status.is_success() {
             let detail = format!("HTTP {status}: {}", snippet(&body));
             return Err(if status.is_client_error() {
-                LlmError::NoModel { endpoint: self.endpoint.clone(), detail }
+                LlmError::NoModel {
+                    endpoint: self.endpoint.clone(),
+                    detail,
+                }
             } else {
                 self.offline(detail)
             });
         }
 
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            self.offline(format!("malformed /v1/embeddings response ({e}): {}", snippet(&body)))
+            self.offline(format!(
+                "malformed /v1/embeddings response ({e}): {}",
+                snippet(&body)
+            ))
         })?;
         let data = value["data"].as_array().ok_or_else(|| {
             self.offline(format!(
@@ -122,7 +135,9 @@ impl Embedder for OpenAiEmbedder {
         for entry in data {
             let index = entry["index"].as_u64().map(|i| i as usize);
             let vec = entry["embedding"].as_array().map(|nums| {
-                nums.iter().filter_map(|n| n.as_f64().map(|f| f as f32)).collect::<Vec<f32>>()
+                nums.iter()
+                    .filter_map(|n| n.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
             });
             match (index, vec) {
                 (Some(i), Some(v)) if i < vectors.len() => vectors[i] = Some(v),
@@ -254,7 +269,11 @@ pub async fn search(
     }
 
     log::info!("memory: search mode=semantic results={}", results.len());
-    Ok(SearchOutcome { mode: SearchMode::Semantic, degrade_reason: None, results })
+    Ok(SearchOutcome {
+        mode: SearchMode::Semantic,
+        degrade_reason: None,
+        results,
+    })
 }
 
 /// The visible keyword degrade: FTS5 bm25 ranking with the typed reason
@@ -269,7 +288,11 @@ fn keyword_degrade(
         "memory: search degraded to keyword mode ({}): {reason}",
         reason.kind()
     );
-    let results = store.search_keyword(query, limit)?.into_iter().map(|(rec, _)| rec).collect();
+    let results = store
+        .search_keyword(query, limit)?
+        .into_iter()
+        .map(|(rec, _)| rec)
+        .collect();
     Ok(SearchOutcome {
         mode: SearchMode::Keyword,
         degrade_reason: Some(reason),
@@ -371,9 +394,11 @@ mod tests {
     #[tokio::test]
     async fn embedder_request_carries_model_and_input() {
         let body = embeddings_response(&[&[1.0]]);
-        let (endpoint, captured) =
-            spawn_capturing_server(plain_response("200 OK", &body)).await;
-        OpenAiEmbedder::new(&endpoint).embed(&["hello".into()]).await.unwrap();
+        let (endpoint, captured) = spawn_capturing_server(plain_response("200 OK", &body)).await;
+        OpenAiEmbedder::new(&endpoint)
+            .embed(&["hello".into()])
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
         assert_eq!(body["model"], EMBED_MODEL);
         assert_eq!(body["input"], serde_json::json!(["hello"]));
@@ -382,8 +407,7 @@ mod tests {
     #[tokio::test]
     async fn embedder_with_model_overrides_the_id() {
         let body = embeddings_response(&[&[1.0]]);
-        let (endpoint, captured) =
-            spawn_capturing_server(plain_response("200 OK", &body)).await;
+        let (endpoint, captured) = spawn_capturing_server(plain_response("200 OK", &body)).await;
         OpenAiEmbedder::new(&endpoint)
             .with_model("custom-embed")
             .embed(&["x".into()])
@@ -395,7 +419,10 @@ mod tests {
     #[tokio::test]
     async fn embedder_refused_connection_is_offline_naming_endpoint() {
         let endpoint = refused_endpoint().await;
-        let err = OpenAiEmbedder::new(&endpoint).embed(&["x".into()]).await.unwrap_err();
+        let err = OpenAiEmbedder::new(&endpoint)
+            .embed(&["x".into()])
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert_eq!(err.endpoint(), endpoint);
     }
@@ -407,23 +434,33 @@ mod tests {
             r#"{"error":"model not found"}"#,
         ))
         .await;
-        let err = OpenAiEmbedder::new(&endpoint).embed(&["x".into()]).await.unwrap_err();
+        let err = OpenAiEmbedder::new(&endpoint)
+            .embed(&["x".into()])
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "no-model");
-        assert!(matches!(&err, LlmError::NoModel { detail, .. } if detail.contains("model not found")));
+        assert!(
+            matches!(&err, LlmError::NoModel { detail, .. } if detail.contains("model not found"))
+        );
     }
 
     #[tokio::test]
     async fn embedder_http_5xx_is_offline() {
-        let endpoint =
-            spawn_raw_server(plain_response("503 Service Unavailable", "busy")).await;
-        let err = OpenAiEmbedder::new(&endpoint).embed(&["x".into()]).await.unwrap_err();
+        let endpoint = spawn_raw_server(plain_response("503 Service Unavailable", "busy")).await;
+        let err = OpenAiEmbedder::new(&endpoint)
+            .embed(&["x".into()])
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
     }
 
     #[tokio::test]
     async fn embedder_malformed_body_is_offline_with_detail() {
         let endpoint = spawn_raw_server(plain_response("200 OK", "not json")).await;
-        let err = OpenAiEmbedder::new(&endpoint).embed(&["x".into()]).await.unwrap_err();
+        let err = OpenAiEmbedder::new(&endpoint)
+            .embed(&["x".into()])
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert!(matches!(&err, LlmError::Offline { detail, .. } if detail.contains("malformed")));
     }
@@ -460,7 +497,9 @@ mod tests {
         }
 
         fn failing(err: LlmError) -> Self {
-            Self { fail_with: Some(err) }
+            Self {
+                fail_with: Some(err),
+            }
         }
 
         fn vector_for(text: &str) -> Vec<f32> {
@@ -492,20 +531,35 @@ mod tests {
     }
 
     fn offline_err() -> LlmError {
-        LlmError::Offline { endpoint: "http://mock.invalid".into(), detail: "refused".into() }
+        LlmError::Offline {
+            endpoint: "http://mock.invalid".into(),
+            detail: "refused".into(),
+        }
     }
 
     #[tokio::test]
     async fn semantic_search_ranks_topical_memory_first() {
         let s = store();
-        s.insert(mem("tried a new coffee brewing ratio", Some(MockEmbedder::vector_for("coffee"))))
-            .unwrap();
+        s.insert(mem(
+            "tried a new coffee brewing ratio",
+            Some(MockEmbedder::vector_for("coffee")),
+        ))
+        .unwrap();
         let rust = s
-            .insert(mem("fixed the rust borrow checker fight", Some(MockEmbedder::vector_for("rust"))))
+            .insert(mem(
+                "fixed the rust borrow checker fight",
+                Some(MockEmbedder::vector_for("rust")),
+            ))
             .unwrap();
-        s.insert(mem("weekly meeting notes", Some(MockEmbedder::vector_for("meeting")))).unwrap();
+        s.insert(mem(
+            "weekly meeting notes",
+            Some(MockEmbedder::vector_for("meeting")),
+        ))
+        .unwrap();
 
-        let outcome = search(&s, &MockEmbedder::ok(), "rust programming", 10).await.unwrap();
+        let outcome = search(&s, &MockEmbedder::ok(), "rust programming", 10)
+            .await
+            .unwrap();
         assert_eq!(outcome.mode, SearchMode::Semantic);
         assert!(outcome.degrade_reason.is_none());
         assert_eq!(outcome.results[0].id, rust.id);
@@ -515,21 +569,33 @@ mod tests {
     async fn embed_failure_degrades_to_keyword_with_typed_reason() {
         let s = store();
         let rec = s.insert(mem("rust error taxonomy notes", None)).unwrap();
-        let outcome =
-            search(&s, &MockEmbedder::failing(offline_err()), "rust taxonomy", 10).await.unwrap();
+        let outcome = search(
+            &s,
+            &MockEmbedder::failing(offline_err()),
+            "rust taxonomy",
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.mode, SearchMode::Keyword);
-        let reason = outcome.degrade_reason.expect("degrade must carry the typed reason");
+        let reason = outcome
+            .degrade_reason
+            .expect("degrade must carry the typed reason");
         assert_eq!(reason.kind(), "offline");
         // Recall keeps working through FTS5 (R021).
-        assert_eq!(outcome.results.iter().map(|r| r.id).collect::<Vec<_>>(), vec![rec.id]);
+        assert_eq!(
+            outcome.results.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![rec.id]
+        );
     }
 
     #[tokio::test]
     async fn degrade_outcome_serializes_camel_case_with_reason() {
         let s = store();
         s.insert(mem("rust notes", None)).unwrap();
-        let outcome =
-            search(&s, &MockEmbedder::failing(offline_err()), "rust", 10).await.unwrap();
+        let outcome = search(&s, &MockEmbedder::failing(offline_err()), "rust", 10)
+            .await
+            .unwrap();
         let v = serde_json::to_value(&outcome).unwrap();
         assert_eq!(v["mode"], "keyword");
         assert_eq!(v["degradeReason"]["kind"], "offline");
@@ -554,8 +620,9 @@ mod tests {
         let s = store();
         s.insert(mem("anything", None)).unwrap();
         // A failing embedder proves the embedder is never invoked.
-        let outcome =
-            search(&s, &MockEmbedder::failing(offline_err()), "   ", 10).await.unwrap();
+        let outcome = search(&s, &MockEmbedder::failing(offline_err()), "   ", 10)
+            .await
+            .unwrap();
         assert!(outcome.results.is_empty());
         assert!(outcome.degrade_reason.is_none());
     }
@@ -572,21 +639,29 @@ mod tests {
 
         // The vector was written back — the corpus healed itself (D022).
         let rows = s.embedded_rows().unwrap();
-        assert_eq!(rows, vec![(rec.id, MockEmbedder::vector_for("rust ownership deep dive"))]);
+        assert_eq!(
+            rows,
+            vec![(rec.id, MockEmbedder::vector_for("rust ownership deep dive"))]
+        );
     }
 
     #[tokio::test]
     async fn keyword_hits_missing_from_semantic_ranking_are_appended() {
         let s = store();
         let semantic = s
-            .insert(mem("rust async runtime notes", Some(MockEmbedder::vector_for("rust"))))
+            .insert(mem(
+                "rust async runtime notes",
+                Some(MockEmbedder::vector_for("rust")),
+            ))
             .unwrap();
         // Simulate a row past the backfill cap: no vector, but a keyword hit.
         // Backfill would embed it, so pre-fill every other row and cap at 2.
         let keyword_only = s.insert(mem("rust macro hygiene rules", None)).unwrap();
         s.set_embedding(keyword_only.id, &[]).unwrap_err(); // guard: empty vec rejected
 
-        let outcome = search(&s, &MockEmbedder::ok(), "rust macro", 10).await.unwrap();
+        let outcome = search(&s, &MockEmbedder::ok(), "rust macro", 10)
+            .await
+            .unwrap();
         let ids: Vec<i64> = outcome.results.iter().map(|r| r.id).collect();
         assert!(ids.contains(&semantic.id));
         assert!(ids.contains(&keyword_only.id));
@@ -600,8 +675,11 @@ mod tests {
     async fn limit_caps_combined_results() {
         let s = store();
         for i in 0..5 {
-            s.insert(mem(&format!("rust note {i}"), Some(MockEmbedder::vector_for("rust"))))
-                .unwrap();
+            s.insert(mem(
+                &format!("rust note {i}"),
+                Some(MockEmbedder::vector_for("rust")),
+            ))
+            .unwrap();
         }
         let outcome = search(&s, &MockEmbedder::ok(), "rust", 3).await.unwrap();
         assert_eq!(outcome.results.len(), 3);
@@ -611,9 +689,13 @@ mod tests {
     async fn dimension_mismatched_vectors_are_excluded_not_fatal() {
         let s = store();
         // A leftover 2-dim vector among 3-dim ones (e.g. old model output).
-        s.insert(mem("stale vector row", Some(vec![1.0, 0.0]))).unwrap();
+        s.insert(mem("stale vector row", Some(vec![1.0, 0.0])))
+            .unwrap();
         let good = s
-            .insert(mem("rust lifetimes explained", Some(MockEmbedder::vector_for("rust"))))
+            .insert(mem(
+                "rust lifetimes explained",
+                Some(MockEmbedder::vector_for("rust")),
+            ))
             .unwrap();
         let outcome = search(&s, &MockEmbedder::ok(), "rust", 10).await.unwrap();
         assert_eq!(outcome.mode, SearchMode::Semantic);

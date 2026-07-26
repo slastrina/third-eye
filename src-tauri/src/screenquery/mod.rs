@@ -63,7 +63,11 @@ pub struct ScreenElement {
 /// fields — the same IPC error contract shape as [`OcrError`] and
 /// [`crate::input::InputError`]; consumers match on `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ScreenQueryError {
     /// Screen Recording permission is not granted (TCC) — capture refused
     /// before any pixel was read. The UI responds with the guided walkthrough.
@@ -118,7 +122,10 @@ impl std::fmt::Display for ScreenQueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScreenQueryError::PermissionDenied { detail } => {
-                write!(f, "screen-query permission-denied: Screen Recording not granted ({detail})")
+                write!(
+                    f,
+                    "screen-query permission-denied: Screen Recording not granted ({detail})"
+                )
             }
             ScreenQueryError::RecognitionFailed { detail } => {
                 write!(f, "screen-query recognition-failed: {detail}")
@@ -187,7 +194,9 @@ mod tests {
     #[tokio::test]
     async fn errors_propagate_through_dyn_with_kind() {
         let backend: Arc<dyn ScreenQuery> = Arc::new(MockScreenQuery {
-            fail_with: Some(ScreenQueryError::RecognitionFailed { detail: "vision failed".into() }),
+            fail_with: Some(ScreenQueryError::RecognitionFailed {
+                detail: "vision failed".into(),
+            }),
         });
         let err = backend.query().await.unwrap_err();
         assert_eq!(err.kind(), "recognition-failed");
@@ -195,8 +204,14 @@ mod tests {
 
     #[test]
     fn element_json_shape_is_camel_case() {
-        let el =
-            ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) };
+        let el = ScreenElement {
+            text: "hi".into(),
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+            app: Some("Zed".into()),
+        };
         let v = serde_json::to_value(&el).unwrap();
         assert_eq!(v["text"], "hi");
         assert_eq!(v["x"], 1);
@@ -206,7 +221,14 @@ mod tests {
         assert_eq!(v["app"], "Zed");
 
         // A None app serializes as JSON null — the model reads "unattributed".
-        let bare = ScreenElement { text: "x".into(), x: 0, y: 0, width: 1, height: 1, app: None };
+        let bare = ScreenElement {
+            text: "x".into(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            app: None,
+        };
         assert!(serde_json::to_value(&bare).unwrap()["app"].is_null());
     }
 
@@ -214,18 +236,24 @@ mod tests {
     fn error_json_shape_is_the_ipc_contract() {
         // The tool surfaces match on `kind` and read camelCase fields; a change
         // here is a breaking IPC change.
-        let denied = ScreenQueryError::PermissionDenied { detail: "TCC denied".into() };
+        let denied = ScreenQueryError::PermissionDenied {
+            detail: "TCC denied".into(),
+        };
         let v = serde_json::to_value(&denied).unwrap();
         assert_eq!(v["kind"], "permission-denied");
         assert_eq!(v["detail"], "TCC denied");
 
-        let recognition = ScreenQueryError::RecognitionFailed { detail: "vision error".into() };
+        let recognition = ScreenQueryError::RecognitionFailed {
+            detail: "vision error".into(),
+        };
         let v = serde_json::to_value(&recognition).unwrap();
         assert_eq!(v["kind"], "recognition-failed");
         assert_eq!(v["detail"], "vision error");
 
-        let unsupported =
-            ScreenQueryError::Unsupported { platform: "linux".into(), detail: "no backend".into() };
+        let unsupported = ScreenQueryError::Unsupported {
+            platform: "linux".into(),
+            detail: "no backend".into(),
+        };
         let v = serde_json::to_value(&unsupported).unwrap();
         assert_eq!(v["kind"], "unsupported");
         assert_eq!(v["platform"], "linux");
@@ -235,9 +263,16 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            ScreenQueryError::PermissionDenied { detail: String::new() },
-            ScreenQueryError::RecognitionFailed { detail: String::new() },
-            ScreenQueryError::Unsupported { platform: String::new(), detail: String::new() },
+            ScreenQueryError::PermissionDenied {
+                detail: String::new(),
+            },
+            ScreenQueryError::RecognitionFailed {
+                detail: String::new(),
+            },
+            ScreenQueryError::Unsupported {
+                platform: String::new(),
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -247,17 +282,34 @@ mod tests {
 
     #[test]
     fn ocr_permission_error_survives_the_mapping() {
-        let err: ScreenQueryError =
-            OcrError::PermissionDenied { detail: "TCC denied".into() }.into();
+        let err: ScreenQueryError = OcrError::PermissionDenied {
+            detail: "TCC denied".into(),
+        }
+        .into();
         assert_eq!(err.kind(), "permission-denied");
-        assert_eq!(err, ScreenQueryError::PermissionDenied { detail: "TCC denied".into() });
+        assert_eq!(
+            err,
+            ScreenQueryError::PermissionDenied {
+                detail: "TCC denied".into()
+            }
+        );
     }
 
     #[test]
     fn other_ocr_errors_collapse_to_recognition_failed_with_kind_in_detail() {
         let cases: Vec<(OcrError, &str)> = vec![
-            (OcrError::CaptureFailed { detail: "no display".into() }, "capture-failed"),
-            (OcrError::RecognitionFailed { detail: "vision".into() }, "recognition-failed"),
+            (
+                OcrError::CaptureFailed {
+                    detail: "no display".into(),
+                },
+                "capture-failed",
+            ),
+            (
+                OcrError::RecognitionFailed {
+                    detail: "vision".into(),
+                },
+                "recognition-failed",
+            ),
             (OcrError::unsupported_here(), "unsupported"),
         ];
         for (ocr_err, original_kind) in cases {
@@ -277,7 +329,9 @@ mod tests {
 
     #[test]
     fn error_display_names_kind_and_detail() {
-        let err = ScreenQueryError::RecognitionFailed { detail: "vision gave up".into() };
+        let err = ScreenQueryError::RecognitionFailed {
+            detail: "vision gave up".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("recognition-failed"), "kind missing: {msg}");
         assert!(msg.contains("vision gave up"), "detail missing: {msg}");

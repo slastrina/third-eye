@@ -1,0 +1,176 @@
+/* Design-system component styles. Components reference contextual --te-c-*
+ * variables so the same component works on dark glass panels (default) and
+ * the light tour card (inside a `.te-light` scope) without per-surface props. */
+
+:root {
+  --te-c-text: var(--te-text);
+  --te-c-text-strong: var(--te-text-strong);
+  --te-c-text-muted: var(--te-text-dim);
+  --te-c-text-faint: var(--te-text-ghost);
+  --te-c-border: var(--te-line-strong);
+  --te-c-border-strong: rgba(255, 255, 255, 0.3);
+  --te-c-hover-fill: var(--te-fill-hover);
+  --te-c-input-fill: var(--te-fill-input);
+}
+
+.te-light {
+  --te-c-text: var(--te-light-body);
+  --te-c-text-strong: var(--te-light-ink);
+  --te-c-text-muted: var(--te-light-muted);
+  --te-c-text-faint: var(--te-light-faint);
+  --te-c-border: var(--te-light-line);
+  --te-c-border-strong: var(--te-light-line-strong);
+  --te-c-hover-fill: var(--te-light-bg);
+  --te-c-input-fill: var(--te-light-bg);
+  color: var(--te-light-body);
+}
+
+/* ── Button ─────────────────────────────────────────────────────────── */
+
+.te-btn {
+  appearance: none;
+  border: none;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-family: var(--te-font);
+  font-size: 13px;
+  border-radius: var(--te-r-pill);
+  padding: 9px 22px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--te-c-text);
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  user-select: none;
+}
+.te-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.te-btn--primary {
+  background: var(--te-green);
+  color: var(--te-navy);
+  font-weight: 600;
+  padding: 10px 26px;
+}
+.te-btn--primary:hover:not(:disabled) {
+  background: var(--te-green-hover);
+}
+
+.te-btn--outline {
+  border: 1.5px solid var(--te-c-border-strong);
+  color: var(--te-c-text);
+}
+.te-btn--outline:hover:not(:disabled) {
+  border-color: var(--te-c-text-strong);
+  background: var(--te-c-hover-fill);
+}
+
+.te-btn--accent {
+  background: var(--te-green-glow);
+  border: 1px solid var(--te-green-border);
+  color: var(--te-green);
+  font-weight: 500;
+}
+.te-btn--accent:hover:not(:disabled) {
+  background: rgba(147, 218, 73, 0.24);
+}
+
+.te-btn--danger {
+  background: var(--te-red-glow);
+  border: 1px solid var(--te-red-border);
+  color: var(--te-red-soft);
+  font-weight: 600;
+}
+.te-btn--danger:hover:not(:disabled) {
+  background: rgba(232, 92, 92, 0.3);
+}
+
+.te-btn--ghost {
+  padding: 6px 10px;
+  color: var(--te-c-text-faint);
+}
+.te-btn--ghost:hover:not(:disabled) {
+  color: var(--te-c-text-strong);
+}
+
+/* ── Chip ───────────────────────────────────────────────────────────── */
+
+.te-chip {
+  appearance: none;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--te-font);
+  font-size: 12px;
+  border-radius: var(--te-r-pill);
+  padding: 5px 12px;
+  background: transparent;
+  border: 1px solid var(--te-c-border);
+  color: var(--te-c-text);
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  user-select: none;
+}
+button.te-chip {
+  cursor: pointer;
+}
+button.te-chip:hover {
+  border-color: var(--te-c-border-strong);
+  background: var(--te-c-hover-fill);
+}
+
+.te-chip--selected {
+  border-color: var(--te-green);
+  color: var(--te-green);
+  background: var(--te-green-glow);
+  font-weight: 600;
+}
+.te-light .te-chip--selected {
+  color: var(--te-light-ink);
+  background: rgba(147, 218, 73, 0.25);
+}
+button.te-chip--selected:hover {
+  border-color: var(--te-green);
+  background: var(--te-green-glow);
+}
+
+.te-chip--amber {
+  border-color: rgba(233, 162, 59, 0.4);
+  color: var(--te-amber);
+}
+
+.te-chip--dashed {
+  border-style: dashed;
+  color: var(--te-c-text-muted);
+}
+
+/* Removable chip's ✕ — a nested button, so the chip itself stays a span. */
+.te-chip__remove {
+  appearance: none;
+  border: none;
+  background: none;
+  margin: 0;
+  padding: 0 2px;
+  font: inherit;
+  cursor: pointer;
+  color: var(--te-c-text-faint);
+}
+.te-chip__remove:hover {
+  color: var(--te-red);
+}
+
+/* ── Section label ──────────────────────────────────────────────────── */
+
+.te-seclabel {
+  font-family: var(--te-font);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--te-c-text-faint);
+  margin: 0 0 8px;
+}

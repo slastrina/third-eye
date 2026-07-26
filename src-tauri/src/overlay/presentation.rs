@@ -20,7 +20,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::config::{
-    self, EdgeExtents, OverlayPointConfig, OverlayPresentation, OverlaySizeConfig, PresentationMode,
+    self, OverlayPointConfig, OverlayPresentation, OverlaySizeConfig, PresentationMode,
     OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH,
 };
 
@@ -187,7 +187,10 @@ pub fn apply_overlay_presentation(
     match config::save_overlay_presentation(app, &desired) {
         Ok(()) => {
             state.record_persist_error(None);
-            log::info!("overlay: presentation set to {:?} (via {via})", desired.mode);
+            log::info!(
+                "overlay: presentation set to {:?} (via {via})",
+                desired.mode
+            );
         }
         Err(e) => {
             state.set(previous);
@@ -261,13 +264,17 @@ pub fn overlay_presentation(state: State<'_, OverlayPresentationState>) -> Prese
 pub fn apply_persisted_overlay_presentation(app: &AppHandle) {
     if let Some(presentation) = config::load_overlay_presentation(app) {
         app.state::<OverlayPresentationState>().set(presentation);
-        log::info!("overlay: applied persisted presentation ({:?})", presentation.mode);
+        log::info!(
+            "overlay: applied persisted presentation ({:?})",
+            presentation.mode
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EdgeExtents;
 
     fn defaults() -> OverlayPresentation {
         OverlayPresentation::default()
@@ -286,7 +293,11 @@ mod tests {
         let state = OverlayPresentationState::new();
         let next = with_mode(defaults(), PresentationMode::Left);
         let previous = state.set(next);
-        assert_eq!(previous, defaults(), "set returns the prior record for rollback");
+        assert_eq!(
+            previous,
+            defaults(),
+            "set returns the prior record for rollback"
+        );
         assert_eq!(state.current(), next);
         // Rolling back restores the exact prior record.
         state.set(previous);
@@ -297,7 +308,10 @@ mod tests {
     fn persist_errors_are_queryable_and_clearable() {
         let state = OverlayPresentationState::new();
         state.record_persist_error(Some("failed to persist overlayPresentation".into()));
-        assert!(state.persist_error().unwrap().contains("overlayPresentation"));
+        assert!(state
+            .persist_error()
+            .unwrap()
+            .contains("overlayPresentation"));
         state.record_persist_error(None);
         assert_eq!(state.persist_error(), None);
     }
@@ -339,8 +353,18 @@ mod tests {
     #[test]
     fn with_extent_modal_writes_both_axes() {
         let modal = with_extent(defaults(), PresentationMode::Modal, 800.0, 600.0);
-        assert_eq!(modal.modal_size, OverlaySizeConfig { width: 800.0, height: 600.0 });
-        assert_eq!(modal.edge_extents, defaults().edge_extents, "edges untouched by a modal resize");
+        assert_eq!(
+            modal.modal_size,
+            OverlaySizeConfig {
+                width: 800.0,
+                height: 600.0
+            }
+        );
+        assert_eq!(
+            modal.edge_extents,
+            defaults().edge_extents,
+            "edges untouched by a modal resize"
+        );
     }
 
     #[test]
@@ -351,7 +375,12 @@ mod tests {
         let tiny = with_extent(defaults(), PresentationMode::Left, 10.0, 10.0);
         assert_eq!(tiny.edge_extents.left, OVERLAY_MIN_WIDTH);
 
-        let nan = with_extent(defaults(), PresentationMode::Modal, f64::NAN, f64::NEG_INFINITY);
+        let nan = with_extent(
+            defaults(),
+            PresentationMode::Modal,
+            f64::NAN,
+            f64::NEG_INFINITY,
+        );
         assert_eq!(nan.modal_size.width, OVERLAY_MIN_WIDTH);
         assert_eq!(nan.modal_size.height, OVERLAY_MIN_HEIGHT);
 
@@ -367,14 +396,23 @@ mod tests {
         // changes; the mode and every extent are carried forward untouched.
         let base = defaults();
         let moved = with_position(base, -1920.0, -128.0);
-        assert_eq!(moved.modal_position, Some(OverlayPointConfig { x: -1920.0, y: -128.0 }));
+        assert_eq!(
+            moved.modal_position,
+            Some(OverlayPointConfig {
+                x: -1920.0,
+                y: -128.0
+            })
+        );
         assert_eq!(moved.mode, base.mode);
         assert_eq!(moved.edge_extents, base.edge_extents);
         assert_eq!(moved.modal_size, base.modal_size);
 
         // A finite positive point round-trips identically (no clamp/select).
         let moved = with_position(base, 512.0, 384.0);
-        assert_eq!(moved.modal_position, Some(OverlayPointConfig { x: 512.0, y: 384.0 }));
+        assert_eq!(
+            moved.modal_position,
+            Some(OverlayPointConfig { x: 512.0, y: 384.0 })
+        );
     }
 
     #[test]
@@ -384,7 +422,11 @@ mod tests {
         // the error. modalPosition serializes as an object when the modal has a
         // remembered point.
         let state = OverlayPresentationState::new();
-        state.set(with_position(with_mode(defaults(), PresentationMode::Top), 256.0, 128.0));
+        state.set(with_position(
+            with_mode(defaults(), PresentationMode::Top),
+            256.0,
+            128.0,
+        ));
         state.record_persist_error(Some("failed to persist overlayPresentation".into()));
         let v = serde_json::to_value(state.status()).unwrap();
         let obj = v.as_object().unwrap();
@@ -392,8 +434,14 @@ mod tests {
         assert_eq!(obj["mode"], "top");
         assert!(obj["edgeExtents"].is_object());
         assert!(obj["modalSize"].is_object());
-        assert_eq!(obj["modalPosition"], serde_json::json!({ "x": 256.0, "y": 128.0 }));
-        assert!(obj["persistError"].as_str().unwrap().contains("overlayPresentation"));
+        assert_eq!(
+            obj["modalPosition"],
+            serde_json::json!({ "x": 256.0, "y": 128.0 })
+        );
+        assert!(obj["persistError"]
+            .as_str()
+            .unwrap()
+            .contains("overlayPresentation"));
     }
 
     #[test]
@@ -403,15 +451,26 @@ mod tests {
         // vanish, so the frontend can read `modalPosition === null` → center.
         let v = serde_json::to_value(OverlayPresentationState::new().status()).unwrap();
         assert_eq!(v["mode"], "modal");
-        assert!(v["persistError"].is_null(), "absent persist error must be JSON null");
-        assert!(v["modalPosition"].is_null(), "never-moved modal position must be JSON null");
+        assert!(
+            v["persistError"].is_null(),
+            "absent persist error must be JSON null"
+        );
+        assert!(
+            v["modalPosition"].is_null(),
+            "never-moved modal position must be JSON null"
+        );
     }
 
     #[test]
     fn edge_extents_default_is_a_valid_on_screen_shape() {
         // The fallback record the applier can never make off-screen: every
         // default extent sits at or above the mins.
-        let EdgeExtents { top, bottom, left, right } = defaults().edge_extents;
+        let EdgeExtents {
+            top,
+            bottom,
+            left,
+            right,
+        } = defaults().edge_extents;
         assert!(top >= OVERLAY_MIN_HEIGHT && bottom >= OVERLAY_MIN_HEIGHT);
         assert!(left >= OVERLAY_MIN_WIDTH && right >= OVERLAY_MIN_WIDTH);
     }

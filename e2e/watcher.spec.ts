@@ -90,7 +90,7 @@ test("watcher section degrades to a named unavailable state outside Tauri", asyn
   const watcher = section(page);
   await expect(watcher.getByRole("heading", { name: "Watch Screen" })).toBeVisible();
   // watcher_status rejects → toggle disabled with a named note, not a crash.
-  await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeDisabled();
+  await expect(page.getByRole("switch", { name: "Watch Screen" })).toBeDisabled();
   await expect(watcher.locator(".settings-unavailable")).toContainText(
     "Watcher state is unavailable outside the app.",
   );
@@ -104,7 +104,7 @@ test("live status renders and the toggle drives set_watcher_enabled", async ({ p
   await installWatcherIpcMock(page);
   await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
-  const toggle = page.getByRole("checkbox", { name: "Watch Screen" });
+  const toggle = page.getByRole("switch", { name: "Watch Screen" });
   const state = watcher.locator(".settings-status-value");
 
   // Mount-time watcher_status resolves → live toggle, idle status.
@@ -130,7 +130,7 @@ test("watcher://observation feeds the snippet list, newest first, capped at 5", 
   await installWatcherIpcMock(page);
   await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
-  await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeEnabled();
+  await expect(page.getByRole("switch", { name: "Watch Screen" })).toBeEnabled();
 
   // Six observations through the real event path — the list keeps the last 5.
   await page.evaluate(() => {
@@ -173,7 +173,7 @@ test("watcher://state broadcasts drive privacy pause and typed tick errors", asy
   await page.goto("/?view=settings&section=watcher");
   const watcher = section(page);
   const state = watcher.locator(".settings-status-value");
-  await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeEnabled();
+  await expect(page.getByRole("switch", { name: "Watch Screen" })).toBeEnabled();
 
   // Privacy pause arrives as a broadcast (e.g. toggled from the tray) and is
   // its own visible state, not a silent stop.
@@ -188,7 +188,7 @@ test("watcher://state broadcasts drive privacy pause and typed tick errors", asy
   await expect(state).toHaveText("Paused by Privacy Mode");
   await expect(state).toHaveAttribute("data-watcher-state", "paused-privacy");
   // The broadcast snapshot is authoritative for the toggle too.
-  await expect(page.getByRole("checkbox", { name: "Watch Screen" })).toBeChecked();
+  await expect(page.getByRole("switch", { name: "Watch Screen" })).toBeChecked();
 
   // A typed tick error surfaces as a role=alert banner with the human title.
   await page.evaluate(() => {

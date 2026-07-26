@@ -113,7 +113,10 @@ impl ServerHandler for CountingMcpServer {
                     "echo: {message}"
                 ))]))
             }
-            other => Err(McpError::invalid_params(format!("no such tool: {other}"), None)),
+            other => Err(McpError::invalid_params(
+                format!("no such tool: {other}"),
+                None,
+            )),
         }
     }
 }
@@ -237,7 +240,10 @@ async fn off_mode_blocks_before_the_wire_and_the_server_is_never_reached() {
         .await;
 
     // Typed, visible block — never a silent no-op (R006/R007).
-    assert!(!outcome.ok, "an Off-mode MCP call must be blocked: {outcome:?}");
+    assert!(
+        !outcome.ok,
+        "an Off-mode MCP call must be blocked: {outcome:?}"
+    );
     assert_eq!(
         outcome.failure.as_deref(),
         Some(MCP_ACTION_BLOCKED_KIND),
@@ -268,7 +274,10 @@ async fn ask_mode_with_a_deny_verdict_blocks_and_the_server_is_never_reached() {
         1,
         "Ask mode must consult the prompt seam once for an ungranted tool"
     );
-    assert!(!outcome.ok, "a denied MCP call must be blocked: {outcome:?}");
+    assert!(
+        !outcome.ok,
+        "a denied MCP call must be blocked: {outcome:?}"
+    );
     assert_eq!(outcome.failure.as_deref(), Some(MCP_ACTION_BLOCKED_KIND));
     assert_eq!(
         harness.call_count.load(Ordering::SeqCst),
@@ -312,7 +321,11 @@ async fn ask_mode_with_allow_once_reaches_the_server_but_does_not_grant() {
         .execute(&tool_call("mcp__echo", r#"{"message":"once"}"#))
         .await;
 
-    assert_eq!(prompts.load(Ordering::SeqCst), 1, "AllowOnce must be prompted");
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        1,
+        "AllowOnce must be prompted"
+    );
     assert!(outcome.ok, "an AllowOnce MCP call must run: {outcome:?}");
     assert_eq!(outcome.content, "echo: once");
     assert_eq!(harness.call_count.load(Ordering::SeqCst), 1);

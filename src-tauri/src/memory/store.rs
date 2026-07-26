@@ -170,25 +170,35 @@ impl MemoryStore {
     /// is always greppable at startup.
     pub fn open(path: &Path) -> Result<Self, MemoryError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MemoryError::Db { detail: format!("create {parent:?}: {e}") })?;
+            std::fs::create_dir_all(parent).map_err(|e| MemoryError::Db {
+                detail: format!("create {parent:?}: {e}"),
+            })?;
         }
-        let conn = Connection::open(path)
-            .map_err(|e| MemoryError::Db { detail: format!("open {path:?}: {e}") })?;
+        let conn = Connection::open(path).map_err(|e| MemoryError::Db {
+            detail: format!("open {path:?}: {e}"),
+        })?;
         // journal_mode returns the resulting mode as a row; query it rather
         // than execute so the statement is consumed either way.
-        let mode: String =
-            conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         init_connection(&conn)?;
-        log::info!("memory: db open at {} (journal_mode={mode})", path.display());
-        Ok(Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) })
+        log::info!(
+            "memory: db open at {} (journal_mode={mode})",
+            path.display()
+        );
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: Some(path.to_path_buf()),
+        })
     }
 
     /// In-memory store for tests: same schema and pragmas, no file.
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
         init_connection(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), path: None })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: None,
+        })
     }
 
     /// The on-disk db path, or `None` for an in-memory store.
@@ -205,14 +215,18 @@ impl MemoryStore {
     /// caller, not data.
     pub fn insert(&self, new: NewMemory) -> Result<MemoryRecord, MemoryError> {
         validate_summary(&new.summary)?;
-        let apps_json = serde_json::to_string(&new.apps)
-            .map_err(|e| MemoryError::InvalidInput { detail: format!("apps: {e}") })?;
+        let apps_json =
+            serde_json::to_string(&new.apps).map_err(|e| MemoryError::InvalidInput {
+                detail: format!("apps: {e}"),
+            })?;
         let embedding_json = new
             .embedding
             .as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| MemoryError::InvalidInput { detail: format!("embedding: {e}") })?;
+            .map_err(|e| MemoryError::InvalidInput {
+                detail: format!("embedding: {e}"),
+            })?;
         let now = now_ms();
         let conn = self.lock();
         conn.execute(
@@ -282,7 +296,9 @@ impl MemoryStore {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), MemoryError> {
-        let changed = self.lock().execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let changed = self
+            .lock()
+            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         if changed == 0 {
             return Err(MemoryError::NotFound { id });
         }
@@ -297,9 +313,26 @@ impl MemoryStore {
         Ok(removed)
     }
 
+    /// Retention enforcement (memoryRetention follow-up): delete memories
+    /// whose creation predates `cutoff_ms`, returning how many were removed.
+    /// Keyed on `created_at_ms` — when the memory entered the store — not the
+    /// observed span, so an old span distilled recently survives its full
+    /// retention window like any other new memory.
+    pub fn prune_created_before(&self, cutoff_ms: i64) -> Result<usize, MemoryError> {
+        let removed = self.lock().execute(
+            "DELETE FROM memories WHERE created_at_ms < ?1",
+            params![cutoff_ms],
+        )?;
+        if removed > 0 {
+            log::info!("memory: retention pruned {removed} rows older than {cutoff_ms}");
+        }
+        Ok(removed)
+    }
+
     pub fn count(&self) -> Result<usize, MemoryError> {
-        let n: i64 =
-            self.lock().query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        let n: i64 = self
+            .lock()
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
         Ok(n as usize)
     }
 
@@ -313,7 +346,9 @@ impl MemoryStore {
         let conn = self.lock();
         let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
         let cols = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(cols)
     }
@@ -373,13 +408,17 @@ impl MemoryStore {
     /// Rejects empty vectors — an unrankable embedding is a caller bug.
     pub fn set_embedding(&self, id: i64, embedding: &[f32]) -> Result<(), MemoryError> {
         if embedding.is_empty() {
-            return Err(MemoryError::InvalidInput { detail: "embedding is empty".into() });
+            return Err(MemoryError::InvalidInput {
+                detail: "embedding is empty".into(),
+            });
         }
-        let json = serde_json::to_string(embedding)
-            .map_err(|e| MemoryError::InvalidInput { detail: format!("embedding: {e}") })?;
-        let changed = self
-            .lock()
-            .execute("UPDATE memories SET embedding = ?1 WHERE id = ?2", params![json, id])?;
+        let json = serde_json::to_string(embedding).map_err(|e| MemoryError::InvalidInput {
+            detail: format!("embedding: {e}"),
+        })?;
+        let changed = self.lock().execute(
+            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+            params![json, id],
+        )?;
         if changed == 0 {
             return Err(MemoryError::NotFound { id });
         }
@@ -415,7 +454,9 @@ impl MemoryStore {
 
 fn validate_summary(summary: &str) -> Result<(), MemoryError> {
     if summary.trim().is_empty() {
-        return Err(MemoryError::InvalidInput { detail: "summary is empty".into() });
+        return Err(MemoryError::InvalidInput {
+            detail: "summary is empty".into(),
+        });
     }
     Ok(())
 }
@@ -423,7 +464,10 @@ fn validate_summary(summary: &str) -> Result<(), MemoryError> {
 /// Milliseconds since the Unix epoch. Saturates at 0 if the clock is set
 /// before 1970 rather than panicking.
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Build an FTS5 MATCH expression that treats the user's text as plain
@@ -480,13 +524,38 @@ mod tests {
     fn open_records_db_path_and_in_memory_has_none() {
         assert_eq!(store().db_path(), None);
 
-        let path = std::env::temp_dir()
-            .join(format!("third-eye-store-path-test-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "third-eye-store-path-test-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let s = MemoryStore::open(&path).unwrap();
         assert_eq!(s.db_path(), Some(path.as_path()));
         drop(s);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_created_before_removes_only_expired_rows() {
+        let s = store();
+        let old = s.insert(mem("expired memory")).unwrap();
+        let kept = s.insert(mem("fresh memory")).unwrap();
+        // Cutoff strictly between the two creation times can't be arranged
+        // with real clocks, so backdate the first row directly.
+        s.lock()
+            .execute(
+                "UPDATE memories SET created_at_ms = 1 WHERE id = ?1",
+                params![old.id],
+            )
+            .unwrap();
+        let removed = s.prune_created_before(kept.created_at_ms).unwrap();
+        assert_eq!(removed, 1);
+        let survivors = s.list(10, 0).unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, kept.id);
+        // A cutoff at/below every creation time removes nothing (forever
+        // maps to never calling this at all — see memory_retention_window_ms).
+        assert_eq!(s.prune_created_before(0).unwrap(), 0);
     }
 
     #[test]
@@ -505,7 +574,10 @@ mod tests {
         assert_eq!(fetched, rec);
 
         s.delete(rec.id).unwrap();
-        assert_eq!(s.get(rec.id).unwrap_err(), MemoryError::NotFound { id: rec.id });
+        assert_eq!(
+            s.get(rec.id).unwrap_err(),
+            MemoryError::NotFound { id: rec.id }
+        );
         assert_eq!(s.count().unwrap(), 0);
     }
 
@@ -514,12 +586,19 @@ mod tests {
         let s = store();
         // Same created_at_ms is possible within one test run — id DESC is
         // the tiebreak, so insertion order still reverses deterministically.
-        let ids: Vec<i64> =
-            (1..=5).map(|i| s.insert(mem(&format!("memory number {i}"))).unwrap().id).collect();
+        let ids: Vec<i64> = (1..=5)
+            .map(|i| s.insert(mem(&format!("memory number {i}"))).unwrap().id)
+            .collect();
         let page1 = s.list(2, 0).unwrap();
-        assert_eq!(page1.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ids[4], ids[3]]);
+        assert_eq!(
+            page1.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![ids[4], ids[3]]
+        );
         let page2 = s.list(2, 2).unwrap();
-        assert_eq!(page2.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ids[2], ids[1]]);
+        assert_eq!(
+            page2.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1]]
+        );
         let rest = s.list(10, 4).unwrap();
         assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ids[0]]);
     }
@@ -541,7 +620,10 @@ mod tests {
     fn update_bumps_timestamp_and_clears_embedding() {
         let s = store();
         let rec = s
-            .insert(NewMemory { embedding: Some(vec![0.1, 0.2]), ..mem("draft summary") })
+            .insert(NewMemory {
+                embedding: Some(vec![0.1, 0.2]),
+                ..mem("draft summary")
+            })
             .unwrap();
         assert_eq!(s.embedded_rows().unwrap().len(), 1);
 
@@ -559,7 +641,10 @@ mod tests {
         let s = store();
         assert_eq!(s.get(99).unwrap_err(), MemoryError::NotFound { id: 99 });
         assert_eq!(s.delete(99).unwrap_err(), MemoryError::NotFound { id: 99 });
-        assert_eq!(s.update_summary(99, "x").unwrap_err(), MemoryError::NotFound { id: 99 });
+        assert_eq!(
+            s.update_summary(99, "x").unwrap_err(),
+            MemoryError::NotFound { id: 99 }
+        );
     }
 
     #[test]
@@ -569,7 +654,10 @@ mod tests {
             assert_eq!(s.insert(mem(bad)).unwrap_err().kind(), "invalid-input");
         }
         let rec = s.insert(mem("real summary")).unwrap();
-        assert_eq!(s.update_summary(rec.id, "  ").unwrap_err().kind(), "invalid-input");
+        assert_eq!(
+            s.update_summary(rec.id, "  ").unwrap_err().kind(),
+            "invalid-input"
+        );
         // Failed update left the row untouched.
         assert_eq!(s.get(rec.id).unwrap().summary, "real summary");
     }
@@ -577,9 +665,15 @@ mod tests {
     #[test]
     fn keyword_search_ranks_topical_row_first() {
         let s = store();
-        s.insert(mem("debugged the tokio runtime deadlock in the watcher loop")).unwrap();
-        let rust = s.insert(mem("refactored rust error taxonomy for the llm module")).unwrap();
-        s.insert(mem("planned the quarterly team offsite agenda")).unwrap();
+        s.insert(mem(
+            "debugged the tokio runtime deadlock in the watcher loop",
+        ))
+        .unwrap();
+        let rust = s
+            .insert(mem("refactored rust error taxonomy for the llm module"))
+            .unwrap();
+        s.insert(mem("planned the quarterly team offsite agenda"))
+            .unwrap();
 
         let hits = s.search_keyword("rust error taxonomy", 10).unwrap();
         assert!(!hits.is_empty());
@@ -639,7 +733,9 @@ mod tests {
         let conn = s.lock();
         let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
         let cols: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -677,8 +773,10 @@ mod tests {
 
         let s = MemoryStore::open(&db_path).unwrap();
         assert!(db_path.exists());
-        let mode: String =
-            s.lock().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        let mode: String = s
+            .lock()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
         drop(s);
 
@@ -698,11 +796,13 @@ mod tests {
         // keys, and the embedding must never leak over IPC.
         let s = store();
         let rec = s
-            .insert(NewMemory { embedding: Some(vec![1.0]), ..mem("shape pin") })
+            .insert(NewMemory {
+                embedding: Some(vec![1.0]),
+                ..mem("shape pin")
+            })
             .unwrap();
         let v = serde_json::to_value(&rec).unwrap();
-        let mut keys: Vec<&str> =
-            v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -748,8 +848,10 @@ CREATE TABLE IF NOT EXISTS memories (
 
     #[test]
     fn migration_is_idempotent_across_reopens() {
-        let path = std::env::temp_dir()
-            .join(format!("third-eye-migration-idempotent-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "third-eye-migration-idempotent-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let s = MemoryStore::open(&path).unwrap();
         let cols_first = s.column_info().unwrap();
@@ -763,8 +865,10 @@ CREATE TABLE IF NOT EXISTS memories (
 
     #[test]
     fn pre_m008_db_migrates_and_rows_default_to_watcher() {
-        let path = std::env::temp_dir()
-            .join(format!("third-eye-migration-fixture-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "third-eye-migration-fixture-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         pre_m008_db(&path);
 
@@ -779,8 +883,10 @@ CREATE TABLE IF NOT EXISTS memories (
 
     #[test]
     fn fresh_and_migrated_schemas_are_identical() {
-        let path = std::env::temp_dir()
-            .join(format!("third-eye-migration-equiv-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "third-eye-migration-equiv-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         pre_m008_db(&path);
 
@@ -799,7 +905,10 @@ CREATE TABLE IF NOT EXISTS memories (
     fn chat_source_round_trips_and_serializes_lowercase() {
         let s = store();
         let rec = s
-            .insert(NewMemory { source: MemorySource::Chat, ..mem("asked to search for rust") })
+            .insert(NewMemory {
+                source: MemorySource::Chat,
+                ..mem("asked to search for rust")
+            })
             .unwrap();
         assert_eq!(rec.source, MemorySource::Chat);
         assert_eq!(s.get(rec.id).unwrap().source, MemorySource::Chat);
@@ -812,7 +921,10 @@ CREATE TABLE IF NOT EXISTS memories (
         let s = store();
         let rec = s.insert(mem("row with odd provenance")).unwrap();
         s.lock()
-            .execute("UPDATE memories SET source = 'mystery' WHERE id = ?1", params![rec.id])
+            .execute(
+                "UPDATE memories SET source = 'mystery' WHERE id = ?1",
+                params![rec.id],
+            )
             .unwrap();
         assert_eq!(s.get(rec.id).unwrap().source, MemorySource::Watcher);
     }
@@ -822,12 +934,19 @@ CREATE TABLE IF NOT EXISTS memories (
         let s = store();
         let a = s.insert(mem("first without vector")).unwrap();
         let b = s.insert(mem("second without vector")).unwrap();
-        s.insert(NewMemory { embedding: Some(vec![1.0]), ..mem("has a vector") }).unwrap();
+        s.insert(NewMemory {
+            embedding: Some(vec![1.0]),
+            ..mem("has a vector")
+        })
+        .unwrap();
 
         let rows = s.unembedded_rows(10).unwrap();
         assert_eq!(
             rows,
-            vec![(a.id, "first without vector".into()), (b.id, "second without vector".into())]
+            vec![
+                (a.id, "first without vector".into()),
+                (b.id, "second without vector".into())
+            ]
         );
         assert_eq!(s.unembedded_rows(1).unwrap().len(), 1);
     }
@@ -840,7 +959,10 @@ CREATE TABLE IF NOT EXISTS memories (
         assert_eq!(s.embedded_rows().unwrap(), vec![(rec.id, vec![0.5, -1.0])]);
         assert!(s.unembedded_rows(10).unwrap().is_empty());
 
-        assert_eq!(s.set_embedding(rec.id, &[]).unwrap_err().kind(), "invalid-input");
+        assert_eq!(
+            s.set_embedding(rec.id, &[]).unwrap_err().kind(),
+            "invalid-input"
+        );
         assert_eq!(
             s.set_embedding(999, &[1.0]).unwrap_err(),
             MemoryError::NotFound { id: 999 }

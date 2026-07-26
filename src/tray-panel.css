@@ -1,0 +1,120 @@
+/* Tray panel window shell — transparent window, the card paints pixels. */
+
+.tray-panel-root {
+  height: 100%;
+  padding: 4px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.tray-panel-card {
+  display: flex;
+  flex-direction: column;
+  animation: te-in 0.18s ease;
+}
+
+.tray-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--te-line);
+}
+.tray-panel-header-text {
+  flex: 1;
+  min-width: 0;
+}
+.tray-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--te-text-strong);
+}
+.tray-panel-sub {
+  font-size: 11.5px;
+  color: var(--te-text-dim);
+}
+.tray-panel-close {
+  appearance: none;
+  border: none;
+  background: none;
+  margin: 0;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--te-text-ghost);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.tray-panel-close:hover {
+  color: var(--te-red);
+  background: var(--te-red-glow);
+}
+
+.tray-panel-section {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--te-line);
+}
+
+.tray-panel-pause-row {
+  display: flex;
+  gap: 6px;
+}
+.tray-panel-pause-row .te-chip {
+  flex: 1;
+  justify-content: center;
+}
+
+.tray-panel-resume {
+  width: 100%;
+}
+
+.tray-panel-stats {
+  display: flex;
+  gap: 8px;
+}
+.tray-panel-stat-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--te-text-strong);
+}
+.tray-panel-stat-label {
+  font-size: 10.5px;
+  color: var(--te-text-dim);
+}
+
+.tray-panel-latest {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tray-panel-latest-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.tray-panel-latest-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--te-green);
+  flex: none;
+  position: relative;
+  top: -1px;
+}
+.tray-panel-latest-text {
+  font-size: 12px;
+  color: var(--te-text);
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.tray-panel-actions {
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+}
+.tray-panel-actions > * {
+  flex: 1;
+}

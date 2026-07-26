@@ -137,13 +137,19 @@ impl ChatMessage {
     /// it — the first half of the OpenAI tool round-trip. `content` is the
     /// text (often empty) that accompanied the request.
     pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { tool_calls, ..Self::plain(Role::Assistant, content) }
+        Self {
+            tool_calls,
+            ..Self::plain(Role::Assistant, content)
+        }
     }
 
     /// A tool-result turn answering `tool_call_id` — the second half of the
     /// OpenAI tool round-trip. `content` is the tool's output for the model.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { tool_call_id: Some(tool_call_id.into()), ..Self::plain(Role::Tool, content) }
+        Self {
+            tool_call_id: Some(tool_call_id.into()),
+            ..Self::plain(Role::Tool, content)
+        }
     }
 
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
@@ -170,8 +176,7 @@ impl Serialize for ChatMessage {
         if self.attachments.is_empty() {
             msg.serialize_field("content", &self.content)?;
         } else {
-            let mut parts =
-                vec![serde_json::json!({ "type": "text", "text": self.content })];
+            let mut parts = vec![serde_json::json!({ "type": "text", "text": self.content })];
             parts.extend(self.attachments.iter().map(|att| {
                 serde_json::json!({
                     "type": "image_url",
@@ -216,7 +221,10 @@ pub struct ChatRequest {
 impl ChatRequest {
     /// A plain request with no tools — the S02 chat/ingest shape.
     pub fn new(messages: Vec<ChatMessage>) -> Self {
-        Self { messages, tools: Vec::new() }
+        Self {
+            messages,
+            tools: Vec::new(),
+        }
     }
 
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
@@ -234,7 +242,11 @@ impl ChatRequest {
 /// the UI preserves it on screen rather than discarding the user's partial
 /// answer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum LlmError {
     /// The endpoint could not be reached (connection refused, timeout, DNS)
     /// or answered with a server error before any token arrived.
@@ -249,11 +261,18 @@ pub enum LlmError {
     ToolsUnsupported { endpoint: String, detail: String },
     /// The stream died after tokens started arriving. `partial_text` holds
     /// everything streamed before the drop.
-    Interrupted { endpoint: String, partial_text: String, detail: String },
+    Interrupted {
+        endpoint: String,
+        partial_text: String,
+        detail: String,
+    },
     /// The privacy guard refused to send this request to a non-loopback
     /// endpoint (R016 fail closed). Carries the endpoint and a kebab-case
     /// machine-readable reason only — never any request text.
-    GuardBlocked { endpoint: String, reason: guard::GuardBlockReason },
+    GuardBlocked {
+        endpoint: String,
+        reason: guard::GuardBlockReason,
+    },
 }
 
 impl LlmError {
@@ -299,15 +318,25 @@ impl std::fmt::Display for LlmError {
                 write!(f, "no model available at {endpoint} ({detail})")
             }
             LlmError::ToolsUnsupported { endpoint, detail } => {
-                write!(f, "model at {endpoint} does not support tool calling ({detail})")
+                write!(
+                    f,
+                    "model at {endpoint} does not support tool calling ({detail})"
+                )
             }
-            LlmError::Interrupted { endpoint, partial_text, detail } => write!(
+            LlmError::Interrupted {
+                endpoint,
+                partial_text,
+                detail,
+            } => write!(
                 f,
                 "stream from {endpoint} interrupted after {} chars ({detail})",
                 partial_text.chars().count()
             ),
             LlmError::GuardBlocked { endpoint, reason } => {
-                write!(f, "blocked by privacy guard: request to {endpoint} not sent ({reason})")
+                write!(
+                    f,
+                    "blocked by privacy guard: request to {endpoint} not sent ({reason})"
+                )
             }
         }
     }
@@ -423,11 +452,18 @@ mod tests {
             for token in ["mock ", "reply"] {
                 on_token(token);
             }
-            Ok(StreamOutcome { text: "mock reply".into(), token_count: 2, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: "mock reply".into(),
+                token_count: 2,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: self.fail_with.is_none(), endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: self.fail_with.is_none(),
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
@@ -467,8 +503,11 @@ mod tests {
 
     #[test]
     fn chat_messages_serialize_to_openai_wire_format() {
-        let msgs =
-            vec![ChatMessage::system("be brief"), ChatMessage::user("hi"), ChatMessage::assistant("yo")];
+        let msgs = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("yo"),
+        ];
         let v = serde_json::to_value(&msgs).unwrap();
         assert_eq!(v[0]["role"], "system");
         assert_eq!(v[1]["role"], "user");
@@ -488,11 +527,14 @@ mod tests {
 
     #[test]
     fn message_with_attachment_serializes_vision_content_parts() {
-        let msg = ChatMessage::user("what is on my screen?")
-            .with_attachments(vec![Attachment { base64_png: "QUJD".into() }]);
+        let msg = ChatMessage::user("what is on my screen?").with_attachments(vec![Attachment {
+            base64_png: "QUJD".into(),
+        }]);
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["role"], "user");
-        let content = v["content"].as_array().expect("content must be a parts array");
+        let content = v["content"]
+            .as_array()
+            .expect("content must be a parts array");
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "what is on my screen?");
@@ -503,8 +545,12 @@ mod tests {
     #[test]
     fn multiple_attachments_each_get_an_image_part() {
         let msg = ChatMessage::user("compare these").with_attachments(vec![
-            Attachment { base64_png: "QQ==".into() },
-            Attachment { base64_png: "Qg==".into() },
+            Attachment {
+                base64_png: "QQ==".into(),
+            },
+            Attachment {
+                base64_png: "Qg==".into(),
+            },
         ]);
         let v = serde_json::to_value(&msg).unwrap();
         let content = v["content"].as_array().unwrap();
@@ -517,8 +563,7 @@ mod tests {
     fn deserialize_without_attachments_field_is_additive() {
         // Frontend messages predating S04 (and history turns) carry no
         // attachments key — they must parse to an empty vec, not error.
-        let msg: ChatMessage =
-            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        let msg: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert_eq!(msg, ChatMessage::user("hi"));
         assert!(msg.attachments.is_empty());
     }
@@ -547,11 +592,20 @@ mod tests {
         assert_eq!(v["endpoint"], "http://192.168.182.224:1234");
         assert_eq!(v["detail"], "connection refused");
 
-        let no_model = LlmError::NoModel { endpoint: "e".into(), detail: "d".into() };
+        let no_model = LlmError::NoModel {
+            endpoint: "e".into(),
+            detail: "d".into(),
+        };
         assert_eq!(serde_json::to_value(&no_model).unwrap()["kind"], "no-model");
 
-        let tools = LlmError::ToolsUnsupported { endpoint: "e".into(), detail: "d".into() };
-        assert_eq!(serde_json::to_value(&tools).unwrap()["kind"], "tools-unsupported");
+        let tools = LlmError::ToolsUnsupported {
+            endpoint: "e".into(),
+            detail: "d".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&tools).unwrap()["kind"],
+            "tools-unsupported"
+        );
 
         let interrupted = LlmError::Interrupted {
             endpoint: "e".into(),
@@ -582,8 +636,14 @@ mod tests {
         assert_eq!(err.endpoint(), "http://192.0.2.1:9");
         let msg = err.to_string();
         assert!(msg.contains("privacy guard"), "guard missing: {msg}");
-        assert!(msg.contains("http://192.0.2.1:9"), "endpoint missing: {msg}");
-        assert!(msg.contains("attachment-unredactable"), "reason missing: {msg}");
+        assert!(
+            msg.contains("http://192.0.2.1:9"),
+            "endpoint missing: {msg}"
+        );
+        assert!(
+            msg.contains("attachment-unredactable"),
+            "reason missing: {msg}"
+        );
     }
 
     #[test]
@@ -593,7 +653,10 @@ mod tests {
             detail: "connection refused".into(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("http://192.168.182.224:1234"), "endpoint missing: {msg}");
+        assert!(
+            msg.contains("http://192.168.182.224:1234"),
+            "endpoint missing: {msg}"
+        );
         assert!(msg.contains("offline"), "failure type missing: {msg}");
     }
 
@@ -606,13 +669,19 @@ mod tests {
         assert_eq!(err.kind(), "tools-unsupported");
         assert_eq!(err.endpoint(), "http://192.168.182.224:1234");
         let msg = err.to_string();
-        assert!(msg.contains("http://192.168.182.224:1234"), "endpoint missing: {msg}");
+        assert!(
+            msg.contains("http://192.168.182.224:1234"),
+            "endpoint missing: {msg}"
+        );
         assert!(msg.contains("tool calling"), "failure type missing: {msg}");
     }
 
     #[test]
     fn health_serializes_camel_case() {
-        let h = LlmHealth { online: false, endpoint: "http://x:1".into() };
+        let h = LlmHealth {
+            online: false,
+            endpoint: "http://x:1".into(),
+        };
         let v = serde_json::to_value(&h).unwrap();
         assert_eq!(v["online"], false);
         assert_eq!(v["endpoint"], "http://x:1");
@@ -652,12 +721,17 @@ mod tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "");
-        let calls = v["tool_calls"].as_array().expect("tool_calls must be an array");
+        let calls = v["tool_calls"]
+            .as_array()
+            .expect("tool_calls must be an array");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["id"], "call_abc");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "memory_search");
-        assert_eq!(calls[0]["function"]["arguments"], r#"{"query":"morning work"}"#);
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"query":"morning work"}"#
+        );
         assert!(!v.as_object().unwrap().contains_key("tool_call_id"));
     }
 
@@ -680,7 +754,11 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("tool_calls"));
         assert!(!obj.contains_key("tool_call_id"));
-        assert_eq!(obj.len(), 2, "plain message must carry exactly role+content: {v}");
+        assert_eq!(
+            obj.len(),
+            2,
+            "plain message must carry exactly role+content: {v}"
+        );
     }
 
     #[test]
@@ -715,8 +793,7 @@ mod tests {
     #[test]
     fn deserialize_plain_message_defaults_tool_fields_empty() {
         // Additive IPC contract: frontend messages carry no tool keys.
-        let msg: ChatMessage =
-            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        let msg: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert!(msg.tool_calls.is_empty());
         assert_eq!(msg.tool_call_id, None);
     }

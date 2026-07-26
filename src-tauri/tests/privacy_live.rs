@@ -53,8 +53,11 @@ const SEED_SECRETS: [&str; 5] = [
 
 /// The byte-exact placeholder vocabulary (pinned in privacy unit tests) that
 /// must ride the outbound requests instead.
-const PLACEHOLDERS: [&str; 3] =
-    ["[REDACTED:password]", "[REDACTED:card]", "[REDACTED:api-key]"];
+const PLACEHOLDERS: [&str; 3] = [
+    "[REDACTED:password]",
+    "[REDACTED:card]",
+    "[REDACTED:api-key]",
+];
 
 /// An innocent, distinctive line that must survive redaction verbatim all
 /// the way onto the wire — proof the pipeline redacts secrets, not text
@@ -117,7 +120,9 @@ mod proxy {
         let cap = captured.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((client, _)) = listener.accept().await else { return };
+                let Ok((client, _)) = listener.accept().await else {
+                    return;
+                };
                 let idx = {
                     let mut lock = cap.lock().unwrap();
                     lock.push(Vec::new());
@@ -230,7 +235,10 @@ fn assert_no_secret_bytes(bytes: &[u8], what: &str) {
 /// Returns which sibling files existed at scan time.
 fn scan_store_files(db_path: &Path, stage: &str) -> (bool, bool) {
     let bytes = std::fs::read(db_path).expect("read store db file");
-    assert!(!bytes.is_empty(), "store db file must not be empty ({stage})");
+    assert!(
+        !bytes.is_empty(),
+        "store db file must not be empty ({stage})"
+    );
     assert_no_secret_bytes(&bytes, &format!("store file ({stage})"));
 
     let mut existed = (false, false);
@@ -278,7 +286,9 @@ async fn live_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
         None,
         Arc::new(GuardState::new()),
     ));
-    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+        .lane_client(THIN_LANE)
+        .expect("thin lane must resolve");
 
     let watcher = WatcherState::new();
     let rx = watcher.subscribe();
@@ -305,9 +315,19 @@ async fn live_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
     // The pipeline really ran, live: no distillation error and stored output.
     let status = ingest.status();
     eprintln!("live ingest status: {status:?}");
-    assert!(status.last_error.is_none(), "live distillation failed: {:?}", status.last_error);
-    assert!(status.distilled_count >= 1, "at least one batch must distill");
-    assert!(store.count().unwrap() >= 1, "distilled summaries must be stored");
+    assert!(
+        status.last_error.is_none(),
+        "live distillation failed: {:?}",
+        status.last_error
+    );
+    assert!(
+        status.distilled_count >= 1,
+        "at least one batch must distill"
+    );
+    assert!(
+        store.count().unwrap() >= 1,
+        "distilled summaries must be stored"
+    );
 
     // --- Wire proof: every captured client→upstream byte stream ---
     let streams = captured.lock().unwrap().clone();
@@ -350,7 +370,10 @@ async fn live_pipeline_leaks_no_secret_bytes_to_store_or_wire() {
     // scanning the siblings now covers stored content the main file may not
     // yet hold.
     let (wal_before, _) = scan_store_files(&scratch.path, "pre-checkpoint");
-    assert!(wal_before, "WAL-mode store must have a -wal sibling while open");
+    assert!(
+        wal_before,
+        "WAL-mode store must have a -wal sibling while open"
+    );
 
     // Closing the last connection checkpoints the WAL into the main file, so
     // the post-close scan sees every stored page. (No placeholder assertion

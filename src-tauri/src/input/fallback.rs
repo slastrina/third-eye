@@ -17,7 +17,10 @@ pub struct FallbackInput;
 #[async_trait]
 impl InputControl for FallbackInput {
     fn permission(&self) -> InputPermission {
-        InputPermission { granted: false, supported: false }
+        InputPermission {
+            granted: false,
+            supported: false,
+        }
     }
 
     fn request_permission(&self) -> bool {
@@ -45,7 +48,9 @@ mod tests {
             InputAction::click(MouseButton::Left),
             InputAction::click_at(MouseButton::Left, 5, 6),
             InputAction::TypeText { text: "hi".into() },
-            InputAction::KeyPress { key: "return".into() },
+            InputAction::KeyPress {
+                key: "return".into(),
+            },
         ];
         for action in actions {
             let err = backend.perform(action.clone()).await.unwrap_err();
@@ -59,7 +64,13 @@ mod tests {
     #[test]
     fn fallback_permission_is_unsupported_value_not_error() {
         let backend = FallbackInput;
-        assert_eq!(backend.permission(), InputPermission { granted: false, supported: false });
+        assert_eq!(
+            backend.permission(),
+            InputPermission {
+                granted: false,
+                supported: false
+            }
+        );
         assert!(!backend.request_permission());
     }
 }

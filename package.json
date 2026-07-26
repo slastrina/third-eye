@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
@@ -18,10 +20,12 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
+    "@storybook/react-vite": "^10.5.4",
     "@tauri-apps/cli": "^2.5.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "storybook": "^10.5.4",
     "typescript": "~5.6.3",
     "vite": "^6.0.5",
     "vitest": "^3.1.1"

@@ -16,7 +16,10 @@ pub struct FallbackCapture;
 #[async_trait]
 impl ScreenCapture for FallbackCapture {
     fn permission(&self) -> CapturePermission {
-        CapturePermission { granted: false, supported: false }
+        CapturePermission {
+            granted: false,
+            supported: false,
+        }
     }
 
     fn request_permission(&self) -> bool {
@@ -48,7 +51,13 @@ mod tests {
     #[test]
     fn fallback_permission_is_unsupported_value_not_error() {
         let backend = FallbackCapture;
-        assert_eq!(backend.permission(), CapturePermission { granted: false, supported: false });
+        assert_eq!(
+            backend.permission(),
+            CapturePermission {
+                granted: false,
+                supported: false
+            }
+        );
         assert!(!backend.request_permission());
     }
 }

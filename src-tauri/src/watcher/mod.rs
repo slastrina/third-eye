@@ -237,7 +237,11 @@ fn build_observation(
 ) -> Result<RedactedObservation, RedactionError> {
     let outcome = crate::privacy::redact(&text)?;
     Ok(RedactedObservation {
-        observation: TextObservation { text: outcome.text, app_context, captured_at },
+        observation: TextObservation {
+            text: outcome.text,
+            app_context,
+            captured_at,
+        },
         detections: outcome.detections,
         confidence: outcome.confidence,
     })
@@ -306,8 +310,10 @@ async fn run_loop(app: tauri::AppHandle, engine: Arc<dyn OcrEngine>) {
 
         if next == WatcherRunState::Watching {
             if activity.is_none() {
-                activity =
-                    Some(crate::tray::begin_activity(&app, crate::tray::ActivityKind::Watcher));
+                activity = Some(crate::tray::begin_activity(
+                    &app,
+                    crate::tray::ActivityKind::Watcher,
+                ));
             }
             tick(&app, &state, engine.as_ref()).await;
         } else {
@@ -345,23 +351,20 @@ async fn tick(app: &tauri::AppHandle, state: &WatcherState, engine: &dyn OcrEngi
                 log::debug!("watcher: tick extracted no text");
                 return;
             }
-            let built = match build_observation(
-                lines.join("\n"),
-                frontmost_app_context(),
-                now_millis(),
-            ) {
-                Ok(built) => built,
-                Err(err) => {
-                    // Fail closed (D028): no unredacted text may leave this
-                    // frame, so the whole observation is dropped. Error kind
-                    // only — never the captured text.
-                    log::error!(
-                        "watcher: observation dropped, redaction failed ({})",
-                        err.kind()
-                    );
-                    return;
-                }
-            };
+            let built =
+                match build_observation(lines.join("\n"), frontmost_app_context(), now_millis()) {
+                    Ok(built) => built,
+                    Err(err) => {
+                        // Fail closed (D028): no unredacted text may leave this
+                        // frame, so the whole observation is dropped. Error kind
+                        // only — never the captured text.
+                        log::error!(
+                            "watcher: observation dropped, redaction failed ({})",
+                            err.kind()
+                        );
+                        return;
+                    }
+                };
             if !built.detections.is_empty() {
                 log::info!("watcher: redacted {}", detection_summary(&built.detections));
                 // The shared guard counters (M003 S02) see watcher detections
@@ -420,7 +423,10 @@ mod tests {
         // The loop keys capture on this exact comparison; every other state
         // must skip the OCR engine entirely.
         for (enabled, privacy) in [(false, false), (false, true), (true, true)] {
-            assert_ne!(decide_run_state(enabled, privacy), WatcherRunState::Watching);
+            assert_ne!(
+                decide_run_state(enabled, privacy),
+                WatcherRunState::Watching
+            );
         }
     }
 
@@ -432,7 +438,10 @@ mod tests {
             (WatcherRunState::PausedPrivacy, "paused-privacy"),
         ] {
             assert_eq!(state.as_str(), name);
-            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(name));
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(name)
+            );
         }
     }
 
@@ -452,13 +461,20 @@ mod tests {
         assert_eq!(v["capturedAt"], 1_752_800_000_000u64);
 
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["appContext", "capturedAt", "text"], "unexpected field set: {keys:?}");
+        assert_eq!(
+            keys,
+            ["appContext", "capturedAt", "text"],
+            "unexpected field set: {keys:?}"
+        );
     }
 
     #[test]
     fn observation_app_context_is_optional_end_to_end() {
-        let observation =
-            TextObservation { text: "x".into(), app_context: None, captured_at: 1 };
+        let observation = TextObservation {
+            text: "x".into(),
+            app_context: None,
+            captured_at: 1,
+        };
         let v = serde_json::to_value(&observation).unwrap();
         assert_eq!(v["appContext"], serde_json::Value::Null);
     }
@@ -468,7 +484,9 @@ mod tests {
         let status = WatcherStatus {
             enabled: true,
             state: WatcherRunState::PausedPrivacy,
-            last_tick_error: Some(OcrError::PermissionDenied { detail: "TCC denied".into() }),
+            last_tick_error: Some(OcrError::PermissionDenied {
+                detail: "TCC denied".into(),
+            }),
             error: Some("persist failed".into()),
         };
         let v = serde_json::to_value(&status).unwrap();
@@ -502,8 +520,14 @@ mod tests {
         state.set_enabled(true);
         assert!(state.enabled());
 
-        assert!(state.set_run_state(WatcherRunState::Watching), "idle -> watching changed");
-        assert!(!state.set_run_state(WatcherRunState::Watching), "watching -> watching did not");
+        assert!(
+            state.set_run_state(WatcherRunState::Watching),
+            "idle -> watching changed"
+        );
+        assert!(
+            !state.set_run_state(WatcherRunState::Watching),
+            "watching -> watching did not"
+        );
         assert!(state.set_run_state(WatcherRunState::PausedPrivacy));
         assert_eq!(state.run_state(), WatcherRunState::PausedPrivacy);
     }
@@ -511,10 +535,21 @@ mod tests {
     #[test]
     fn tick_errors_are_kept_until_a_success_clears_them() {
         let state = WatcherState::new();
-        let err = OcrError::CaptureFailed { detail: "no display".into() };
-        assert!(state.record_tick_error(Some(err.clone())), "first error is a change");
-        assert!(!state.record_tick_error(Some(err)), "same error again is not");
-        assert_eq!(state.status().last_tick_error.unwrap().kind(), "capture-failed");
+        let err = OcrError::CaptureFailed {
+            detail: "no display".into(),
+        };
+        assert!(
+            state.record_tick_error(Some(err.clone())),
+            "first error is a change"
+        );
+        assert!(
+            !state.record_tick_error(Some(err)),
+            "same error again is not"
+        );
+        assert_eq!(
+            state.status().last_tick_error.unwrap().kind(),
+            "capture-failed"
+        );
         assert!(state.record_tick_error(None), "success clears it");
         assert_eq!(state.status().last_tick_error, None);
     }
@@ -523,7 +558,12 @@ mod tests {
     fn persist_errors_are_queryable_and_clearable() {
         let state = WatcherState::new();
         state.record_persist_error(Some("failed to persist watcherEnabled=true".into()));
-        assert!(state.status().error.as_deref().unwrap().contains("watcherEnabled"));
+        assert!(state
+            .status()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("watcherEnabled"));
         state.record_persist_error(None);
         assert_eq!(state.status().error, None);
     }
@@ -546,7 +586,11 @@ mod tests {
         // The diagnostics view may be closed and S02 does not exist yet —
         // a receiverless send must be a no-op, not an error path.
         let state = WatcherState::new();
-        state.publish(TextObservation { text: "x".into(), app_context: None, captured_at: 1 });
+        state.publish(TextObservation {
+            text: "x".into(),
+            app_context: None,
+            captured_at: 1,
+        });
     }
 
     #[tokio::test]
@@ -588,9 +632,18 @@ mod tests {
         assert_eq!(
             built.detections,
             [
-                Detection { kind: crate::privacy::DetectionKind::Password, count: 1 },
-                Detection { kind: crate::privacy::DetectionKind::Card, count: 1 },
-                Detection { kind: crate::privacy::DetectionKind::ApiKey, count: 1 },
+                Detection {
+                    kind: crate::privacy::DetectionKind::Password,
+                    count: 1
+                },
+                Detection {
+                    kind: crate::privacy::DetectionKind::Card,
+                    count: 1
+                },
+                Detection {
+                    kind: crate::privacy::DetectionKind::ApiKey,
+                    count: 1
+                },
             ]
         );
         // The loggable metadata never carries any text, original or redacted.
@@ -624,11 +677,20 @@ mod tests {
         // The log-line vocabulary is the same kebab-case tag set S03 counters
         // key off — pin as_str to the serde tag, and the summary shape.
         for kind in crate::privacy::DetectionKind::ALL {
-            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(kind.as_str()));
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(kind.as_str())
+            );
         }
         let summary = detection_summary(&[
-            Detection { kind: crate::privacy::DetectionKind::Password, count: 2 },
-            Detection { kind: crate::privacy::DetectionKind::ApiKey, count: 1 },
+            Detection {
+                kind: crate::privacy::DetectionKind::Password,
+                count: 2,
+            },
+            Detection {
+                kind: crate::privacy::DetectionKind::ApiKey,
+                count: 1,
+            },
         ]);
         assert_eq!(summary, "password=2 api-key=1");
         assert_eq!(detection_summary(&[]), "");

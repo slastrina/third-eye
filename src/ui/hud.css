@@ -1,0 +1,159 @@
+/* Live automation HUD components: pill, action trail, ghost indicator. */
+
+.te-hudpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--te-font);
+  background: var(--te-glass-heavy);
+  border: 1px solid var(--te-amber-border);
+  border-radius: var(--te-r-pill);
+  padding: 8px 10px 8px 16px;
+  box-shadow: 0 18px 60px rgba(2, 8, 24, 0.6);
+  backdrop-filter: var(--te-blur);
+  -webkit-backdrop-filter: var(--te-blur);
+  animation: te-in 0.2s ease;
+  color: var(--te-text-strong);
+}
+.te-hudpill[data-tone="done"] {
+  border-color: rgba(147, 218, 73, 0.5);
+}
+.te-hudpill[data-tone="stopped"] {
+  border-color: var(--te-red-border);
+}
+.te-hudpill[data-tone="stopped"] .te-hudpill__headline {
+  color: var(--te-red-soft);
+}
+
+.te-hudpill__headline {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.te-hudpill__count {
+  font-size: 11px;
+  color: var(--te-text-faint);
+  white-space: nowrap;
+}
+
+.te-hudpill__stop {
+  appearance: none;
+  margin: 0;
+  font-family: var(--te-font);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--te-red-soft);
+  background: var(--te-red-glow);
+  border: 1px solid var(--te-red-border);
+  border-radius: var(--te-r-pill);
+  padding: 5px 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.te-hudpill__stop:hover {
+  background: rgba(232, 92, 92, 0.3);
+}
+
+/* ── Action trail ───────────────────────────────────────────────────── */
+
+.te-trail {
+  list-style: none;
+  margin: 0;
+  padding: 12px 14px;
+  width: 380px;
+  max-width: 100%;
+  box-sizing: border-box;
+  background: var(--te-glass-heavy);
+  border: 1px solid var(--te-line-strong);
+  border-radius: 13px;
+  box-shadow: 0 18px 60px rgba(2, 8, 24, 0.55);
+  backdrop-filter: var(--te-blur);
+  -webkit-backdrop-filter: var(--te-blur);
+  font-family: var(--te-font);
+  display: flex;
+  flex-direction: column;
+}
+
+.te-trail__item {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 2px;
+}
+.te-trail__item[data-status="running"] .te-trail__mark {
+  color: var(--te-amber);
+}
+.te-trail__item[data-status="ok"] .te-trail__mark {
+  color: var(--te-green);
+}
+.te-trail__item[data-status="failed"] .te-trail__mark {
+  color: var(--te-red);
+}
+
+.te-trail__mark {
+  font-size: 12px;
+  width: 14px;
+  flex: none;
+}
+.te-trail__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.te-trail__label {
+  font-size: 12.5px;
+  color: var(--te-text);
+}
+.te-trail__failure {
+  font-size: 11px;
+  color: var(--te-red-soft);
+}
+
+/* ── Ghost indicator ────────────────────────────────────────────────── */
+
+.te-ghost {
+  position: absolute;
+  pointer-events: none;
+  transition: left 0.35s var(--te-glide), top 0.35s var(--te-glide);
+}
+
+.te-ghost__ring {
+  position: absolute;
+  left: -17px;
+  top: -17px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid var(--te-amber);
+  box-shadow: 0 0 0 2px rgba(2, 8, 24, 0.35);
+  animation: te-pulse 1.2s ease-out infinite;
+}
+
+.te-ghost__ripple {
+  position: absolute;
+  left: -17px;
+  top: -17px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid var(--te-amber);
+  animation: te-ripple 0.45s ease-out forwards;
+}
+
+.te-ghost__badge {
+  position: absolute;
+  left: 14px;
+  top: 22px;
+  font-family: var(--te-font);
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--te-amber);
+  color: var(--te-navy);
+  border-radius: var(--te-r-pill);
+  padding: 2px 8px;
+  white-space: nowrap;
+}

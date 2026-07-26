@@ -27,9 +27,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
-use super::{
-    ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink,
-};
+use super::{ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOutcome, TokenSink};
 
 /// The single definition site for the default LM Studio endpoint — the
 /// fallback when neither the persisted settings override (`llmEndpoint`,
@@ -64,7 +62,12 @@ impl OpenAiClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client construction cannot fail with static config");
-        Self { endpoint, model: None, api_key: None, http }
+        Self {
+            endpoint,
+            model: None,
+            api_key: None,
+            http,
+        }
     }
 
     /// Pin this client to one model id. LM Studio validates the id only when
@@ -129,16 +132,28 @@ impl OpenAiClient {
             return Err(self.offline(format!("HTTP {status}: {}", snippet(&body))));
         }
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            self.offline(format!("malformed /v1/models response ({e}): {}", snippet(&body)))
+            self.offline(format!(
+                "malformed /v1/models response ({e}): {}",
+                snippet(&body)
+            ))
         })?;
         let data = value["data"].as_array().ok_or_else(|| {
-            self.offline(format!("/v1/models response has no data array: {}", snippet(&body)))
+            self.offline(format!(
+                "/v1/models response has no data array: {}",
+                snippet(&body)
+            ))
         })?;
-        Ok(data.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect())
+        Ok(data
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_owned))
+            .collect())
     }
 
     fn offline(&self, detail: impl Into<String>) -> LlmError {
-        LlmError::Offline { endpoint: self.endpoint.clone(), detail: detail.into() }
+        LlmError::Offline {
+            endpoint: self.endpoint.clone(),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -194,9 +209,15 @@ impl OpenAiClient {
                         self.endpoint,
                         self.model.as_deref().unwrap_or("default")
                     );
-                    LlmError::ToolsUnsupported { endpoint: self.endpoint.clone(), detail }
+                    LlmError::ToolsUnsupported {
+                        endpoint: self.endpoint.clone(),
+                        detail,
+                    }
                 } else {
-                    LlmError::NoModel { endpoint: self.endpoint.clone(), detail }
+                    LlmError::NoModel {
+                        endpoint: self.endpoint.clone(),
+                        detail,
+                    }
                 }
             } else {
                 self.offline(detail)
@@ -213,48 +234,49 @@ impl OpenAiClient {
         let mut tool_acc: std::collections::BTreeMap<usize, PartialToolCall> =
             std::collections::BTreeMap::new();
 
-        let mut handle_line = |line: &str,
-                               text: &mut String,
-                               token_count: &mut usize,
-                               tool_acc: &mut std::collections::BTreeMap<usize, PartialToolCall>| {
-            match parse_sse_line(line) {
-                Ok(SseLine::Token(token)) => {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(Instant::now());
-                        log::debug!(
-                            "llm: first token after {:.0} ms",
-                            started.elapsed().as_secs_f64() * 1000.0
-                        );
+        let mut handle_line =
+            |line: &str,
+             text: &mut String,
+             token_count: &mut usize,
+             tool_acc: &mut std::collections::BTreeMap<usize, PartialToolCall>| {
+                match parse_sse_line(line) {
+                    Ok(SseLine::Token(token)) => {
+                        if first_token_at.is_none() {
+                            first_token_at = Some(Instant::now());
+                            log::debug!(
+                                "llm: first token after {:.0} ms",
+                                started.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        text.push_str(&token);
+                        *token_count += 1;
+                        on_token(&token);
+                        Ok(false)
                     }
-                    text.push_str(&token);
-                    *token_count += 1;
-                    on_token(&token);
-                    Ok(false)
-                }
-                Ok(SseLine::Reasoning(chunk)) => {
-                    // A distinct stream: forwarded to the Thinking… surface when a
-                    // sink is wired, never appended to `text` (the answer stays
-                    // reasoning-free) and never counted as an answer token.
-                    if let Some(sink) = on_reasoning {
-                        sink(&chunk);
+                    Ok(SseLine::Reasoning(chunk)) => {
+                        // A distinct stream: forwarded to the Thinking… surface when a
+                        // sink is wired, never appended to `text` (the answer stays
+                        // reasoning-free) and never counted as an answer token.
+                        if let Some(sink) = on_reasoning {
+                            sink(&chunk);
+                        }
+                        Ok(false)
                     }
-                    Ok(false)
-                }
-                Ok(SseLine::ToolCalls(deltas)) => {
-                    for delta in deltas {
-                        tool_acc.entry(delta.index).or_default().absorb(delta);
+                    Ok(SseLine::ToolCalls(deltas)) => {
+                        for delta in deltas {
+                            tool_acc.entry(delta.index).or_default().absorb(delta);
+                        }
+                        Ok(false)
                     }
-                    Ok(false)
+                    Ok(SseLine::Done) => Ok(true),
+                    Ok(SseLine::Skip) => Ok(false),
+                    Err(detail) => Err(LlmError::Interrupted {
+                        endpoint: self.endpoint.clone(),
+                        partial_text: text.clone(),
+                        detail,
+                    }),
                 }
-                Ok(SseLine::Done) => Ok(true),
-                Ok(SseLine::Skip) => Ok(false),
-                Err(detail) => Err(LlmError::Interrupted {
-                    endpoint: self.endpoint.clone(),
-                    partial_text: text.clone(),
-                    detail,
-                }),
-            }
-        };
+            };
 
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| LlmError::Interrupted {
@@ -282,17 +304,24 @@ impl OpenAiClient {
         // without [DONE] is a valid successful completion).
         if !buf.is_empty() {
             let line = String::from_utf8_lossy(&buf).to_string();
-            handle_line(line.trim_end_matches(['\n', '\r']), &mut text, &mut token_count, &mut tool_acc)?;
+            handle_line(
+                line.trim_end_matches(['\n', '\r']),
+                &mut text,
+                &mut token_count,
+                &mut tool_acc,
+            )?;
         }
 
         let tool_calls = tool_acc
             .into_iter()
             .map(|(index, partial)| {
-                partial.finish(index).map_err(|detail| LlmError::Interrupted {
-                    endpoint: self.endpoint.clone(),
-                    partial_text: text.clone(),
-                    detail,
-                })
+                partial
+                    .finish(index)
+                    .map_err(|detail| LlmError::Interrupted {
+                        endpoint: self.endpoint.clone(),
+                        partial_text: text.clone(),
+                        detail,
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -311,7 +340,11 @@ impl OpenAiClient {
                 self.endpoint
             );
         }
-        Ok(StreamOutcome { text, token_count, tool_calls })
+        Ok(StreamOutcome {
+            text,
+            token_count,
+            tool_calls,
+        })
     }
 }
 
@@ -335,12 +368,17 @@ impl LlmClient for OpenAiClient {
         on_token: TokenSink<'_>,
         on_reasoning: ReasoningSink<'_>,
     ) -> Result<StreamOutcome, LlmError> {
-        self.stream_chat_core(request, on_token, Some(on_reasoning)).await
+        self.stream_chat_core(request, on_token, Some(on_reasoning))
+            .await
     }
 
     async fn health(&self) -> LlmHealth {
         let url = format!("{}/v1/models", self.endpoint);
-        let online = match self.authorize(self.http.get(&url)).timeout(HEALTH_TIMEOUT).send().await
+        let online = match self
+            .authorize(self.http.get(&url))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .await
         {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
@@ -348,7 +386,10 @@ impl LlmClient for OpenAiClient {
                 false
             }
         };
-        LlmHealth { online, endpoint: self.endpoint.clone() }
+        LlmHealth {
+            online,
+            endpoint: self.endpoint.clone(),
+        }
     }
 }
 
@@ -409,7 +450,9 @@ impl PartialToolCall {
     /// round-trip, and some OpenAI-compatible servers omit it.
     fn finish(self, index: usize) -> Result<super::ToolCall, String> {
         let Some(name) = self.name else {
-            return Err(format!("tool call at index {index} streamed without a function name"));
+            return Err(format!(
+                "tool call at index {index} streamed without a function name"
+            ));
         };
         Ok(super::ToolCall {
             id: self.id.unwrap_or_else(|| format!("call_{index}")),
@@ -509,9 +552,7 @@ pub(crate) mod test_support {
     /// tests can assert what went over the wire. The request is fully read
     /// (headers + content-length body) before the response is sent, so once
     /// the client has seen the response the capture is complete.
-    pub(crate) async fn spawn_capturing_server(
-        response: Vec<u8>,
-    ) -> (String, Arc<Mutex<Vec<u8>>>) {
+    pub(crate) async fn spawn_capturing_server(response: Vec<u8>) -> (String, Arc<Mutex<Vec<u8>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -538,10 +579,18 @@ pub(crate) mod test_support {
     /// `content-length` bytes of body.
     fn request_complete(buf: &[u8]) -> bool {
         let text = String::from_utf8_lossy(buf);
-        let Some(header_end) = text.find("\r\n\r\n") else { return false };
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
         let content_length = text
             .lines()
-            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:")?.trim().parse::<usize>().ok())
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
             .unwrap_or(0);
         buf.len() >= header_end + 4 + content_length
     }
@@ -550,7 +599,10 @@ pub(crate) mod test_support {
     pub(crate) fn captured_body_json(captured: &Arc<Mutex<Vec<u8>>>) -> serde_json::Value {
         let raw = captured.lock().unwrap().clone();
         let text = String::from_utf8_lossy(&raw);
-        let body = text.split("\r\n\r\n").nth(1).expect("captured request has no body");
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("captured request has no body");
         serde_json::from_str(body).expect("captured request body is not JSON")
     }
 
@@ -563,7 +615,10 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn sse_token(token: &str) -> String {
-        format!("data: {}\n\n", serde_json::json!({"choices": [{"delta": {"content": token}}]}))
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": token}}]})
+        )
     }
 
     /// One streamed `delta.tool_calls` SSE event with a single entry, in the
@@ -643,7 +698,11 @@ mod tests {
 
     #[tokio::test]
     async fn streams_tokens_and_accumulates_text() {
-        let parts = vec![sse_token("Hel"), sse_token("lo"), "data: [DONE]\n\n".to_string()];
+        let parts = vec![
+            sse_token("Hel"),
+            sse_token("lo"),
+            "data: [DONE]\n\n".to_string(),
+        ];
         let endpoint = spawn_raw_server(chunked_200(&parts, true)).await;
         let (result, seen) = run_chat(&endpoint).await;
         let outcome = result.unwrap();
@@ -666,8 +725,7 @@ mod tests {
         // transfer chunks — the byte buffer must stitch it back together.
         let event = sse_token("héllo");
         let (a, b) = event.split_at(20);
-        let endpoint =
-            spawn_raw_server(chunked_200(&[a.to_string(), b.to_string()], true)).await;
+        let endpoint = spawn_raw_server(chunked_200(&[a.to_string(), b.to_string()], true)).await;
         let (result, seen) = run_chat(&endpoint).await;
         assert_eq!(result.unwrap().text, "héllo");
         assert_eq!(seen, vec!["héllo"]);
@@ -697,7 +755,10 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert_eq!(err.endpoint(), endpoint);
-        assert!(err.to_string().contains(&endpoint), "display must name endpoint: {err}");
+        assert!(
+            err.to_string().contains(&endpoint),
+            "display must name endpoint: {err}"
+        );
         assert!(seen.is_empty());
     }
 
@@ -708,7 +769,9 @@ mod tests {
         let (result, _) = run_chat(&endpoint).await;
         let err = result.unwrap_err();
         assert_eq!(err.kind(), "no-model");
-        assert!(matches!(&err, LlmError::NoModel { detail, .. } if detail.contains("No model loaded")));
+        assert!(
+            matches!(&err, LlmError::NoModel { detail, .. } if detail.contains("No model loaded"))
+        );
     }
 
     #[tokio::test]
@@ -727,7 +790,11 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), "interrupted");
         assert_eq!(err.partial_text(), Some("partial"));
-        assert_eq!(seen, vec!["par", "tial"], "tokens before the drop must have been delivered");
+        assert_eq!(
+            seen,
+            vec!["par", "tial"],
+            "tokens before the drop must have been delivered"
+        );
     }
 
     #[tokio::test]
@@ -759,7 +826,10 @@ mod tests {
     #[test]
     fn parse_skips_non_data_lines_and_comments() {
         for line in ["", ": keep-alive", "event: message", "id: 7", "data:"] {
-            assert!(matches!(parse_sse_line(line), Ok(SseLine::Skip)), "line: {line:?}");
+            assert!(
+                matches!(parse_sse_line(line), Ok(SseLine::Skip)),
+                "line: {line:?}"
+            );
         }
     }
 
@@ -817,8 +887,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.text, "Final answer", "reasoning must not leak into the answer");
-        assert_eq!(outcome.token_count, 1, "reasoning deltas are not answer tokens");
+        assert_eq!(
+            outcome.text, "Final answer",
+            "reasoning must not leak into the answer"
+        );
+        assert_eq!(
+            outcome.token_count, 1,
+            "reasoning deltas are not answer tokens"
+        );
         assert_eq!(*tokens.lock().unwrap(), "Final answer");
         assert_eq!(
             *reasoning.lock().unwrap(),
@@ -841,7 +917,11 @@ mod tests {
         let outcome = result.unwrap();
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.token_count, 1);
-        assert_eq!(seen, vec!["done"], "reasoning is never delivered as a content token");
+        assert_eq!(
+            seen,
+            vec!["done"],
+            "reasoning is never delivered as a content token"
+        );
     }
 
     #[test]
@@ -895,8 +975,18 @@ mod tests {
         // Interleaved deltas for two calls must reassemble independently and
         // come back in index order.
         let parts = vec![
-            sse_tool_delta(0, Some("call_a"), Some("memory_search"), Some(r#"{"query":"#)),
-            sse_tool_delta(1, Some("call_b"), Some("memory_search"), Some(r#"{"query":"#)),
+            sse_tool_delta(
+                0,
+                Some("call_a"),
+                Some("memory_search"),
+                Some(r#"{"query":"#),
+            ),
+            sse_tool_delta(
+                1,
+                Some("call_b"),
+                Some("memory_search"),
+                Some(r#"{"query":"#),
+            ),
             sse_tool_delta(0, None, None, Some(r#""first"}"#)),
             sse_tool_delta(1, None, None, Some(r#""second"}"#)),
             "data: [DONE]\n\n".to_string(),
@@ -934,7 +1024,10 @@ mod tests {
         let endpoint = spawn_raw_server(chunked_200(&parts, true)).await;
         let err = run_chat_with_tools(&endpoint).await.unwrap_err();
         assert_eq!(err.kind(), "interrupted");
-        assert!(err.to_string().contains("function name"), "detail must name the cause: {err}");
+        assert!(
+            err.to_string().contains("function name"),
+            "detail must name the cause: {err}"
+        );
     }
 
     #[tokio::test]
@@ -942,7 +1035,12 @@ mod tests {
         // Some models narrate before calling: both surfaces must survive.
         let parts = vec![
             sse_token("Let me check. "),
-            sse_tool_delta(0, Some("call_1"), Some("memory_search"), Some(r#"{"query":"x"}"#)),
+            sse_tool_delta(
+                0,
+                Some("call_1"),
+                Some("memory_search"),
+                Some(r#"{"query":"x"}"#),
+            ),
             "data: [DONE]\n\n".to_string(),
         ];
         let endpoint = spawn_raw_server(chunked_200(&parts, true)).await;
@@ -967,7 +1065,9 @@ mod tests {
         let err = run_chat_with_tools(&endpoint).await.unwrap_err();
         assert_eq!(err.kind(), "tools-unsupported");
         assert_eq!(err.endpoint(), endpoint);
-        assert!(matches!(&err, LlmError::ToolsUnsupported { detail, .. } if detail.contains("tool use")));
+        assert!(
+            matches!(&err, LlmError::ToolsUnsupported { detail, .. } if detail.contains("tool use"))
+        );
     }
 
     #[tokio::test]
@@ -999,7 +1099,10 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint).with_model("thin-model-1b");
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
         assert_eq!(body["model"], "thin-model-1b");
         assert_eq!(body["stream"], true);
@@ -1013,7 +1116,10 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint);
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
         assert!(
             !body.as_object().unwrap().contains_key("model"),
@@ -1026,7 +1132,10 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint).with_api_key("sk-test-bearer-123");
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let raw = captured.lock().unwrap().clone();
         let headers = String::from_utf8_lossy(&raw).to_ascii_lowercase();
         assert!(
@@ -1042,10 +1151,16 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint);
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let raw = captured.lock().unwrap().clone();
         let headers = String::from_utf8_lossy(&raw).to_ascii_lowercase();
-        assert!(!headers.contains("authorization:"), "keyless client must not send auth");
+        assert!(
+            !headers.contains("authorization:"),
+            "keyless client must not send auth"
+        );
     }
 
     #[tokio::test]
@@ -1055,13 +1170,19 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint);
-        let msg = ChatMessage::user("what is on my screen?")
-            .with_attachments(vec![crate::llm::Attachment { base64_png: "QUJD".into() }]);
+        let msg = ChatMessage::user("what is on my screen?").with_attachments(vec![
+            crate::llm::Attachment {
+                base64_png: "QUJD".into(),
+            },
+        ]);
         client.stream_chat(&req(vec![msg]), &|_| {}).await.unwrap();
 
         let body = captured_body_json(&captured);
         let content = &body["messages"][0]["content"];
-        assert!(content.is_array(), "attachment content must be a parts array: {body}");
+        assert!(
+            content.is_array(),
+            "attachment content must be a parts array: {body}"
+        );
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "what is on my screen?");
         assert_eq!(content[1]["type"], "image_url");
@@ -1075,7 +1196,10 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint);
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
         assert_eq!(body["messages"][0]["content"], "hi");
     }
@@ -1099,7 +1223,9 @@ mod tests {
         client.stream_chat(&request, &|_| {}).await.unwrap();
 
         let body = captured_body_json(&captured);
-        let tools = body["tools"].as_array().expect("body must carry a tools array");
+        let tools = body["tools"]
+            .as_array()
+            .expect("body must carry a tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "memory_search");
@@ -1115,7 +1241,10 @@ mod tests {
         let parts = vec![sse_token("ok"), "data: [DONE]\n\n".to_string()];
         let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
         let client = OpenAiClient::new(&endpoint);
-        client.stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {}).await.unwrap();
+        client
+            .stream_chat(&req(vec![ChatMessage::user("hi")]), &|_| {})
+            .await
+            .unwrap();
         let body = captured_body_json(&captured);
         assert!(
             !body.as_object().unwrap().contains_key("tools"),
@@ -1148,7 +1277,10 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "memory_search");
+        assert_eq!(
+            msgs[1]["tool_calls"][0]["function"]["name"],
+            "memory_search"
+        );
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "call_1");
         assert_eq!(msgs[2]["content"], r#"{"results":[]}"#);
@@ -1178,13 +1310,20 @@ mod tests {
     #[tokio::test]
     async fn list_models_empty_data_array_is_ok_and_empty() {
         let endpoint = spawn_raw_server(plain_response("200 OK", r#"{"data":[]}"#)).await;
-        assert!(OpenAiClient::new(&endpoint).list_models().await.unwrap().is_empty());
+        assert!(OpenAiClient::new(&endpoint)
+            .list_models()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn list_models_maps_refused_connection_to_offline_naming_endpoint() {
         let endpoint = refused_endpoint().await;
-        let err = OpenAiClient::new(&endpoint).list_models().await.unwrap_err();
+        let err = OpenAiClient::new(&endpoint)
+            .list_models()
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert_eq!(err.endpoint(), endpoint);
     }
@@ -1192,7 +1331,10 @@ mod tests {
     #[tokio::test]
     async fn list_models_maps_http_error_to_offline_with_status_detail() {
         let endpoint = spawn_raw_server(plain_response("500 Internal Server Error", "boom")).await;
-        let err = OpenAiClient::new(&endpoint).list_models().await.unwrap_err();
+        let err = OpenAiClient::new(&endpoint)
+            .list_models()
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert!(matches!(&err, LlmError::Offline { detail, .. } if detail.contains("500")));
     }
@@ -1200,7 +1342,10 @@ mod tests {
     #[tokio::test]
     async fn list_models_maps_malformed_body_to_offline_with_detail() {
         let endpoint = spawn_raw_server(plain_response("200 OK", "not json at all")).await;
-        let err = OpenAiClient::new(&endpoint).list_models().await.unwrap_err();
+        let err = OpenAiClient::new(&endpoint)
+            .list_models()
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert!(matches!(&err, LlmError::Offline { detail, .. } if detail.contains("malformed")));
     }
@@ -1208,7 +1353,10 @@ mod tests {
     #[tokio::test]
     async fn list_models_maps_missing_data_array_to_offline() {
         let endpoint = spawn_raw_server(plain_response("200 OK", r#"{"models":[]}"#)).await;
-        let err = OpenAiClient::new(&endpoint).list_models().await.unwrap_err();
+        let err = OpenAiClient::new(&endpoint)
+            .list_models()
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "offline");
         assert!(matches!(&err, LlmError::Offline { detail, .. } if detail.contains("data array")));
     }
@@ -1218,6 +1366,9 @@ mod tests {
         // Single definition site: the settings override / THIRD_EYE_ENDPOINT
         // fall back to this constant (S05).
         assert_eq!(DEFAULT_ENDPOINT, "http://localhost:1234");
-        assert_eq!(LlmClient::endpoint(&OpenAiClient::default_endpoint()), DEFAULT_ENDPOINT);
+        assert_eq!(
+            LlmClient::endpoint(&OpenAiClient::default_endpoint()),
+            DEFAULT_ENDPOINT
+        );
     }
 }

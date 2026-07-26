@@ -61,7 +61,11 @@ pub fn provider_endpoint(provider: CloudProvider) -> &'static str {
 /// camelCase fields over IPC, the same convention as [`CloudKeyError`] and
 /// `OcrError`; details never carry key material.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum CloudClientError {
     /// Cloud opt-in is off — no remote client may be constructed. Returned
     /// before the keystore is ever consulted.
@@ -122,7 +126,9 @@ impl CloudTransport {
     /// The endpoint this transport targets for `provider` — the override when
     /// set, else the provider's real HTTPS base.
     fn endpoint_for(&self, provider: CloudProvider) -> String {
-        self.endpoint.clone().unwrap_or_else(|| provider_endpoint(provider).to_string())
+        self.endpoint
+            .clone()
+            .unwrap_or_else(|| provider_endpoint(provider).to_string())
     }
 
     /// Build the reqwest client carrying the connect timeout plus any TLS
@@ -135,7 +141,9 @@ impl CloudTransport {
         if let Some((host, addr)) = &self.resolve {
             builder = builder.resolve(host, *addr);
         }
-        builder.build().expect("reqwest client construction cannot fail with static config")
+        builder
+            .build()
+            .expect("reqwest client construction cannot fail with static config")
     }
 }
 
@@ -153,7 +161,10 @@ pub fn build_cloud_client(
 ) -> Result<Arc<GuardedClient>, CloudClientError> {
     // Gate 1: opted out → refuse before the keystore is ever consulted.
     if !optin.enabled() {
-        log::debug!("cloud: construction refused for {} (opt-in off)", provider.account());
+        log::debug!(
+            "cloud: construction refused for {} (opt-in off)",
+            provider.account()
+        );
         return Err(CloudClientError::OptinDisabled);
     }
 
@@ -165,8 +176,14 @@ pub fn build_cloud_client(
             return Err(CloudClientError::NoApiKey { provider });
         }
         Err(e) => {
-            log::error!("cloud: keystore read failed for {} ({})", provider.account(), e.kind());
-            return Err(CloudClientError::StoreFailed { detail: store_detail(e) });
+            log::error!(
+                "cloud: keystore read failed for {} ({})",
+                provider.account(),
+                e.kind()
+            );
+            return Err(CloudClientError::StoreFailed {
+                detail: store_detail(e),
+            });
         }
     };
 
@@ -208,12 +225,17 @@ mod tests {
     impl TestStore {
         fn new(tag: &str) -> Self {
             use std::time::{SystemTime, UNIX_EPOCH};
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let service = format!(
                 "com.slastrina.thirdeye.test.client.{tag}.{}.{nanos}",
                 std::process::id()
             );
-            Self { store: KeyStore::with_service(&service) }
+            Self {
+                store: KeyStore::with_service(&service),
+            }
         }
     }
 
@@ -264,7 +286,12 @@ mod tests {
         .err()
         .expect("opt-in on + empty keystore must refuse construction");
         assert_eq!(err.kind(), "no-api-key");
-        assert_eq!(err, CloudClientError::NoApiKey { provider: CloudProvider::Openai });
+        assert_eq!(
+            err,
+            CloudClientError::NoApiKey {
+                provider: CloudProvider::Openai
+            }
+        );
     }
 
     #[test]
@@ -283,6 +310,7 @@ mod tests {
 
     #[test]
     fn successful_build_wraps_in_guarded_client_with_external_trust() {
+        let _keychain = crate::cloud::real_keychain_test_lock();
         // Opt-in on + a seeded key → an Arc<GuardedClient> at the provider's
         // real HTTPS endpoint, classified External so the guard is engaged.
         // No network call is made — construction only.
@@ -313,8 +341,12 @@ mod tests {
     fn error_kind_matches_serde_tag_for_every_variant() {
         let all = [
             CloudClientError::OptinDisabled,
-            CloudClientError::NoApiKey { provider: CloudProvider::Anthropic },
-            CloudClientError::StoreFailed { detail: "keychain locked".into() },
+            CloudClientError::NoApiKey {
+                provider: CloudProvider::Anthropic,
+            },
+            CloudClientError::StoreFailed {
+                detail: "keychain locked".into(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -324,7 +356,9 @@ mod tests {
 
     #[test]
     fn no_api_key_error_serializes_provider_kebab_case() {
-        let err = CloudClientError::NoApiKey { provider: CloudProvider::Openai };
+        let err = CloudClientError::NoApiKey {
+            provider: CloudProvider::Openai,
+        };
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["kind"], "no-api-key");
         assert_eq!(v["provider"], "openai");
@@ -334,9 +368,15 @@ mod tests {
     fn transport_defaults_to_the_providers_real_endpoint() {
         let prod = CloudTransport::default();
         assert_eq!(prod.endpoint_for(CloudProvider::Openai), OPENAI_ENDPOINT);
-        assert_eq!(prod.endpoint_for(CloudProvider::Anthropic), ANTHROPIC_ENDPOINT);
+        assert_eq!(
+            prod.endpoint_for(CloudProvider::Anthropic),
+            ANTHROPIC_ENDPOINT
+        );
         // The override seam wins when set (the S03 mock's endpoint).
         let overridden = CloudTransport::default().with_endpoint("https://cloud.test:8443");
-        assert_eq!(overridden.endpoint_for(CloudProvider::Openai), "https://cloud.test:8443");
+        assert_eq!(
+            overridden.endpoint_for(CloudProvider::Openai),
+            "https://cloud.test:8443"
+        );
     }
 }

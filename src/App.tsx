@@ -10,7 +10,10 @@ import {
   completeFirstRun,
   composeMessages,
   firstRunStatus,
+  hotkeyStatus,
   initialChatState,
+  isLocalEndpoint,
+  memoryRetention,
   modelInfo,
   onLlmDone,
   onLlmError,
@@ -30,6 +33,7 @@ import {
   requestInputPermission,
   runState,
   sendChat,
+  setMemoryRetention,
   setModel,
   showStopButton,
   startHealthProbe,
@@ -38,11 +42,17 @@ import {
   toCaptureFlowError,
 } from "./chat";
 import {
-  allSupportedGranted,
-  initialOnboardingState,
-  onboardingBlocked,
-  onboardingReducer,
-} from "./onboarding-state";
+  hotkeyFinishesTour,
+  initialTourState,
+  tourFinishBlocked,
+  tourOnLastStep,
+  tourReducer,
+  tourVisible,
+  type Retention,
+} from "./tour-state";
+import { Tour } from "./Tour";
+import { EyeIcon } from "./ui/EyeIcon";
+import { Toast } from "./ui/Toast";
 import {
   hideOverlay,
   onOverlayStateChanged,
@@ -55,6 +65,7 @@ import {
   drawerRect,
   extentFromSize,
   isOnScreen,
+  type DrawerRect,
   type Edge,
   type OverlayPoint,
   type OverlaySize,
@@ -92,6 +103,23 @@ import {
 // arrive via overlay_presentation() and supersede these.
 const SEED_EDGE_EXTENTS = { top: 320, bottom: 320, left: 420, right: 420 } as const;
 const SEED_MODAL_SIZE = { width: 720, height: 480 } as const;
+
+// Apply a window rect with size FIRST, then position — SEQUENTIALLY, never
+// Promise.all. On macOS tao converts the top-left y into Cocoa's bottom-left
+// origin using the window's CURRENT height, and a later size change grows the
+// frame from that bottom-left origin — upward. Position-then-size therefore
+// pushed the top of a freshly-snapped full-height drawer above the screen: it
+// rendered as a short strip stuck over the menu bar in the top corner until a
+// manual resize re-applied position after size (the first-snap bug). Ordering
+// size→position makes the position call see the FINAL height, every time.
+// Callers must construct this inside a promise chain: getCurrentWindow()
+// throws synchronously outside a Tauri runtime.
+function applyWindowRect(rect: DrawerRect): Promise<void> {
+  const win = getCurrentWindow();
+  return win
+    .setSize(new LogicalSize(rect.width, rect.height))
+    .then(() => win.setPosition(new LogicalPosition(rect.x, rect.y)));
+}
 
 // TEST HOOK (not a production source): seed the initial presentation from
 // ?edge= so the overlay renders a drawer variant deterministically under
@@ -136,22 +164,28 @@ function App() {
   );
   const drawerEdge: Edge | null = presentation ? drawerEdgeOf(presentation) : null;
 
-  // First-run onboarding (M006): a one-time explainer that requests Screen
-  // Recording + Accessibility with context. All show/hide and per-permission
-  // lifecycle logic is pure (onboarding-state.ts); this component only fires the
-  // IPC. Requesting Accessibility here does not arm HID (D038/R019).
-  const [onboarding, dispatchOnboarding] = useReducer(
-    onboardingReducer,
-    initialOnboardingState,
-  );
-  // The once-registered blur/Escape dismiss handler needs live onboarding
-  // visibility without re-binding: while the explainer is up we must NOT
+  // First-start tour (2026-07 redesign): the four-step wizard that replaced
+  // the M006 explainer. All step/permission/retention lifecycle logic is pure
+  // (tour-state.ts wrapping onboarding-state.ts); this component only fires
+  // the IPC. Requesting Accessibility here does not arm HID (D038/R019).
+  const [tour, dispatchTour] = useReducer(tourReducer, initialTourState);
+  // The live global shortcut shown on the Summon step (null outside Tauri —
+  // the step then omits the keycap row rather than inventing a binding).
+  const [tourHotkey, setTourHotkey] = useState<string | null>(null);
+  // The once-registered blur/Escape dismiss handler needs live tour
+  // visibility without re-binding: while the tour is up we must NOT
   // dismiss on blur/Escape, or losing key focus (this app is Accessory and
   // never frontmost, so blur is easy) drops the overlay out of visible-focused
-  // and the still-rendered panel goes click-through — dead Grant/Continue/Skip
+  // and the still-rendered card goes click-through — dead Grant/Continue/Skip
   // buttons. Keeping the overlay focused keeps native mouse events on.
-  const onboardingVisibleRef = useRef(onboarding.visible);
-  onboardingVisibleRef.current = onboarding.visible;
+  const onboardingVisibleRef = useRef(tourVisible(tour));
+  onboardingVisibleRef.current = tourVisible(tour);
+  // Live tour state for the once-registered overlay-state listener (hotkey
+  // completion needs the current step without re-subscribing), plus the
+  // finish effect behind a ref for the same reason.
+  const tourRef = useRef(tour);
+  tourRef.current = tour;
+  const finishTourRef = useRef<() => void>(() => {});
 
   // Token deltas are coalesced per animation frame so a fast stream costs at
   // most one render per frame, not one per token. Terminal events carry the
@@ -162,7 +196,16 @@ function App() {
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const unlisten = onOverlayStateChanged(setState);
+    const unlisten = onOverlayStateChanged((next) => {
+      // Summon-step completion: the global hotkey's toggle is the only path
+      // that hides a focused overlay while the tour holds the Escape/blur
+      // guard, so `hidden` during the Summon step means "the user tried the
+      // hotkey" — finish the tour exactly as the design's try-it-now promises.
+      if (next === "hidden" && hotkeyFinishesTour(tourRef.current)) {
+        finishTourRef.current();
+      }
+      setState(next);
+    });
     // MEM115: a capability/ACL denial rejects listen() inside the real app —
     // catch loudly so a dead subscription is visible, not a frozen surface.
     unlisten.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -356,18 +399,54 @@ function App() {
     };
   }, []);
 
-  // First-run onboarding snapshot (M006). Decides whether to show the explainer;
-  // outside a Tauri runtime the invoke rejects and onboarding simply never
-  // shows (same absorb posture as the queries above). The backend also shows
-  // the overlay from setup() when onboarding is pending, so the panel is
-  // visible without the user summoning it.
+  // First-run tour snapshot. Decides whether to show the wizard; outside a
+  // Tauri runtime the invokes reject and the tour simply never shows (same
+  // absorb posture as the queries above). The backend also shows the overlay
+  // from setup() when onboarding is pending, so the card is visible without
+  // the user summoning it. Retention + hotkey load alongside: both are
+  // display data the wizard's later steps need, harmless if they lose the
+  // race (the reducer folds them whenever they land).
   useEffect(() => {
     let cancelled = false;
+    // TEST HOOK (?edge= precedent): outside a Tauri runtime first_run_status
+    // rejects, so Playwright can never see the tour. `?tour=pending` seeds a
+    // fresh-install snapshot (capture ungranted → hard block) and
+    // `?tour=granted` a grantable one, letting e2e drive the wizard DOM. The
+    // real snapshot below overrides the seed the moment it resolves, so there
+    // is no diverging runtime source inside the app.
+    const tourSeed = new URLSearchParams(window.location.search).get("tour");
+    if (tourSeed === "pending" || tourSeed === "granted") {
+      dispatchTour({
+        type: "permissions",
+        action: {
+          type: "snapshot",
+          status: {
+            pending: true,
+            capture: { granted: tourSeed === "granted", supported: true },
+            input: { granted: false, supported: true },
+            persistError: null,
+          },
+        },
+      });
+    }
     firstRunStatus().then(
       (status) => {
-        if (!cancelled) dispatchOnboarding({ type: "snapshot", status });
+        if (!cancelled) dispatchTour({ type: "permissions", action: { type: "snapshot", status } });
       },
-      (err) => console.debug("onboarding: first_run_status unavailable:", err),
+      (err) => console.debug("tour: first_run_status unavailable:", err),
+    );
+    memoryRetention().then(
+      (status) => {
+        if (!cancelled)
+          dispatchTour({ type: "retention-loaded", value: status.retention as Retention });
+      },
+      (err) => console.debug("tour: memory_retention unavailable:", err),
+    );
+    hotkeyStatus().then(
+      (status) => {
+        if (!cancelled) setTourHotkey(status.shortcut);
+      },
+      (err) => console.debug("tour: hotkey_status unavailable:", err),
     );
     return () => {
       cancelled = true;
@@ -470,15 +549,13 @@ function App() {
             edge,
             extent,
           );
-          // getCurrentWindow() reads window.__TAURI_INTERNALS__.metadata
-          // synchronously — outside a Tauri runtime it THROWS, so it must stay
-          // inside this .then (never eager in the effect body) or a plain-browser
-          // render crashes. currentMonitor() has already rejected there.
-          const win = getCurrentWindow();
-          return Promise.all([
-            win.setPosition(new LogicalPosition(rect.x, rect.y)),
-            win.setSize(new LogicalSize(rect.width, rect.height)),
-          ]);
+          // applyWindowRect calls getCurrentWindow(), which reads
+          // window.__TAURI_INTERNALS__.metadata synchronously — outside a Tauri
+          // runtime it THROWS, so it must stay inside this .then (never eager in
+          // the effect body) or a plain-browser render crashes. currentMonitor()
+          // has already rejected there. Size-before-position ordering is the
+          // first-snap fix (see applyWindowRect).
+          return applyWindowRect(rect);
         })
         .catch((err) => console.debug("overlay: drawer snap no-op:", err));
     } else {
@@ -495,31 +572,27 @@ function App() {
       const position = presentation.modalPosition;
       Promise.all([availableMonitors(), currentMonitor()])
         .then(([monitors, monitor]) => {
-          const win = getCurrentWindow();
-          const apply = (
-            x: number,
-            y: number,
-            width: number,
-            height: number,
-          ): Promise<void> =>
-            Promise.all([
-              win.setSize(new LogicalSize(width, height)),
-              win.setPosition(new LogicalPosition(x, y)),
-            ]).then(() => {});
           if (position && isOnScreen(position, monitors)) {
-            return apply(position.x, position.y, size.width, size.height);
+            return applyWindowRect({
+              x: position.x,
+              y: position.y,
+              width: size.width,
+              height: size.height,
+            });
           }
           if (!monitor) {
             // No monitor resolved (headless / detached) — size only, no anchor
             // to center against.
             console.debug("overlay: modal center skipped, no current monitor");
-            return win.setSize(new LogicalSize(size.width, size.height));
+            return getCurrentWindow().setSize(
+              new LogicalSize(size.width, size.height),
+            );
           }
           const rect = centeredModalRect(
             { ...monitor.workArea, scaleFactor: monitor.scaleFactor },
             size,
           );
-          return apply(rect.x, rect.y, rect.width, rect.height);
+          return applyWindowRect(rect);
         })
         .catch((err) => console.debug("overlay: modal geometry no-op:", err));
     }
@@ -613,13 +686,19 @@ function App() {
           const rect = latest;
           latest = null;
           inFlight = true;
-          const ops: Promise<unknown>[] = [
-            win.setSize(new LogicalSize(rect.width, rect.height)),
-          ];
-          if (rect.x !== undefined && rect.y !== undefined) {
-            ops.push(win.setPosition(new LogicalPosition(rect.x, rect.y)));
-          }
-          Promise.all(ops)
+          // Size before position, sequentially (applyWindowRect): position's
+          // flipped-y must be computed from the FINAL height or a growing
+          // drawer walks its top off-screen (the first-snap bug).
+          const op =
+            rect.x !== undefined && rect.y !== undefined
+              ? applyWindowRect({
+                  x: rect.x,
+                  y: rect.y,
+                  width: rect.width,
+                  height: rect.height,
+                })
+              : win.setSize(new LogicalSize(rect.width, rect.height));
+          op
             .catch((err) => console.debug("overlay: resize apply no-op:", err))
             .finally(() => {
               inFlight = false;
@@ -759,70 +838,103 @@ function App() {
     );
   };
 
-  // First-run onboarding actions (M006). Each request fires the OS prompt and
-  // folds the resulting live permission back into the pure reducer.
+  // First-start tour actions. Each permission request fires the OS prompt and
+  // folds the resulting live permission back into the pure reducer (via the
+  // wrapped M006 lifecycle).
   const requestCapture = () => {
-    dispatchOnboarding({ type: "request-start", which: "capture" });
+    dispatchTour({ type: "permissions", action: { type: "request-start", which: "capture" } });
     requestCapturePermission().then(
       (permission) =>
-        dispatchOnboarding({ type: "request-done", which: "capture", permission }),
+        dispatchTour({
+          type: "permissions",
+          action: { type: "request-done", which: "capture", permission },
+        }),
       (err) => {
-        console.warn("onboarding: request_capture_permission failed:", err);
+        console.warn("tour: request_capture_permission failed:", err);
         // Leave the step in requesting? No — re-query the truthful state.
-        dispatchOnboarding({
-          type: "request-done",
-          which: "capture",
-          permission: chatRef.current.capturePermission ?? { granted: false, supported: true },
+        dispatchTour({
+          type: "permissions",
+          action: {
+            type: "request-done",
+            which: "capture",
+            permission: chatRef.current.capturePermission ?? { granted: false, supported: true },
+          },
         });
       },
     );
   };
 
   const requestInput = () => {
-    dispatchOnboarding({ type: "request-start", which: "input" });
+    dispatchTour({ type: "permissions", action: { type: "request-start", which: "input" } });
     requestInputPermission().then(
       (permission) =>
-        dispatchOnboarding({ type: "request-done", which: "input", permission }),
+        dispatchTour({
+          type: "permissions",
+          action: { type: "request-done", which: "input", permission },
+        }),
       (err) => {
-        console.warn("onboarding: request_input_permission failed:", err);
-        dispatchOnboarding({
-          type: "request-done",
-          which: "input",
-          permission: { granted: false, supported: true },
+        console.warn("tour: request_input_permission failed:", err);
+        dispatchTour({
+          type: "permissions",
+          action: {
+            type: "request-done",
+            which: "input",
+            permission: { granted: false, supported: true },
+          },
         });
       },
     );
   };
 
-  // Finish or skip onboarding — both persist the done flag so the panel never
+  // Retention (Memory step): optimistic dispatch, then fold whatever the
+  // backend says is effective — a rejected value or persist failure lands the
+  // truthful state back in the chips, never a silently-lying selection.
+  const chooseRetention = (value: Retention) => {
+    dispatchTour({ type: "retention", value });
+    setMemoryRetention(value).then(
+      (status) => {
+        if (status.error) console.warn("tour: set_memory_retention:", status.error);
+        dispatchTour({ type: "retention-loaded", value: status.retention as Retention });
+      },
+      (err) => console.debug("tour: set_memory_retention unavailable:", err),
+    );
+  };
+
+  // Finish or skip the tour — both persist the done flag so the wizard never
   // shows again. The overlay stays visible (the user summoned nothing); it
-  // dismisses on the next Escape/blur like any other panel.
-  const finishOnboarding = () => {
+  // dismisses on the next Escape/blur like any other panel. Also fired by the
+  // Summon step's try-it-now hotkey press (via finishTourRef).
+  const finishTour = () => {
     // Defense-in-depth: never persist "done" while a required permission is
-    // missing, even if the disabled Continue button were somehow bypassed. The
-    // block is enforced here, not just in the button's disabled state.
-    if (onboardingBlocked(onboarding)) {
-      console.debug("onboarding: finish blocked — Screen Recording not granted");
+    // missing, even if the disabled Continue button were somehow bypassed.
+    // Step-independent (tourFinishBlocked): Skip from ANY step is caught, not
+    // just Finish on the Permissions step.
+    if (tourFinishBlocked(tourRef.current)) {
+      console.debug("tour: finish blocked — Screen Recording not granted");
       return;
     }
     completeFirstRun().then(
-      (status) => dispatchOnboarding({ type: "completed", status }),
-      // Outside Tauri the invoke rejects — dismiss anyway so the panel never
+      (status) => dispatchTour({ type: "permissions", action: { type: "completed", status } }),
+      // Outside Tauri the invoke rejects — dismiss anyway so the card never
       // wedges; the flag simply wasn't persisted (harmless, re-shows next run).
       (err) => {
-        console.debug("onboarding: complete_first_run unavailable:", err);
-        dispatchOnboarding({
-          type: "completed",
-          status: { pending: false, capture: { granted: false, supported: true }, input: { granted: false, supported: true }, persistError: null },
+        console.debug("tour: complete_first_run unavailable:", err);
+        dispatchTour({
+          type: "permissions",
+          action: {
+            type: "completed",
+            status: { pending: false, capture: { granted: false, supported: true }, input: { granted: false, supported: true }, persistError: null },
+          },
         });
       },
     );
   };
+  finishTourRef.current = finishTour;
 
   const openAccessibilitySettings = () => {
-    console.debug("onboarding: opening Accessibility settings from explainer");
+    console.debug("tour: opening Accessibility settings from the wizard");
     openInputSettings().catch((err) =>
-      console.debug("onboarding: open_input_settings unavailable:", err),
+      console.debug("tour: open_input_settings unavailable:", err),
     );
   };
 
@@ -870,136 +982,27 @@ function App() {
     ? routing.lanes.find((lane) => lane.name === routing.activeLane)?.modelId
     : null;
 
-  // First-run onboarding takes over the overlay when pending — a one-time
-  // explainer requesting Screen Recording + Accessibility with context. It
-  // renders regardless of overlay state (the backend shows the overlay from
-  // setup() when onboarding is pending), ahead of the nudge/chat chrome.
-  if (onboarding.visible) {
-    const stepLabel = (step: (typeof onboarding)["capture"]): string => {
-      switch (step) {
-        case "granted":
-          return "Granted";
-        case "denied":
-          return "Not granted — open System Settings";
-        case "requesting":
-          return "Waiting for you…";
-        case "unsupported":
-          return "Not needed on this platform";
-        case "idle":
-          return "";
-      }
-    };
-    const allSet = allSupportedGranted(onboarding);
-    // A required permission (Screen Recording) is missing — the user must fix it
-    // before continuing. No Skip past a hard block; Continue stays disabled until
-    // the grant lands. Accessibility never blocks (it is HID's off-by-default
-    // grant, D038/R019).
-    const blocked = onboardingBlocked(onboarding);
+  // The first-start tour takes over the overlay while first-run is pending —
+  // it renders regardless of overlay state (the backend shows the overlay
+  // from setup() when onboarding is pending), ahead of the nudge/chat chrome.
+  if (tourVisible(tour)) {
     return (
       <div className="overlay-root" data-state={state} data-onboarding="true">
-        <div className="overlay-panel onboarding-panel" role="dialog" aria-labelledby="onboarding-title">
-          <h1 id="onboarding-title" className="onboarding-title">
-            Welcome to Third Eye
-          </h1>
-          <p className="onboarding-intro">
-            Third Eye watches your screen on-device to help, and can act for you
-            when you ask. It needs two macOS permissions to do that. You can grant
-            them now, or later in Settings.
-          </p>
-
-          <div className="onboarding-step" data-permission="capture" data-step={onboarding.capture}>
-            <div className="onboarding-step-text">
-              <strong>Screen Recording</strong>
-              <span>
-                Lets Third Eye read on-screen text to understand what you're
-                working on. Nothing leaves your Mac; no image is ever saved.
-              </span>
-              <span className="onboarding-step-status">{stepLabel(onboarding.capture)}</span>
-            </div>
-            {onboarding.capture === "denied" ? (
-              <button type="button" className="chat-retry" onClick={openScreenRecordingSettings}>
-                Open System Settings
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="chat-retry"
-                disabled={onboarding.capture !== "idle"}
-                onClick={requestCapture}
-              >
-                {onboarding.capture === "granted" ? "Granted ✓" : "Grant"}
-              </button>
-            )}
-          </div>
-
-          <div className="onboarding-step" data-permission="input" data-step={onboarding.input}>
-            <div className="onboarding-step-text">
-              <strong>Accessibility</strong>
-              <span>
-                Lets Third Eye move the pointer, click, and type on your behalf —
-                only after you turn on Input Control in Settings. Granting this now
-                does not turn it on.
-              </span>
-              <span className="onboarding-step-status">{stepLabel(onboarding.input)}</span>
-            </div>
-            {onboarding.input === "denied" ? (
-              <button type="button" className="chat-retry" onClick={openAccessibilitySettings}>
-                Open System Settings
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="chat-retry"
-                disabled={onboarding.input !== "idle"}
-                onClick={requestInput}
-              >
-                {onboarding.input === "granted" ? "Granted ✓" : "Grant"}
-              </button>
-            )}
-          </div>
-
-          {onboarding.persistError && (
-            <div className="settings-error" role="alert">
-              <strong>Couldn't save onboarding state</strong>
-              <span>{onboarding.persistError} — this welcome may show again next launch.</span>
-            </div>
-          )}
-
-          {blocked && (
-            // R007-style: the block is visible, never a silent disabled button.
-            // Screen Recording is required for the core screen-reading loop, so
-            // the user cannot proceed until it is granted.
-            <div className="settings-error" role="alert" data-onboarding-blocked="true">
-              <strong>Screen Recording is required</strong>
-              <span>
-                Third Eye can't read your screen without it. Grant Screen
-                Recording above{onboarding.capture === "denied"
-                  ? " — open System Settings, turn on Third Eye, then come back"
-                  : ""}{" "}
-                to continue.
-              </span>
-            </div>
-          )}
-
-          <div className="onboarding-actions">
-            <button
-              type="button"
-              className="chat-retry"
-              disabled={blocked}
-              title={blocked ? "Grant Screen Recording first" : undefined}
-              onClick={finishOnboarding}
-            >
-              {allSet ? "All set — continue" : "Continue"}
-            </button>
-            {/* Skip is only offered when nothing required is missing — a hard
-                block cannot be skipped. */}
-            {!blocked && (
-              <button type="button" className="onboarding-skip" onClick={finishOnboarding}>
-                Skip for now
-              </button>
-            )}
-          </div>
-        </div>
+        <Tour
+          tour={tour}
+          hotkeyShortcut={tourHotkey}
+          onNext={() => {
+            if (tourOnLastStep(tour)) finishTour();
+            else dispatchTour({ type: "next" });
+          }}
+          onBack={() => dispatchTour({ type: "back" })}
+          onSkip={finishTour}
+          onGrantCapture={requestCapture}
+          onGrantInput={requestInput}
+          onOpenCaptureSettings={openScreenRecordingSettings}
+          onOpenInputSettings={openAccessibilitySettings}
+          onRetention={chooseRetention}
+        />
       </div>
     );
   }
@@ -1037,16 +1040,35 @@ function App() {
           onMouseUp={persistMoveEnd}
           aria-hidden="true"
         />
-        <form onSubmit={onSubmit}>
+        <form onSubmit={onSubmit} className="overlay-input-row">
+          {/* The eye mirrors the run truthfully: amber acting while a run is
+              live (Stop visible), scanning green while summoned, calm watching
+              otherwise. */}
+          <span className="overlay-input-eye" aria-hidden="true">
+            <EyeIcon
+              state={
+                showStopButton(chat)
+                  ? "acting"
+                  : state === "visible-focused"
+                    ? "thinking"
+                    : "watching"
+              }
+              size={34}
+              stroke="#ffffff"
+            />
+          </span>
           <input
             ref={inputRef}
             className="overlay-input"
             type="text"
-            placeholder="Third Eye"
+            placeholder="Ask, act, or recall anything…"
             aria-label="Overlay input"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
           />
+          <span className="overlay-esc-chip" aria-hidden="true">
+            esc
+          </span>
         </form>
         {showStopButton(chat) && (
           <div className="run-controls">
@@ -1062,12 +1084,18 @@ function App() {
         )}
         {trayNotice && (
           <div className="tray-notice" role="status">
-            <div className="chat-banner-text">
-              <strong>{trayNotice.title}</strong>
-              <span>{trayNotice.detail}</span>
-            </div>
-            <button type="button" className="chat-retry" onClick={() => setTrayNotice(null)}>
-              OK
+            <Toast placement="inline">
+              <span className="tray-notice-text">
+                <strong>{trayNotice.title}</strong> {trayNotice.detail}
+              </span>
+            </Toast>
+            <button
+              type="button"
+              className="tray-notice-dismiss"
+              aria-label="Dismiss notice"
+              onClick={() => setTrayNotice(null)}
+            >
+              ✕
             </button>
           </div>
         )}
@@ -1237,6 +1265,13 @@ function App() {
                 </button>
               ))}
             </div>
+            {/* Honest locality badge: only when the endpoint host actually is
+                this machine — never decoration (no-fake-data rule). */}
+            {isLocalEndpoint(routing.endpoint) && (
+              <span className="model-on-device" title={routing.endpoint}>
+                ● on-device
+              </span>
+            )}
           </div>
         )}
         {/* Resize affordance (M006/S01+S03): mutually exclusive by mode. In

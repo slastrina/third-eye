@@ -198,10 +198,7 @@ pub struct SeenBox {
 impl SeenBox {
     /// Is `(px, py)` inside this box? Right/bottom edges are exclusive.
     fn contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x
-            && px < self.x + self.width
-            && py >= self.y
-            && py < self.y + self.height
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
 }
 
@@ -462,7 +459,10 @@ impl ToolExecutor for MemorySearchTool {
         if call.name != MEMORY_SEARCH_TOOL {
             return ToolOutcome::failure(
                 "unknown-tool",
-                format!("unknown tool: {} (available: {MEMORY_SEARCH_TOOL})", call.name),
+                format!(
+                    "unknown tool: {} (available: {MEMORY_SEARCH_TOOL})",
+                    call.name
+                ),
             );
         }
         let args: MemorySearchArgs = match serde_json::from_str(&call.arguments) {
@@ -476,11 +476,15 @@ impl ToolExecutor for MemorySearchTool {
         };
         // Same clamp as the memory_search IPC command (Q6): the model cannot
         // request an unbounded page out of SQLite.
-        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .clamp(1, MAX_SEARCH_LIMIT);
         match search(&self.store, self.embedder.as_ref(), &args.query, limit).await {
             Ok(outcome) => {
-                let content = serde_json::to_string(&outcome)
-                    .unwrap_or_else(|e| format!(r#"{{"error":"result serialization failed: {e}"}}"#));
+                let content = serde_json::to_string(&outcome).unwrap_or_else(|e| {
+                    format!(r#"{{"error":"result serialization failed: {e}"}}"#)
+                });
                 ToolOutcome {
                     content,
                     ok: true,
@@ -527,7 +531,11 @@ impl InputTool {
         arm: Arc<HidArmState>,
         focused_app: Arc<FocusedApp>,
     ) -> Self {
-        Self { backend, arm, focused_app }
+        Self {
+            backend,
+            arm,
+            focused_app,
+        }
     }
 
     /// The model-facing definition. `action` is required and discriminates the
@@ -612,13 +620,19 @@ impl ToolExecutor for InputTool {
         // ever touched — a visible tool result, never a silent no-op (R007).
         if !self.arm.armed() {
             let err = InputError::disabled();
-            log::warn!("llm: input_action refused — HID disarmed (kind={})", err.kind());
+            log::warn!(
+                "llm: input_action refused — HID disarmed (kind={})",
+                err.kind()
+            );
             return ToolOutcome::failure(err.kind(), err.to_string());
         }
         if call.name != INPUT_ACTION_TOOL {
             return ToolOutcome::failure(
                 "unknown-tool",
-                format!("unknown tool: {} (available: {INPUT_ACTION_TOOL})", call.name),
+                format!(
+                    "unknown tool: {} (available: {INPUT_ACTION_TOOL})",
+                    call.name
+                ),
             );
         }
         // The arguments ARE an InputAction (tagged on `action`) — one parse both
@@ -711,7 +725,11 @@ impl ScreenQueryTool {
         screen_seen: Arc<ScreenSeen>,
         focused_app: Arc<FocusedApp>,
     ) -> Self {
-        Self { backend, screen_seen, focused_app }
+        Self {
+            backend,
+            screen_seen,
+            focused_app,
+        }
     }
 
     /// The model-facing definition. No arguments: a screen query is a snapshot
@@ -745,7 +763,10 @@ impl ToolExecutor for ScreenQueryTool {
         if call.name != SCREEN_QUERY_TOOL {
             return ToolOutcome::failure(
                 "unknown-tool",
-                format!("unknown tool: {} (available: {SCREEN_QUERY_TOOL})", call.name),
+                format!(
+                    "unknown tool: {} (available: {SCREEN_QUERY_TOOL})",
+                    call.name
+                ),
             );
         }
         // No arguments to parse — a screen query is a snapshot of the current
@@ -911,7 +932,10 @@ impl ToolExecutor for FocusAppTool {
             // A not-found carries the running-app candidates back to the model so
             // it can retry against a real name; other typed errors ride their
             // kind back unchanged (R007).
-            Err(AppFocusError::NotFound { requested, candidates }) => ToolOutcome {
+            Err(AppFocusError::NotFound {
+                requested,
+                candidates,
+            }) => ToolOutcome {
                 content: serde_json::json!({
                     "error": format!("no running or installed app matched {requested:?}"),
                     "candidates": candidates,
@@ -946,7 +970,10 @@ impl CompositeExecutor {
 #[async_trait]
 impl ToolExecutor for CompositeExecutor {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        self.executors.iter().flat_map(|e| e.definitions()).collect()
+        self.executors
+            .iter()
+            .flat_map(|e| e.definitions())
+            .collect()
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
@@ -1050,7 +1077,15 @@ impl ApprovalGate {
         screen_seen: Arc<ScreenSeen>,
         focused_app: Arc<FocusedApp>,
     ) -> Self {
-        Self { inner, focus, mode, whitelist, approver, screen_seen, focused_app }
+        Self {
+            inner,
+            focus,
+            mode,
+            whitelist,
+            approver,
+            screen_seen,
+            focused_app,
+        }
     }
 
     /// A human sentence describing the pending action — what the overlay shows so
@@ -1059,8 +1094,15 @@ impl ApprovalGate {
     fn summary(action: &InputAction) -> String {
         match action {
             InputAction::MouseMove { x, y } => format!("Move the mouse to ({x}, {y})"),
-            InputAction::MouseClick { button, x: Some(x), y: Some(y) } => {
-                format!("Click the {} mouse button at ({x}, {y})", button_name(*button))
+            InputAction::MouseClick {
+                button,
+                x: Some(x),
+                y: Some(y),
+            } => {
+                format!(
+                    "Click the {} mouse button at ({x}, {y})",
+                    button_name(*button)
+                )
             }
             InputAction::MouseClick { button, .. } => {
                 format!("Click the {} mouse button", button_name(*button))
@@ -1174,7 +1216,10 @@ impl ToolExecutor for ApprovalGate {
                     )
                 }
             };
-            let summary = format!("Open {} (bring to front, launching if needed)", quote_preview(&app));
+            let summary = format!(
+                "Open {} (bring to front, launching if needed)",
+                quote_preview(&app)
+            );
             let outcome = self
                 .gate_and_run(FOCUS_APP_TOOL, ActionKind::FocusApp, summary, || {
                     self.focus.execute(call)
@@ -1289,8 +1334,10 @@ impl ToolExecutor for ApprovalGate {
         }
         let kind = action.kind();
         let summary = Self::summary(&action);
-        self.gate_and_run(INPUT_ACTION_TOOL, kind, summary, || self.inner.execute(call))
-            .await
+        self.gate_and_run(INPUT_ACTION_TOOL, kind, summary, || {
+            self.inner.execute(call)
+        })
+        .await
     }
 }
 
@@ -1329,13 +1376,23 @@ impl LoopOutcome {
     /// A natural finish — the model stopped calling tools, the ceiling forced a
     /// text answer, or a zombie call terminated the loop.
     fn done(outcome: StreamOutcome) -> Self {
-        Self { outcome, stopped: false }
+        Self {
+            outcome,
+            stopped: false,
+        }
     }
 
     /// A user-stopped run: whatever streamed before the stop, no tool calls
     /// leaking out, flagged so the caller surfaces the `stopped` run-state.
     fn stopped(text: String, token_count: usize) -> Self {
-        Self { outcome: StreamOutcome { text, token_count, tool_calls: Vec::new() }, stopped: true }
+        Self {
+            outcome: StreamOutcome {
+                text,
+                token_count,
+                tool_calls: Vec::new(),
+            },
+            stopped: true,
+        }
     }
 }
 
@@ -1389,6 +1446,9 @@ pub async fn run_tool_loop(
 /// streamed, no tool calls leaking out, no further dispatch (visible, never
 /// silent). Structural termination is unchanged: with a never-stopping signal
 /// the loop is exactly the S01-S03 bounded loop.
+// Three sinks + a stop signal are the injected-effects contract, not a design
+// smell to bundle away; the arity is deliberate.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tool_loop_with_stop(
     client: &dyn LlmClient,
     executor: &dyn ToolExecutor,
@@ -1412,10 +1472,19 @@ pub async fn run_tool_loop_with_stop(
             );
             return Ok(LoopOutcome::stopped(streamed_text, streamed_tokens));
         }
-        let tools = if round < MAX_TOOL_ROUNDS { executor.definitions() } else { Vec::new() };
+        let tools = if round < MAX_TOOL_ROUNDS {
+            executor.definitions()
+        } else {
+            Vec::new()
+        };
         let final_round = tools.is_empty();
-        let request = ChatRequest { messages: std::mem::take(&mut messages), tools };
-        let outcome = client.stream_chat_reasoning(&request, on_token, on_reasoning).await?;
+        let request = ChatRequest {
+            messages: std::mem::take(&mut messages),
+            tools,
+        };
+        let outcome = client
+            .stream_chat_reasoning(&request, on_token, on_reasoning)
+            .await?;
         messages = request.messages;
         streamed_text = outcome.text.clone();
         streamed_tokens = outcome.token_count;
@@ -1435,12 +1504,17 @@ pub async fn run_tool_loop_with_stop(
             log::warn!(
                 "llm: tool call on the tools-stripped final round ignored (request={request_id})"
             );
-            return Ok(LoopOutcome::done(StreamOutcome { tool_calls: Vec::new(), ..outcome }));
+            return Ok(LoopOutcome::done(StreamOutcome {
+                tool_calls: Vec::new(),
+                ..outcome
+            }));
         }
 
         // First half of the OpenAI round-trip: echo the requested calls.
-        messages
-            .push(ChatMessage::assistant_tool_calls(outcome.text.clone(), outcome.tool_calls.clone()));
+        messages.push(ChatMessage::assistant_tool_calls(
+            outcome.text.clone(),
+            outcome.tool_calls.clone(),
+        ));
 
         for call in &outcome.tool_calls {
             // Stop observed mid-round: refuse to dispatch this (or any later)
@@ -1452,7 +1526,10 @@ pub async fn run_tool_loop_with_stop(
                      (request={request_id})",
                     call.name
                 );
-                return Ok(LoopOutcome::stopped(outcome.text.clone(), outcome.token_count));
+                return Ok(LoopOutcome::stopped(
+                    outcome.text.clone(),
+                    outcome.token_count,
+                ));
             }
             log::info!(
                 "llm: tool call round={round} name={} id={} args={} (request={request_id})",
@@ -1573,20 +1650,35 @@ mod tests {
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
     fn text_outcome(text: &str) -> Result<StreamOutcome, LlmError> {
-        Ok(StreamOutcome { text: text.into(), token_count: 1, tool_calls: Vec::new() })
+        Ok(StreamOutcome {
+            text: text.into(),
+            token_count: 1,
+            tool_calls: Vec::new(),
+        })
     }
 
     fn tool_call_outcome(calls: Vec<ToolCall>) -> Result<StreamOutcome, LlmError> {
-        Ok(StreamOutcome { text: String::new(), token_count: 0, tool_calls: calls })
+        Ok(StreamOutcome {
+            text: String::new(),
+            token_count: 0,
+            tool_calls: calls,
+        })
     }
 
     fn search_call(id: &str, args: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: MEMORY_SEARCH_TOOL.into(), arguments: args.into() }
+        ToolCall {
+            id: id.into(),
+            name: MEMORY_SEARCH_TOOL.into(),
+            arguments: args.into(),
+        }
     }
 
     /// Embedder that always fails offline — forces the keyword degrade so
@@ -1600,7 +1692,10 @@ mod tests {
         }
 
         async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-            Err(LlmError::Offline { endpoint: self.endpoint().into(), detail: "down".into() })
+            Err(LlmError::Offline {
+                endpoint: self.endpoint().into(),
+                detail: "down".into(),
+            })
         }
     }
 
@@ -1626,7 +1721,10 @@ mod tests {
 
     impl Capture {
         fn new() -> Self {
-            Self { events: Mutex::new(Vec::new()), tokens: Mutex::new(String::new()) }
+            Self {
+                events: Mutex::new(Vec::new()),
+                tokens: Mutex::new(String::new()),
+            }
         }
 
         fn events(&self) -> Vec<ToolEvent> {
@@ -1659,7 +1757,11 @@ mod tests {
         assert!(capture.events().is_empty());
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].tools.len(), 1, "first round must advertise memory_search");
+        assert_eq!(
+            requests[0].tools.len(),
+            1,
+            "first round must advertise memory_search"
+        );
         assert_eq!(*capture.tokens.lock().unwrap(), "plain answer");
     }
 
@@ -1676,11 +1778,15 @@ mod tests {
         // Events: one call, one ok result carrying count + degrade mode.
         let events = capture.events();
         assert_eq!(events.len(), 2);
-        let ToolEvent::Call(call) = &events[0] else { panic!("first event must be Call") };
+        let ToolEvent::Call(call) = &events[0] else {
+            panic!("first event must be Call")
+        };
         assert_eq!(call.request_id, 7);
         assert_eq!(call.round, 0);
         assert_eq!(call.call.name, MEMORY_SEARCH_TOOL);
-        let ToolEvent::Result(result) = &events[1] else { panic!("second event must be Result") };
+        let ToolEvent::Result(result) = &events[1] else {
+            panic!("second event must be Result")
+        };
         assert!(result.ok);
         assert_eq!(result.call_id, "call_1");
         assert_eq!(result.result_count, Some(1));
@@ -1741,10 +1847,21 @@ mod tests {
         // must run all six and resolve on the model's own stop, well under the
         // safety ceiling.
         const ROUNDS: usize = 6;
-        assert!(ROUNDS > 3, "must exceed the retired S03 3-round cap");
-        assert!(ROUNDS < MAX_TOOL_ROUNDS, "must resolve on the model's stop, not the ceiling");
+        #[allow(clippy::assertions_on_constants)] // the constant relation IS the documented claim
+        {
+            assert!(ROUNDS > 3, "must exceed the retired S03 3-round cap");
+            assert!(
+                ROUNDS < MAX_TOOL_ROUNDS,
+                "must resolve on the model's stop, not the ceiling"
+            );
+        }
         let mut responses: Vec<Result<StreamOutcome, LlmError>> = (0..ROUNDS)
-            .map(|i| tool_call_outcome(vec![search_call(&format!("call_{i}"), r#"{"query":"again"}"#)]))
+            .map(|i| {
+                tool_call_outcome(vec![search_call(
+                    &format!("call_{i}"),
+                    r#"{"query":"again"}"#,
+                )])
+            })
             .collect();
         responses.push(text_outcome("done after six rounds"));
         let client = ScriptedClient::new(responses);
@@ -1753,12 +1870,24 @@ mod tests {
         assert_eq!(outcome.text, "done after six rounds");
 
         let requests = client.requests();
-        assert_eq!(requests.len(), ROUNDS + 1, "six tool rounds plus the model's text answer");
+        assert_eq!(
+            requests.len(),
+            ROUNDS + 1,
+            "six tool rounds plus the model's text answer"
+        );
         // Every issued round still carried tools — the ceiling was never reached.
         for req in &requests {
-            assert_eq!(req.tools.len(), 1, "the loop stopped on the model, not the tools-strip");
+            assert_eq!(
+                req.tools.len(),
+                1,
+                "the loop stopped on the model, not the tools-strip"
+            );
         }
-        assert_eq!(capture.events().len(), ROUNDS * 2, "one call + one result per round");
+        assert_eq!(
+            capture.events().len(),
+            ROUNDS * 2,
+            "one call + one result per round"
+        );
     }
 
     #[tokio::test]
@@ -1766,15 +1895,19 @@ mod tests {
         // Defensive bound: even if the model "calls" a tool when none were
         // offered, the loop ends — no dispatch, no extra request.
         let mut responses: Vec<Result<StreamOutcome, LlmError>> = (0..MAX_TOOL_ROUNDS)
-            .map(|i| {
-                tool_call_outcome(vec![search_call(&format!("call_{i}"), r#"{"query":"q"}"#)])
-            })
+            .map(|i| tool_call_outcome(vec![search_call(&format!("call_{i}"), r#"{"query":"q"}"#)]))
             .collect();
-        responses.push(tool_call_outcome(vec![search_call("call_zombie", r#"{"query":"q"}"#)]));
+        responses.push(tool_call_outcome(vec![search_call(
+            "call_zombie",
+            r#"{"query":"q"}"#,
+        )]));
         let client = ScriptedClient::new(responses);
         let capture = Capture::new();
         let outcome = run(&client, &seeded_tool(), &capture).await.unwrap();
-        assert!(outcome.tool_calls.is_empty(), "zombie calls must not leak out of the loop");
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "zombie calls must not leak out of the loop"
+        );
         assert_eq!(client.requests().len(), MAX_TOOL_ROUNDS + 1);
         assert_eq!(
             capture.events().len(),
@@ -1806,7 +1939,10 @@ mod tests {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let executor = StopAfterExecute { inner: seeded_tool(), stop: stop.clone() };
+        let executor = StopAfterExecute {
+            inner: seeded_tool(),
+            stop: stop.clone(),
+        };
 
         // The model would call a tool every round; the loop must stop after the
         // first dispatch trips the flag, never issuing the round-1 request.
@@ -1830,15 +1966,26 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(loop_outcome.stopped, "a mid-loop stop must surface a typed stopped outcome");
+        assert!(
+            loop_outcome.stopped,
+            "a mid-loop stop must surface a typed stopped outcome"
+        );
         assert!(
             loop_outcome.outcome.tool_calls.is_empty(),
             "a stopped run must not leak tool calls",
         );
         // Only round 0 was issued: the loop stopped at the top of round 1,
         // before the second request and before any round-1 dispatch.
-        assert_eq!(client.requests().len(), 1, "no request may be issued after the stop");
-        assert_eq!(capture.events().len(), 2, "no tool dispatch past the stop (round 0 only)");
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "no request may be issued after the stop"
+        );
+        assert_eq!(
+            capture.events().len(),
+            2,
+            "no tool dispatch past the stop (round 0 only)"
+        );
     }
 
     #[tokio::test]
@@ -1862,7 +2009,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!loop_outcome.stopped, "a natural finish is never flagged stopped");
+        assert!(
+            !loop_outcome.stopped,
+            "a natural finish is never flagged stopped"
+        );
         assert_eq!(loop_outcome.outcome.text, "answered");
     }
 
@@ -1886,9 +2036,14 @@ mod tests {
         ]);
         let capture = Capture::new();
         let outcome = run(&client, &seeded_tool(), &capture).await.unwrap();
-        assert_eq!(outcome.text, "answered without memory", "loop must survive bad arguments");
+        assert_eq!(
+            outcome.text, "answered without memory",
+            "loop must survive bad arguments"
+        );
 
-        let ToolEvent::Result(result) = &capture.events()[1] else { panic!("expected Result") };
+        let ToolEvent::Result(result) = &capture.events()[1] else {
+            panic!("expected Result")
+        };
         assert!(!result.ok);
         assert_eq!(result.failure.as_deref(), Some("invalid-arguments"));
         assert_eq!(result.result_count, None);
@@ -1896,7 +2051,10 @@ mod tests {
         // The model sees a structured error payload, not silence.
         let followup = &client.requests()[1].messages;
         let body: serde_json::Value = serde_json::from_str(&followup[2].content).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("invalid memory_search arguments"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid memory_search arguments"));
     }
 
     #[tokio::test]
@@ -1911,7 +2069,9 @@ mod tests {
         ]);
         let capture = Capture::new();
         run(&client, &seeded_tool(), &capture).await.unwrap();
-        let ToolEvent::Result(result) = &capture.events()[1] else { panic!("expected Result") };
+        let ToolEvent::Result(result) = &capture.events()[1] else {
+            panic!("expected Result")
+        };
         assert!(!result.ok);
         assert_eq!(result.failure.as_deref(), Some("unknown-tool"));
         let followup = &client.requests()[1].messages;
@@ -1951,7 +2111,9 @@ mod tests {
         assert!(outcome.result_count.unwrap() <= MAX_SEARCH_LIMIT);
 
         // limit 0 clamps up to 1 rather than searching for nothing.
-        let outcome = tool.execute(&search_call("c", r#"{"query":"watcher","limit":0}"#)).await;
+        let outcome = tool
+            .execute(&search_call("c", r#"{"query":"watcher","limit":0}"#))
+            .await;
         assert!(outcome.ok);
     }
 
@@ -1962,7 +2124,10 @@ mod tests {
             .await;
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v["mode"], "keyword");
-        assert_eq!(v["results"][0]["summary"], "Debugged the tokio broadcast lag in the watcher loop");
+        assert_eq!(
+            v["results"][0]["summary"],
+            "Debugged the tokio broadcast lag in the watcher loop"
+        );
         assert!(
             v["results"][0].get("embedding").is_none(),
             "embeddings must never ride to the model"
@@ -2045,14 +2210,19 @@ mod tests {
 
     impl RecordingInput {
         fn new() -> Self {
-            Self { last: Mutex::new(None) }
+            Self {
+                last: Mutex::new(None),
+            }
         }
     }
 
     #[async_trait]
     impl InputControl for RecordingInput {
         fn permission(&self) -> InputPermission {
-            InputPermission { granted: true, supported: true }
+            InputPermission {
+                granted: true,
+                supported: true,
+            }
         }
 
         fn request_permission(&self) -> bool {
@@ -2075,7 +2245,11 @@ mod tests {
     }
 
     fn input_call(id: &str, args: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: INPUT_ACTION_TOOL.into(), arguments: args.into() }
+        ToolCall {
+            id: id.into(),
+            name: INPUT_ACTION_TOOL.into(),
+            arguments: args.into(),
+        }
     }
 
     /// An armed arm-state — the default posture for the delegation tests below.
@@ -2106,7 +2280,10 @@ mod tests {
         let backend = Arc::new(RecordingInput::new());
         let tool = InputTool::new(backend.clone(), armed_arm(), unfocused());
         let outcome = tool
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"right"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"right"}"#,
+            ))
             .await;
         assert!(outcome.ok);
         assert_eq!(outcome.failure, None);
@@ -2139,13 +2316,22 @@ mod tests {
         focused.set("Google Chrome");
         let tool = InputTool::new(backend.clone(), armed_arm(), focused);
         let outcome = tool
-            .execute(&input_call("c1", r#"{"action":"type-text","text":"farts"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"type-text","text":"farts"}"#,
+            ))
             .await;
-        assert!(!outcome.ok, "a wrong-app focus readback must fail the action");
+        assert!(
+            !outcome.ok,
+            "a wrong-app focus readback must fail the action"
+        );
         assert_eq!(outcome.failure.as_deref(), Some(VERIFICATION_FAILED_KIND));
         // The action DID reach the backend — the failure is about its EFFECT,
         // after the fact, not a refusal to act.
-        assert!(backend.last.lock().unwrap().is_some(), "the action itself was performed");
+        assert!(
+            backend.last.lock().unwrap().is_some(),
+            "the action itself was performed"
+        );
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(
@@ -2157,7 +2343,10 @@ mod tests {
             error.contains("Mock App") && error.contains("Google Chrome"),
             "the detail must name both the observed and intended app: {error}"
         );
-        assert!(error.contains("screen_query"), "the detail must teach the recovery: {error}");
+        assert!(
+            error.contains("screen_query"),
+            "the detail must teach the recovery: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2168,26 +2357,41 @@ mod tests {
         focused.set("mock APP");
         let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), focused);
         let outcome = tool
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
-        assert!(outcome.ok, "focus inside the focused app must pass: {}", outcome.content);
+        assert!(
+            outcome.ok,
+            "focus inside the focused app must pass: {}",
+            outcome.content
+        );
         assert_eq!(outcome.failure, None);
     }
 
     #[test]
     fn verify_against_intent_fires_only_on_positive_contradiction() {
         let observed = |app: &str| ActionReport {
-            focus: Some(FocusReport { app: Some(app.into()), ..FocusReport::default() }),
+            focus: Some(FocusReport {
+                app: Some(app.into()),
+                ..FocusReport::default()
+            }),
             ..ActionReport::default()
         };
         // No focused app yet (pre-focus actions) → inert.
         assert_eq!(verify_against_intent(&observed("Other"), None), None);
         // No readback at all (fallback backends, mouse-move) → inert.
-        assert_eq!(verify_against_intent(&ActionReport::default(), Some("Chrome")), None);
+        assert_eq!(
+            verify_against_intent(&ActionReport::default(), Some("Chrome")),
+            None
+        );
         // Readback present but the app unattributed → inert: absence of
         // evidence is not evidence of wrongness.
-        let no_app =
-            ActionReport { focus: Some(FocusReport::default()), ..ActionReport::default() };
+        let no_app = ActionReport {
+            focus: Some(FocusReport::default()),
+            ..ActionReport::default()
+        };
         assert_eq!(verify_against_intent(&no_app, Some("Chrome")), None);
         // Same app, any casing → pass.
         assert_eq!(
@@ -2204,7 +2408,9 @@ mod tests {
     async fn input_tool_malformed_arguments_are_typed_invalid_arguments() {
         let tool = InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused());
         // Unknown action tag: serde rejects it before any HID is touched.
-        let outcome = tool.execute(&input_call("c1", r#"{"action":"self-destruct"}"#)).await;
+        let outcome = tool
+            .execute(&input_call("c1", r#"{"action":"self-destruct"}"#))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("invalid-arguments"));
         let outcome = tool.execute(&input_call("c1", "{not json")).await;
@@ -2230,8 +2436,9 @@ mod tests {
         // FallbackInput returns the typed `unsupported` error on every platform;
         // its kind must ride back to the model/UI unchanged (R007).
         let tool = InputTool::new(Arc::new(FallbackInput), armed_arm(), unfocused());
-        let outcome =
-            tool.execute(&input_call("c1", r#"{"action":"type-text","text":"hi"}"#)).await;
+        let outcome = tool
+            .execute(&input_call("c1", r#"{"action":"type-text","text":"hi"}"#))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("unsupported"));
         // The detail rides in the content so the model can explain to the user.
@@ -2246,7 +2453,10 @@ mod tests {
         // so the CompositeExecutor never offers input_action to the model.
         let arm = Arc::new(HidArmState::disarmed());
         let tool = InputTool::new(Arc::new(RecordingInput::new()), arm.clone(), unfocused());
-        assert!(tool.definitions().is_empty(), "disarmed tool must advertise nothing");
+        assert!(
+            tool.definitions().is_empty(),
+            "disarmed tool must advertise nothing"
+        );
         // Arming the shared holder flips the advertised set live — no re-mount.
         arm.set_armed(true);
         assert_eq!(
@@ -2261,10 +2471,16 @@ mod tests {
         // The core safety requirement: a disarmed execute() is refused with the
         // typed `disabled` error and the InputControl backend is never touched.
         let backend = Arc::new(RecordingInput::new());
-        let tool =
-            InputTool::new(backend.clone(), Arc::new(HidArmState::disarmed()), unfocused());
+        let tool = InputTool::new(
+            backend.clone(),
+            Arc::new(HidArmState::disarmed()),
+            unfocused(),
+        );
         let outcome = tool
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("disabled"));
@@ -2289,10 +2505,17 @@ mod tests {
                 Arc::new(HidArmState::disarmed()),
                 unfocused(),
             )),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                Arc::new(ScreenSeen::new()),
+                Arc::new(FocusedApp::new()),
+            )),
         ]);
-        let names: Vec<String> =
-            composite.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = composite
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert_eq!(names, vec![MEMORY_SEARCH_TOOL, SCREEN_QUERY_TOOL]);
         assert!(
             !names.contains(&INPUT_ACTION_TOOL.to_string()),
@@ -2316,16 +2539,27 @@ mod tests {
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("unknown-tool"));
-        assert!(backend.last.lock().unwrap().is_none(), "disarmed HID backend must stay untouched");
+        assert!(
+            backend.last.lock().unwrap().is_none(),
+            "disarmed HID backend must stay untouched"
+        );
     }
 
     #[test]
     fn composite_concatenates_every_sub_executor_definition() {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
+            Box::new(InputTool::new(
+                Arc::new(RecordingInput::new()),
+                armed_arm(),
+                unfocused(),
+            )),
         ]);
-        let names: Vec<String> = composite.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = composite
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert_eq!(names, vec![MEMORY_SEARCH_TOOL, INPUT_ACTION_TOOL]);
     }
 
@@ -2338,7 +2572,9 @@ mod tests {
         ]);
 
         // memory_search dispatches to the memory tool, unchanged.
-        let mem = composite.execute(&search_call("c1", r#"{"query":"broadcast lag"}"#)).await;
+        let mem = composite
+            .execute(&search_call("c1", r#"{"query":"broadcast lag"}"#))
+            .await;
         assert!(mem.ok);
         assert_eq!(mem.result_count, Some(1));
 
@@ -2357,7 +2593,11 @@ mod tests {
     async fn composite_unknown_tool_is_typed_and_lists_available_tools() {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
+            Box::new(InputTool::new(
+                Arc::new(RecordingInput::new()),
+                armed_arm(),
+                unfocused(),
+            )),
         ]);
         let outcome = composite
             .execute(&ToolCall {
@@ -2430,7 +2670,11 @@ mod tests {
     }
 
     fn screen_call(id: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: SCREEN_QUERY_TOOL.into(), arguments: "{}".into() }
+        ToolCall {
+            id: id.into(),
+            name: SCREEN_QUERY_TOOL.into(),
+            arguments: "{}".into(),
+        }
     }
 
     #[test]
@@ -2441,12 +2685,22 @@ mod tests {
         assert_eq!(v["type"], "function");
         assert_eq!(v["function"]["name"], "screen_query");
         // No required arguments — the model can call it with an empty object.
-        assert_eq!(v["function"]["parameters"]["required"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            v["function"]["parameters"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn screen_query_ok_returns_element_json_with_coordinates() {
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()));
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::ok()),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
         let outcome = tool.execute(&screen_call("c1")).await;
         assert!(outcome.ok);
         assert_eq!(outcome.failure, None);
@@ -2467,8 +2721,22 @@ mod tests {
         // what to focus, so filter() with None returns everything untouched.
         let focused = FocusedApp::new();
         let els = vec![
-            ScreenElement { text: "a".into(), x: 0, y: 0, width: 1, height: 1, app: Some("Chrome".into()) },
-            ScreenElement { text: "b".into(), x: 0, y: 0, width: 1, height: 1, app: None },
+            ScreenElement {
+                text: "a".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                app: Some("Chrome".into()),
+            },
+            ScreenElement {
+                text: "b".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                app: None,
+            },
         ];
         assert_eq!(focused.filter(els.clone()), els);
     }
@@ -2481,9 +2749,30 @@ mod tests {
         let focused = FocusedApp::new();
         focused.set("Google Chrome");
         let kept = focused.filter(vec![
-            ScreenElement { text: "addr".into(), x: 0, y: 0, width: 1, height: 1, app: Some("google chrome".into()) },
-            ScreenElement { text: "other".into(), x: 0, y: 0, width: 1, height: 1, app: Some("Finder".into()) },
-            ScreenElement { text: "desktop".into(), x: 0, y: 0, width: 1, height: 1, app: None },
+            ScreenElement {
+                text: "addr".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                app: Some("google chrome".into()),
+            },
+            ScreenElement {
+                text: "other".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                app: Some("Finder".into()),
+            },
+            ScreenElement {
+                text: "desktop".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                app: None,
+            },
         ]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "addr");
@@ -2509,8 +2798,15 @@ mod tests {
         );
         let outcome = tool.execute(&screen_call("c1")).await;
         assert!(outcome.ok);
-        assert!(seen.seen(), "a successful query must still ground coordinates");
-        assert_eq!(outcome.result_count, Some(1), "only the Chrome element survives");
+        assert!(
+            seen.seen(),
+            "a successful query must still ground coordinates"
+        );
+        assert_eq!(
+            outcome.result_count,
+            Some(1),
+            "only the Chrome element survives"
+        );
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         assert_eq!(v[0]["text"], "address bar");
@@ -2540,9 +2836,11 @@ mod tests {
         // A backend permission failure surfaces as an ok:false outcome carrying
         // the screen-query kind — the UI's walkthrough keys on it (R007).
         let tool = ScreenQueryTool::new(
-            Arc::new(ScriptedScreen::failing(ScreenQueryError::PermissionDenied {
-                detail: "TCC denied".into(),
-            })),
+            Arc::new(ScriptedScreen::failing(
+                ScreenQueryError::PermissionDenied {
+                    detail: "TCC denied".into(),
+                },
+            )),
             Arc::new(ScreenSeen::new()),
             Arc::new(FocusedApp::new()),
         );
@@ -2564,7 +2862,11 @@ mod tests {
 
     #[tokio::test]
     async fn screen_query_wrong_name_is_unknown_tool() {
-        let tool = ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()));
+        let tool = ScreenQueryTool::new(
+            Arc::new(ScriptedScreen::ok()),
+            Arc::new(ScreenSeen::new()),
+            Arc::new(FocusedApp::new()),
+        );
         let outcome = tool
             .execute(&ToolCall {
                 id: "c1".into(),
@@ -2582,12 +2884,26 @@ mod tests {
         // screen_query, dispatched by name.
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
-            Box::new(InputTool::new(Arc::new(RecordingInput::new()), armed_arm(), unfocused())),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), Arc::new(ScreenSeen::new()), Arc::new(FocusedApp::new()))),
+            Box::new(InputTool::new(
+                Arc::new(RecordingInput::new()),
+                armed_arm(),
+                unfocused(),
+            )),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                Arc::new(ScreenSeen::new()),
+                Arc::new(FocusedApp::new()),
+            )),
         ]);
-        let names: Vec<String> =
-            composite.definitions().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec![MEMORY_SEARCH_TOOL, INPUT_ACTION_TOOL, SCREEN_QUERY_TOOL]);
+        let names: Vec<String> = composite
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![MEMORY_SEARCH_TOOL, INPUT_ACTION_TOOL, SCREEN_QUERY_TOOL]
+        );
 
         // A screen_query call routes to the screen tool and returns its elements.
         let outcome = composite.execute(&screen_call("c1")).await;
@@ -2611,7 +2927,10 @@ mod tests {
 
     impl ScriptedApprover {
         fn new(verdicts: Vec<ApprovalVerdict>) -> Self {
-            Self { verdicts: Mutex::new(verdicts.into()), requests: Mutex::new(Vec::new()) }
+            Self {
+                verdicts: Mutex::new(verdicts.into()),
+                requests: Mutex::new(Vec::new()),
+            }
         }
 
         fn prompt_count(&self) -> usize {
@@ -2644,15 +2963,23 @@ mod tests {
 
     impl RecordingFocus {
         fn new() -> Self {
-            Self { last: Mutex::new(None) }
+            Self {
+                last: Mutex::new(None),
+            }
         }
     }
 
     #[async_trait]
     impl AppFocus for RecordingFocus {
-        async fn focus(&self, app_name: &str) -> Result<crate::appfocus::FocusedApp, AppFocusError> {
+        async fn focus(
+            &self,
+            app_name: &str,
+        ) -> Result<crate::appfocus::FocusedApp, AppFocusError> {
             *self.last.lock().unwrap() = Some(app_name.to_string());
-            Ok(crate::appfocus::FocusedApp { app: app_name.to_string(), launched: false })
+            Ok(crate::appfocus::FocusedApp {
+                app: app_name.to_string(),
+                launched: false,
+            })
         }
 
         async fn running_apps(&self) -> Vec<String> {
@@ -2661,7 +2988,11 @@ mod tests {
     }
 
     fn focus_call(id: &str, args: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: FOCUS_APP_TOOL.into(), arguments: args.into() }
+        ToolCall {
+            id: id.into(),
+            name: FOCUS_APP_TOOL.into(),
+            arguments: args.into(),
+        }
     }
 
     /// A gate over a recording backend, its inner tool armed (so a Perform truly
@@ -2681,7 +3012,12 @@ mod tests {
         // exercise the Off/Ask/AutoRun gate directly; the targeting guards
         // (no-screen-query, off-target) have their own dedicated tests.
         let screen_seen = Arc::new(ScreenSeen::new());
-        screen_seen.mark_seen(vec![SeenBox { x: 0, y: 0, width: 100_000, height: 100_000 }]);
+        screen_seen.mark_seen(vec![SeenBox {
+            x: 0,
+            y: 0,
+            width: 100_000,
+            height: 100_000,
+        }]);
         (
             ApprovalGate::new(
                 inner,
@@ -2705,11 +3041,17 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let (gate, _wl) = gate_over(HidRunMode::Off, backend.clone(), approver.clone());
         let outcome = gate
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("disabled"));
-        assert!(backend.last.lock().unwrap().is_none(), "Off must not reach the backend");
+        assert!(
+            backend.last.lock().unwrap().is_none(),
+            "Off must not reach the backend"
+        );
         assert_eq!(approver.prompt_count(), 0, "Off must never prompt");
     }
 
@@ -2740,12 +3082,22 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::Deny]));
         let (gate, _wl) = gate_over(HidRunMode::Ask, backend.clone(), approver.clone());
         let outcome = gate
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some(APPROVAL_DENIED_KIND));
-        assert!(backend.last.lock().unwrap().is_none(), "Deny must not reach the backend");
-        assert_eq!(approver.prompt_count(), 1, "Ask + new kind must prompt exactly once");
+        assert!(
+            backend.last.lock().unwrap().is_none(),
+            "Deny must not reach the backend"
+        );
+        assert_eq!(
+            approver.prompt_count(),
+            1,
+            "Ask + new kind must prompt exactly once"
+        );
         // The overlay saw a human summary naming the action.
         assert!(approver.last_summary().unwrap().contains("Click"));
     }
@@ -2762,17 +3114,30 @@ mod tests {
         let (gate, wl) = gate_over(HidRunMode::Ask, backend.clone(), approver.clone());
 
         let first = gate
-            .execute(&input_call("c1", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
         assert!(first.ok);
         assert_eq!(approver.prompt_count(), 1);
 
         let second = gate
-            .execute(&input_call("c2", r#"{"action":"mouse-click","button":"left"}"#))
+            .execute(&input_call(
+                "c2",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            ))
             .await;
         assert!(second.ok);
-        assert_eq!(approver.prompt_count(), 2, "allow-once must prompt again for the same kind");
-        assert!(wl.lock().unwrap().is_empty(), "allow-once must not whitelist the kind");
+        assert_eq!(
+            approver.prompt_count(),
+            2,
+            "allow-once must prompt again for the same kind"
+        );
+        assert!(
+            wl.lock().unwrap().is_empty(),
+            "allow-once must not whitelist the kind"
+        );
     }
 
     #[tokio::test]
@@ -2785,17 +3150,30 @@ mod tests {
         let (gate, wl) = gate_over(HidRunMode::Ask, backend.clone(), approver.clone());
 
         let first = gate
-            .execute(&input_call("c1", r#"{"action":"key-press","key":"return"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"key-press","key":"return"}"#,
+            ))
             .await;
         assert!(first.ok);
         assert_eq!(approver.prompt_count(), 1);
-        assert!(wl.lock().unwrap().contains(ActionKind::KeyPress), "allow-kind must whitelist");
+        assert!(
+            wl.lock().unwrap().contains(ActionKind::KeyPress),
+            "allow-kind must whitelist"
+        );
 
         let second = gate
             .execute(&input_call("c2", r#"{"action":"key-press","key":"tab"}"#))
             .await;
-        assert!(second.ok, "a whitelisted kind must perform without prompting");
-        assert_eq!(approver.prompt_count(), 1, "the whitelisted kind must not prompt again");
+        assert!(
+            second.ok,
+            "a whitelisted kind must perform without prompting"
+        );
+        assert_eq!(
+            approver.prompt_count(),
+            1,
+            "the whitelisted kind must not prompt again"
+        );
         // A different kind still prompts (by-kind, not blanket) — but the script
         // is exhausted, so we assert via the whitelist rather than prompting.
         assert!(!wl.lock().unwrap().contains(ActionKind::MouseClick));
@@ -2809,12 +3187,18 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let (gate, _wl) = gate_over(HidRunMode::Ask, backend.clone(), approver.clone());
 
-        let bad_tag = gate.execute(&input_call("c1", r#"{"action":"self-destruct"}"#)).await;
+        let bad_tag = gate
+            .execute(&input_call("c1", r#"{"action":"self-destruct"}"#))
+            .await;
         assert_eq!(bad_tag.failure.as_deref(), Some("invalid-arguments"));
         let bad_json = gate.execute(&input_call("c2", "{not json")).await;
         assert_eq!(bad_json.failure.as_deref(), Some("invalid-arguments"));
 
-        assert_eq!(approver.prompt_count(), 0, "a malformed action must never prompt");
+        assert_eq!(
+            approver.prompt_count(),
+            0,
+            "a malformed action must never prompt"
+        );
         assert!(backend.last.lock().unwrap().is_none());
     }
 
@@ -2843,29 +3227,49 @@ mod tests {
         let composite = CompositeExecutor::new(vec![
             Box::new(seeded_tool()),
             Box::new(gate),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                screen_seen,
+                focused_app,
+            )),
         ]);
 
         // memory_search: succeeds, never gated.
-        let mem = composite.execute(&search_call("c1", r#"{"query":"broadcast lag"}"#)).await;
+        let mem = composite
+            .execute(&search_call("c1", r#"{"query":"broadcast lag"}"#))
+            .await;
         assert!(mem.ok);
-        assert_eq!(approver.prompt_count(), 0, "memory_search must never be gated");
+        assert_eq!(
+            approver.prompt_count(),
+            0,
+            "memory_search must never be gated"
+        );
 
         // screen_query: succeeds, never gated — and it grounds the coordinates
         // the mouse-move below needs.
         let scr = composite.execute(&screen_call("c2")).await;
         assert!(scr.ok);
-        assert_eq!(approver.prompt_count(), 0, "screen_query must never be gated");
+        assert_eq!(
+            approver.prompt_count(),
+            0,
+            "screen_query must never be gated"
+        );
 
         // input_action: gated through the approver, then performed. The aim must
         // land inside a real screen_query element — ScriptedScreen::ok() returns
         // one box [100,160)×[200,224), so (120, 210) is on-target.
         let hid = composite
-            .execute(&input_call("c3", r#"{"action":"mouse-move","x":120,"y":210}"#))
+            .execute(&input_call(
+                "c3",
+                r#"{"action":"mouse-move","x":120,"y":210}"#,
+            ))
             .await;
         assert!(hid.ok);
         assert_eq!(approver.prompt_count(), 1, "input_action must be gated");
-        assert_eq!(*backend.last.lock().unwrap(), Some(InputAction::MouseMove { x: 120, y: 210 }));
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            Some(InputAction::MouseMove { x: 120, y: 210 })
+        );
     }
 
     #[tokio::test]
@@ -2889,7 +3293,10 @@ mod tests {
         );
         let composite = CompositeExecutor::new(vec![Box::new(gate)]);
         let client = ScriptedClient::new(vec![
-            tool_call_outcome(vec![input_call("c1", r#"{"action":"mouse-click","button":"left"}"#)]),
+            tool_call_outcome(vec![input_call(
+                "c1",
+                r#"{"action":"mouse-click","button":"left"}"#,
+            )]),
             text_outcome("clicked the button"),
         ]);
         let capture = Capture::new();
@@ -2901,7 +3308,9 @@ mod tests {
             Some(InputAction::click(MouseButton::Left)),
         );
         // The tool-result event rode back ok:true after the approval.
-        let ToolEvent::Result(result) = &capture.events()[1] else { panic!("expected Result") };
+        let ToolEvent::Result(result) = &capture.events()[1] else {
+            panic!("expected Result")
+        };
         assert!(result.ok);
     }
 
@@ -2929,7 +3338,11 @@ mod tests {
         );
         let composite = CompositeExecutor::new(vec![
             Box::new(gate),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                screen_seen,
+                focused_app,
+            )),
         ]);
 
         // Blind mouse-move: refused, backend untouched, approver never consulted.
@@ -2938,7 +3351,11 @@ mod tests {
             .await;
         assert!(!blind.ok);
         assert_eq!(blind.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
-        assert_eq!(*backend.last.lock().unwrap(), None, "a guessed move must never reach HID");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            None,
+            "a guessed move must never reach HID"
+        );
         assert_eq!(approver.prompt_count(), 0);
 
         // screen_query grounds the coordinates.
@@ -2946,9 +3363,15 @@ mod tests {
 
         // Now the same mouse-move lands.
         let aimed = composite
-            .execute(&input_call("c3", r#"{"action":"mouse-move","x":100,"y":200}"#))
+            .execute(&input_call(
+                "c3",
+                r#"{"action":"mouse-move","x":100,"y":200}"#,
+            ))
             .await;
-        assert!(aimed.ok, "mouse-move must perform once the screen has been queried");
+        assert!(
+            aimed.ok,
+            "mouse-move must perform once the screen has been queried"
+        );
         assert_eq!(
             *backend.last.lock().unwrap(),
             Some(InputAction::MouseMove { x: 100, y: 200 }),
@@ -2978,26 +3401,43 @@ mod tests {
         );
         let composite = CompositeExecutor::new(vec![
             Box::new(gate),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                screen_seen,
+                focused_app,
+            )),
         ]);
 
         // Blind aimed click: refused, backend untouched — the coordinate is no
         // longer silently dropped into a click-at-cursor.
         let blind = composite
-            .execute(&input_call("c1", r#"{"action":"mouse-click","x":840,"y":240,"button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","x":840,"y":240,"button":"left"}"#,
+            ))
             .await;
         assert!(!blind.ok);
         assert_eq!(blind.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
-        assert_eq!(*backend.last.lock().unwrap(), None, "a guessed click must never reach HID");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            None,
+            "a guessed click must never reach HID"
+        );
         assert_eq!(approver.prompt_count(), 0);
 
         // screen_query grounds coordinates; the same aimed click now lands, and it
         // carries the coordinate through to the backend (move-then-click).
         assert!(composite.execute(&screen_call("c2")).await.ok);
         let aimed = composite
-            .execute(&input_call("c3", r#"{"action":"mouse-click","x":100,"y":200,"button":"left"}"#))
+            .execute(&input_call(
+                "c3",
+                r#"{"action":"mouse-click","x":100,"y":200,"button":"left"}"#,
+            ))
             .await;
-        assert!(aimed.ok, "an aimed click must perform once the screen has been queried");
+        assert!(
+            aimed.ok,
+            "an aimed click must perform once the screen has been queried"
+        );
         assert_eq!(
             *backend.last.lock().unwrap(),
             Some(InputAction::click_at(MouseButton::Left, 100, 200)),
@@ -3028,23 +3468,41 @@ mod tests {
         );
         let composite = CompositeExecutor::new(vec![
             Box::new(gate),
-            Box::new(ScreenQueryTool::new(Arc::new(ScriptedScreen::ok()), screen_seen, focused_app)),
+            Box::new(ScreenQueryTool::new(
+                Arc::new(ScriptedScreen::ok()),
+                screen_seen,
+                focused_app,
+            )),
         ]);
 
         // Ground the screen, then aim at (5, 5) — well outside the only element.
         assert!(composite.execute(&screen_call("c1")).await.ok);
         let off = composite
-            .execute(&input_call("c2", r#"{"action":"mouse-click","x":5,"y":5,"button":"left"}"#))
+            .execute(&input_call(
+                "c2",
+                r#"{"action":"mouse-click","x":5,"y":5,"button":"left"}"#,
+            ))
             .await;
         assert!(!off.ok, "a click on bare desktop must be refused");
         assert_eq!(off.failure.as_deref(), Some(OFF_TARGET_KIND));
-        assert_eq!(*backend.last.lock().unwrap(), None, "an off-target click must never reach HID");
-        assert_eq!(approver.prompt_count(), 0, "refused before the approval prompt");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            None,
+            "an off-target click must never reach HID"
+        );
+        assert_eq!(
+            approver.prompt_count(),
+            0,
+            "refused before the approval prompt"
+        );
 
         // A click INSIDE the element's box performs (regression guard: enforcement
         // is not blanket-refusing every aimed click).
         let on = composite
-            .execute(&input_call("c3", r#"{"action":"mouse-click","x":130,"y":210,"button":"left"}"#))
+            .execute(&input_call(
+                "c3",
+                r#"{"action":"mouse-click","x":130,"y":210,"button":"left"}"#,
+            ))
             .await;
         assert!(on.ok, "a click inside a real element must perform");
         assert_eq!(
@@ -3059,11 +3517,19 @@ mod tests {
         // a coordinate that was on-target before the focus must now be refused
         // (no-screen-query, since nothing is grounded) until the model re-queries.
         let screen_seen = Arc::new(ScreenSeen::new());
-        screen_seen.mark_seen(vec![SeenBox { x: 100, y: 200, width: 60, height: 24 }]);
+        screen_seen.mark_seen(vec![SeenBox {
+            x: 100,
+            y: 200,
+            width: 60,
+            height: 24,
+        }]);
         assert!(screen_seen.on_target(120, 210));
         screen_seen.invalidate();
         assert!(!screen_seen.seen(), "focus change clears the seen flag");
-        assert!(!screen_seen.on_target(120, 210), "and clears the boxes with it");
+        assert!(
+            !screen_seen.on_target(120, 210),
+            "and clears the boxes with it"
+        );
     }
 
     #[tokio::test]
@@ -3075,7 +3541,12 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let whitelist = Arc::new(std::sync::Mutex::new(SessionWhitelist::new()));
         let screen_seen = Arc::new(ScreenSeen::new());
-        screen_seen.mark_seen(vec![SeenBox { x: 0, y: 0, width: 100_000, height: 100_000 }]); // even with the screen grounded, half-aim is invalid.
+        screen_seen.mark_seen(vec![SeenBox {
+            x: 0,
+            y: 0,
+            width: 100_000,
+            height: 100_000,
+        }]); // even with the screen grounded, half-aim is invalid.
         let gate = ApprovalGate::new(
             InputTool::new(backend.clone(), armed_arm(), unfocused()),
             FocusAppTool::new(Arc::new(RecordingFocus::new())),
@@ -3086,11 +3557,18 @@ mod tests {
             Arc::new(FocusedApp::new()),
         );
         let outcome = gate
-            .execute(&input_call("c1", r#"{"action":"mouse-click","x":840,"button":"left"}"#))
+            .execute(&input_call(
+                "c1",
+                r#"{"action":"mouse-click","x":840,"button":"left"}"#,
+            ))
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("invalid-arguments"));
-        assert_eq!(*backend.last.lock().unwrap(), None, "a half-aimed click must never reach HID");
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            None,
+            "a half-aimed click must never reach HID"
+        );
     }
 
     #[tokio::test]
@@ -3111,11 +3589,19 @@ mod tests {
             Arc::new(FocusedApp::new()),
         );
         for (args, expect) in [
-            (r#"{"action":"mouse-click","button":"left"}"#, InputAction::click(MouseButton::Left)),
-            (r#"{"action":"type-text","text":"hi"}"#, InputAction::TypeText { text: "hi".into() }),
+            (
+                r#"{"action":"mouse-click","button":"left"}"#,
+                InputAction::click(MouseButton::Left),
+            ),
+            (
+                r#"{"action":"type-text","text":"hi"}"#,
+                InputAction::TypeText { text: "hi".into() },
+            ),
             (
                 r#"{"action":"key-press","key":"return"}"#,
-                InputAction::KeyPress { key: "return".into() },
+                InputAction::KeyPress {
+                    key: "return".into(),
+                },
             ),
         ] {
             let outcome = gate.execute(&input_call("c", args)).await;
@@ -3148,7 +3634,10 @@ mod tests {
         let composite = CompositeExecutor::new(vec![
             Box::new(gate),
             Box::new(ScreenQueryTool::new(
-                Arc::new(ScriptedScreen::with_apps(&[("addr", Some("Google Chrome"))])),
+                Arc::new(ScriptedScreen::with_apps(&[(
+                    "addr",
+                    Some("Google Chrome"),
+                )])),
                 screen_seen,
                 focused_app,
             )),
@@ -3156,28 +3645,40 @@ mod tests {
 
         // Query grounds coordinates; a move onto the element now lands.
         assert!(composite.execute(&screen_call("c1")).await.ok);
-        assert!(composite
-            .execute(&input_call("c2", r#"{"action":"mouse-move","x":2,"y":3}"#))
-            .await
-            .ok);
+        assert!(
+            composite
+                .execute(&input_call("c2", r#"{"action":"mouse-move","x":2,"y":3}"#))
+                .await
+                .ok
+        );
 
         // focus_app succeeds → coordinates invalidated.
-        assert!(composite.execute(&focus_call("c3", r#"{"app":"Google Chrome"}"#)).await.ok);
+        assert!(
+            composite
+                .execute(&focus_call("c3", r#"{"app":"Google Chrome"}"#))
+                .await
+                .ok
+        );
 
         // The next move is refused until a fresh query.
         let stale = composite
             .execute(&input_call("c4", r#"{"action":"mouse-move","x":2,"y":3}"#))
             .await;
-        assert!(!stale.ok, "a move after focus_app must be refused until re-query");
+        assert!(
+            !stale.ok,
+            "a move after focus_app must be refused until re-query"
+        );
         assert_eq!(stale.failure.as_deref(), Some(NO_SCREEN_QUERY_KIND));
 
         // Re-query re-grounds (still scoped to the focused Chrome element); the
         // move onto it lands again.
         assert!(composite.execute(&screen_call("c5")).await.ok);
-        assert!(composite
-            .execute(&input_call("c6", r#"{"action":"mouse-move","x":2,"y":3}"#))
-            .await
-            .ok);
+        assert!(
+            composite
+                .execute(&input_call("c6", r#"{"action":"mouse-move","x":2,"y":3}"#))
+                .await
+                .ok
+        );
     }
 
     #[tokio::test]
@@ -3212,12 +3713,25 @@ mod tests {
 
         // Before focus: the pre-focus survey returns all three elements.
         let survey = composite.execute(&screen_call("c1")).await;
-        assert_eq!(survey.result_count, Some(3), "pre-focus survey returns everything");
+        assert_eq!(
+            survey.result_count,
+            Some(3),
+            "pre-focus survey returns everything"
+        );
 
         // Focus Chrome, then re-query: only Chrome's element survives.
-        assert!(composite.execute(&focus_call("c2", r#"{"app":"Google Chrome"}"#)).await.ok);
+        assert!(
+            composite
+                .execute(&focus_call("c2", r#"{"app":"Google Chrome"}"#))
+                .await
+                .ok
+        );
         let scoped = composite.execute(&screen_call("c3")).await;
-        assert_eq!(scoped.result_count, Some(1), "post-focus query is scoped to Chrome");
+        assert_eq!(
+            scoped.result_count,
+            Some(1),
+            "post-focus query is scoped to Chrome"
+        );
         let v: serde_json::Value = serde_json::from_str(&scoped.content).unwrap();
         assert_eq!(v[0]["text"], "address bar");
         assert_eq!(v[0]["app"], "Google Chrome");
@@ -3258,10 +3772,15 @@ mod tests {
     async fn focus_app_ok_reports_the_activated_name() {
         let backend = Arc::new(RecordingFocus::new());
         let tool = FocusAppTool::new(backend.clone());
-        let outcome = tool.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        let outcome = tool
+            .execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#))
+            .await;
         assert!(outcome.ok);
         assert_eq!(outcome.failure, None);
-        assert_eq!(*backend.last.lock().unwrap(), Some("Google Chrome".to_string()));
+        assert_eq!(
+            *backend.last.lock().unwrap(),
+            Some("Google Chrome".to_string())
+        );
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["focused"], "Google Chrome");
@@ -3289,7 +3808,9 @@ mod tests {
             }
         }
         let tool = FocusAppTool::new(Arc::new(MissBackend));
-        let outcome = tool.execute(&focus_call("c1", r#"{"app":"Firefox"}"#)).await;
+        let outcome = tool
+            .execute(&focus_call("c1", r#"{"app":"Firefox"}"#))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("not-found"));
         let v: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
@@ -3309,7 +3830,11 @@ mod tests {
     async fn focus_app_wrong_name_is_unknown_tool() {
         let tool = FocusAppTool::new(Arc::new(RecordingFocus::new()));
         let outcome = tool
-            .execute(&ToolCall { id: "c1".into(), name: "memory_search".into(), arguments: "{}".into() })
+            .execute(&ToolCall {
+                id: "c1".into(),
+                name: "memory_search".into(),
+                arguments: "{}".into(),
+            })
             .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("unknown-tool"));
@@ -3349,7 +3874,10 @@ mod tests {
             Arc::new(RecordingFocus::new()),
             Arc::new(ScriptedApprover::new(vec![])),
         );
-        assert!(off.definitions().is_empty(), "Off must advertise no HID tools");
+        assert!(
+            off.definitions().is_empty(),
+            "Off must advertise no HID tools"
+        );
 
         let (ask, _wl) = focus_gate_over(
             HidRunMode::Ask,
@@ -3358,7 +3886,10 @@ mod tests {
         );
         let names: Vec<String> = ask.definitions().into_iter().map(|d| d.name).collect();
         assert!(names.contains(&INPUT_ACTION_TOOL.to_string()));
-        assert!(names.contains(&FOCUS_APP_TOOL.to_string()), "an armed mode advertises focus_app");
+        assert!(
+            names.contains(&FOCUS_APP_TOOL.to_string()),
+            "an armed mode advertises focus_app"
+        );
     }
 
     #[tokio::test]
@@ -3368,10 +3899,15 @@ mod tests {
         let focus = Arc::new(RecordingFocus::new());
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let (gate, _wl) = focus_gate_over(HidRunMode::Off, focus.clone(), approver.clone());
-        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        let outcome = gate
+            .execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some("disabled"));
-        assert!(focus.last.lock().unwrap().is_none(), "Off must not activate anything");
+        assert!(
+            focus.last.lock().unwrap().is_none(),
+            "Off must not activate anything"
+        );
         assert_eq!(approver.prompt_count(), 0, "Off must never prompt");
     }
 
@@ -3381,10 +3917,15 @@ mod tests {
         let focus = Arc::new(RecordingFocus::new());
         let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::Deny]));
         let (gate, _wl) = focus_gate_over(HidRunMode::Ask, focus.clone(), approver.clone());
-        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        let outcome = gate
+            .execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.failure.as_deref(), Some(APPROVAL_DENIED_KIND));
-        assert!(focus.last.lock().unwrap().is_none(), "Deny must not activate the app");
+        assert!(
+            focus.last.lock().unwrap().is_none(),
+            "Deny must not activate the app"
+        );
         assert_eq!(approver.prompt_count(), 1);
         // The overlay saw a human summary naming the target app.
         assert!(approver.last_summary().unwrap().contains("Google Chrome"));
@@ -3399,14 +3940,26 @@ mod tests {
         let approver = Arc::new(ScriptedApprover::new(vec![ApprovalVerdict::AllowKind]));
         let (gate, wl) = focus_gate_over(HidRunMode::Ask, focus.clone(), approver.clone());
 
-        let first = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        let first = gate
+            .execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#))
+            .await;
         assert!(first.ok);
         assert_eq!(approver.prompt_count(), 1);
-        assert!(wl.lock().unwrap().contains(ActionKind::FocusApp), "allow-kind must whitelist FocusApp");
+        assert!(
+            wl.lock().unwrap().contains(ActionKind::FocusApp),
+            "allow-kind must whitelist FocusApp"
+        );
 
         let second = gate.execute(&focus_call("c2", r#"{"app":"Finder"}"#)).await;
-        assert!(second.ok, "a whitelisted FocusApp must perform without prompting");
-        assert_eq!(approver.prompt_count(), 1, "the whitelisted kind must not prompt again");
+        assert!(
+            second.ok,
+            "a whitelisted FocusApp must perform without prompting"
+        );
+        assert_eq!(
+            approver.prompt_count(),
+            1,
+            "the whitelisted kind must not prompt again"
+        );
         assert_eq!(*focus.last.lock().unwrap(), Some("Finder".to_string()));
     }
 
@@ -3415,9 +3968,14 @@ mod tests {
         let focus = Arc::new(RecordingFocus::new());
         let approver = Arc::new(ScriptedApprover::new(vec![]));
         let (gate, _wl) = focus_gate_over(HidRunMode::AutoRun, focus.clone(), approver.clone());
-        let outcome = gate.execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#)).await;
+        let outcome = gate
+            .execute(&focus_call("c1", r#"{"app":"Google Chrome"}"#))
+            .await;
         assert!(outcome.ok);
         assert_eq!(approver.prompt_count(), 0, "Auto-run must never prompt");
-        assert_eq!(*focus.last.lock().unwrap(), Some("Google Chrome".to_string()));
+        assert_eq!(
+            *focus.last.lock().unwrap(),
+            Some("Google Chrome".to_string())
+        );
     }
 }

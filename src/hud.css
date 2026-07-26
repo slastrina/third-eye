@@ -1,0 +1,21 @@
+/* HUD window shells. Both windows are transparent; only the components
+ * paint pixels (overlay styles.css precedent). */
+
+.hud-pill-root {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding-top: 2px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* The canvas window is re-fitted over whichever monitor contains the live
+ * action's target (fit_hud_canvas); the webview converts absolute screen
+ * points to window coordinates by subtracting the returned origin. */
+.hud-canvas-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}

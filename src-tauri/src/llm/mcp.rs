@@ -548,7 +548,12 @@ impl Default for McpHealthCore {
     /// Fail-safe resting state: `Disconnected`, no error, no tools, and a `0`
     /// timestamp ("no transition yet") — what a build with no MCP server shows.
     fn default() -> Self {
-        Self { phase: McpPhase::Disconnected, last_error: None, tool_count: 0, updated_at: 0 }
+        Self {
+            phase: McpPhase::Disconnected,
+            last_error: None,
+            tool_count: 0,
+            updated_at: 0,
+        }
     }
 }
 
@@ -788,8 +793,15 @@ fn mcp_summary(call: &ToolCall) -> String {
     }
     const MAX: usize = 120;
     let preview: String = args.chars().take(MAX).collect();
-    let ellipsis = if args.chars().count() > MAX { "…" } else { "" };
-    format!("Run the external MCP tool {} with {preview}{ellipsis}", call.name)
+    let ellipsis = if args.chars().count() > MAX {
+        "…"
+    } else {
+        ""
+    };
+    format!(
+        "Run the external MCP tool {} with {preview}{ellipsis}",
+        call.name
+    )
 }
 
 /// Wraps [`McpExecutor`] with the S03 per-call approval gate: before any external
@@ -828,7 +840,12 @@ impl McpApprovalGate {
         allowlist: Arc<Mutex<McpAllowlist>>,
         approver: Arc<dyn McpApprovalPrompt>,
     ) -> Self {
-        Self { inner, mode, allowlist, approver }
+        Self {
+            inner,
+            mode,
+            allowlist,
+            approver,
+        }
     }
 }
 
@@ -1147,7 +1164,10 @@ mod tests {
         assert_eq!(McpRunMode::default(), McpRunMode::Off);
         assert_eq!(serde_json::to_value(McpRunMode::Off).unwrap(), "off");
         assert_eq!(serde_json::to_value(McpRunMode::Ask).unwrap(), "ask");
-        assert_eq!(serde_json::to_value(McpRunMode::AutoRun).unwrap(), "auto-run");
+        assert_eq!(
+            serde_json::to_value(McpRunMode::AutoRun).unwrap(),
+            "auto-run"
+        );
         for mode in [McpRunMode::Off, McpRunMode::Ask, McpRunMode::AutoRun] {
             let v = serde_json::to_value(mode).unwrap();
             let back: McpRunMode = serde_json::from_value(v).unwrap();
@@ -1164,7 +1184,10 @@ mod tests {
         let cfg = McpServerConfig {
             id: "everything".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-everything".to_string(),
+            ],
             enabled: true,
             transport: McpTransport::Stdio,
             url: None,
@@ -1239,7 +1262,10 @@ mod tests {
         let cfg: McpServerConfig =
             serde_json::from_value(serde_json::json!({ "id": "x", "command": "run-me" })).unwrap();
         assert!(cfg.args.is_empty());
-        assert!(!cfg.enabled, "enabled must fail-closed to false when absent");
+        assert!(
+            !cfg.enabled,
+            "enabled must fail-closed to false when absent"
+        );
     }
 
     #[test]
@@ -1308,8 +1334,15 @@ mod tests {
         // the prompt line stays bounded (never dumps an unbounded blob).
         let big = format!(r#"{{"blob":"{}"}}"#, "x".repeat(10_000));
         let s = mcp_summary(&call("mcp__file_write", &big));
-        assert!(s.chars().count() < 200, "summary must be bounded: {} chars", s.chars().count());
-        assert!(s.ends_with('…'), "a truncated preview must end with an ellipsis: {s:?}");
+        assert!(
+            s.chars().count() < 200,
+            "summary must be bounded: {} chars",
+            s.chars().count()
+        );
+        assert!(
+            s.ends_with('…'),
+            "a truncated preview must end with an ellipsis: {s:?}"
+        );
     }
 
     // --- Health-as-value + lifecycle transitions (S04 T02) ------------------
@@ -1320,8 +1353,14 @@ mod tests {
     fn phase_serializes_kebab_case_and_defaults_disconnected() {
         // src/mcp-state.ts (T04) matches these exact wire strings.
         assert_eq!(McpPhase::default(), McpPhase::Disconnected);
-        assert_eq!(serde_json::to_value(McpPhase::Disconnected).unwrap(), "disconnected");
-        assert_eq!(serde_json::to_value(McpPhase::Spawning).unwrap(), "spawning");
+        assert_eq!(
+            serde_json::to_value(McpPhase::Disconnected).unwrap(),
+            "disconnected"
+        );
+        assert_eq!(
+            serde_json::to_value(McpPhase::Spawning).unwrap(),
+            "spawning"
+        );
         assert_eq!(serde_json::to_value(McpPhase::Ready).unwrap(), "ready");
         assert_eq!(serde_json::to_value(McpPhase::Crashed).unwrap(), "crashed");
     }
@@ -1333,7 +1372,11 @@ mod tests {
         let state = McpState::new();
         let status = state.status();
         assert_eq!(status.phase, McpPhase::Disconnected);
-        assert_eq!(status.mode, McpRunMode::Off, "mode fail-closed off by default");
+        assert_eq!(
+            status.mode,
+            McpRunMode::Off,
+            "mode fail-closed off by default"
+        );
         assert_eq!(status.last_error, None);
         assert_eq!(status.tool_count, 0);
         assert_eq!(status.updated_at, 0, "no lifecycle transition yet → 0");
@@ -1382,7 +1425,11 @@ mod tests {
         state.mark_crashed("handshake timed out");
         assert!(state.status().last_error.is_some());
         state.mark_ready(3);
-        assert_eq!(state.status().last_error, None, "ready clears the prior error");
+        assert_eq!(
+            state.status().last_error,
+            None,
+            "ready clears the prior error"
+        );
         assert_eq!(state.status().tool_count, 3);
     }
 
@@ -1446,7 +1493,11 @@ mod tests {
         state.set_mode(McpRunMode::Ask);
         let s = state.status();
         assert_eq!(s.mode, McpRunMode::Ask);
-        assert_eq!(s.phase, McpPhase::Disconnected, "mode change does not fake a lifecycle phase");
+        assert_eq!(
+            s.phase,
+            McpPhase::Disconnected,
+            "mode change does not fake a lifecycle phase"
+        );
         assert!(s.updated_at > 0, "a mode change stamps the transition time");
     }
 }

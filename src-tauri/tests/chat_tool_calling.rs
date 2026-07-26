@@ -36,14 +36,13 @@ use third_eye_lib::input::fallback::FallbackInput;
 use third_eye_lib::llm::openai::{OpenAiClient, DEFAULT_ENDPOINT};
 use third_eye_lib::llm::toolloop::{
     run_tool_loop, CompositeExecutor, InputTool, MemorySearchTool, ScreenQueryTool, ScreenSeen,
-    ToolEvent,
-    INPUT_ACTION_TOOL, MEMORY_SEARCH_TOOL, SCREEN_QUERY_TOOL,
+    ToolEvent, INPUT_ACTION_TOOL, MEMORY_SEARCH_TOOL, SCREEN_QUERY_TOOL,
 };
-use third_eye_lib::screenquery::commands::ScreenQueryState;
 use third_eye_lib::llm::ChatMessage;
 use third_eye_lib::memory::{
     Embedder, MemorySource, MemoryStore, NewMemory, OpenAiEmbedder, SearchMode,
 };
+use third_eye_lib::screenquery::commands::ScreenQueryState;
 
 // --- Live-probe doubles (M005 targeting): drive the REAL model through the
 // production composite while capturing HID actions instead of firing them and
@@ -51,6 +50,7 @@ use third_eye_lib::memory::{
 // (focus_app → screen_query → mouse-move) with zero real-world side effects. ---
 use async_trait::async_trait;
 use third_eye_lib::appfocus::{AppFocus, AppFocusError, FocusedApp};
+use third_eye_lib::input::commands::{HidRunMode, SessionWhitelist};
 use third_eye_lib::input::{
     ActionKind, ActionReport, InputAction, InputControl, InputError, InputPermission,
 };
@@ -58,7 +58,6 @@ use third_eye_lib::llm::toolloop::{
     ApprovalGate, ApprovalPrompt, ApprovalVerdict, FocusAppTool, FocusedApp as FocusedAppGate,
     HID_SYSTEM_PROMPT, NO_SCREEN_QUERY_KIND,
 };
-use third_eye_lib::input::commands::{HidRunMode, SessionWhitelist};
 use third_eye_lib::screenquery::{ScreenElement, ScreenQuery, ScreenQueryError};
 
 /// A scratch db path under the OS temp dir, cleaned up on drop so failed
@@ -106,7 +105,9 @@ mod scripted {
         let cap = captured.clone();
         tokio::spawn(async move {
             for response in responses {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
                 while !request_complete(&buf) {
@@ -127,11 +128,17 @@ mod scripted {
     /// `content-length` bytes of body.
     fn request_complete(buf: &[u8]) -> bool {
         let text = String::from_utf8_lossy(buf);
-        let Some(header_end) = text.find("\r\n\r\n") else { return false };
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
         let content_length = text
             .lines()
             .find_map(|l| {
-                l.to_ascii_lowercase().strip_prefix("content-length:")?.trim().parse::<usize>().ok()
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
             })
             .unwrap_or(0);
         buf.len() >= header_end + 4 + content_length
@@ -141,12 +148,18 @@ mod scripted {
     pub fn body_json(captured: &Arc<Mutex<Vec<Vec<u8>>>>, i: usize) -> serde_json::Value {
         let raw = captured.lock().unwrap()[i].clone();
         let text = String::from_utf8_lossy(&raw);
-        let body = text.split("\r\n\r\n").nth(1).expect("captured request has no body");
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("captured request has no body");
         serde_json::from_str(body).expect("captured request body is not JSON")
     }
 
     pub fn sse_token(token: &str) -> String {
-        format!("data: {}\n\n", serde_json::json!({"choices": [{"delta": {"content": token}}]}))
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": token}}]})
+        )
     }
 
     /// One streamed `delta.tool_calls` SSE event in the OpenAI shape: id and
@@ -245,7 +258,10 @@ struct Capture {
 
 impl Capture {
     fn new() -> Self {
-        Self { events: Mutex::new(Vec::new()), tokens: Mutex::new(String::new()) }
+        Self {
+            events: Mutex::new(Vec::new()),
+            tokens: Mutex::new(String::new()),
+        }
     }
 }
 
@@ -293,14 +309,19 @@ async fn tool_loop_end_to_end_against_mock_server() {
     // The final answer streamed through on_token and landed on the outcome.
     assert_eq!(outcome.text, "You were working on your sourdough starter.");
     assert_eq!(*capture.tokens.lock().unwrap(), outcome.text);
-    assert!(outcome.tool_calls.is_empty(), "resolved loops leak no pending calls");
+    assert!(
+        outcome.tool_calls.is_empty(),
+        "resolved loops leak no pending calls"
+    );
 
     // Tool phases: one Call announcing the reassembled arguments, one ok
     // Result carrying count and the keyword degrade mode — the exact payload
     // the UI's memory-consulted indicator consumes.
     let events = capture.events.lock().unwrap().clone();
     assert_eq!(events.len(), 2, "one call + one result: {events:?}");
-    let ToolEvent::Call(call) = &events[0] else { panic!("first event must be Call") };
+    let ToolEvent::Call(call) = &events[0] else {
+        panic!("first event must be Call")
+    };
     assert_eq!(call.request_id, 42);
     assert_eq!(call.round, 0);
     assert_eq!(call.call.id, "call_live_1");
@@ -309,12 +330,22 @@ async fn tool_loop_end_to_end_against_mock_server() {
         call.call.arguments, r#"{"query":"sourdough"}"#,
         "split argument deltas must reassemble byte-for-byte"
     );
-    let ToolEvent::Result(result) = &events[1] else { panic!("second event must be Result") };
+    let ToolEvent::Result(result) = &events[1] else {
+        panic!("second event must be Result")
+    };
     assert!(result.ok);
     assert_eq!(result.call_id, "call_live_1");
     assert_eq!(result.name, MEMORY_SEARCH_TOOL);
-    assert_eq!(result.result_count, Some(1), "keyword search must hit the sourdough memory");
-    assert_eq!(result.mode, Some(SearchMode::Keyword), "dead embedder degrades to keyword");
+    assert_eq!(
+        result.result_count,
+        Some(1),
+        "keyword search must hit the sourdough memory"
+    );
+    assert_eq!(
+        result.mode,
+        Some(SearchMode::Keyword),
+        "dead embedder degrades to keyword"
+    );
     assert_eq!(result.failure, None);
 
     // Wire-level proof of both requests. Request 0: tools advertised, plain
@@ -329,7 +360,11 @@ async fn tool_loop_end_to_end_against_mock_server() {
     // arguments string, then the tool-role result with the stored memory.
     let req1 = scripted::body_json(&captured, 1);
     let messages = req1["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 3, "user + assistant echo + tool result: {messages:?}");
+    assert_eq!(
+        messages.len(),
+        3,
+        "user + assistant echo + tool result: {messages:?}"
+    );
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages[1]["tool_calls"][0]["id"], "call_live_1");
     assert_eq!(messages[1]["tool_calls"][0]["type"], "function");
@@ -348,7 +383,10 @@ async fn tool_loop_end_to_end_against_mock_server() {
         !tool_content.contains("kubernetes"),
         "the off-topic memory must not match a sourdough query: {tool_content}"
     );
-    assert_eq!(req1["tools"][0]["function"]["name"], "memory_search", "round 1 still offers tools");
+    assert_eq!(
+        req1["tools"][0]["function"]["name"], "memory_search",
+        "round 1 still offers tools"
+    );
 }
 
 /// R006 negative proof through the real HTTP client: a 4xx whose body names
@@ -382,7 +420,10 @@ async fn tools_unsupported_rejection_is_typed_through_the_loop() {
 
     assert_eq!(err.kind(), "tools-unsupported");
     assert_eq!(err.endpoint(), endpoint);
-    assert!(capture.events.lock().unwrap().is_empty(), "no tool executed, no events");
+    assert!(
+        capture.events.lock().unwrap().is_empty(),
+        "no tool executed, no events"
+    );
     assert!(capture.tokens.lock().unwrap().is_empty());
 }
 
@@ -444,14 +485,21 @@ async fn composite_routes_input_action_through_the_loop() {
     // typed `unsupported` failure — the UI/model-visible failure surface (R007).
     let events = capture.events.lock().unwrap().clone();
     assert_eq!(events.len(), 2, "one call + one result: {events:?}");
-    let ToolEvent::Call(call) = &events[0] else { panic!("first event must be Call") };
+    let ToolEvent::Call(call) = &events[0] else {
+        panic!("first event must be Call")
+    };
     assert_eq!(call.call.name, INPUT_ACTION_TOOL);
     assert_eq!(
         call.call.arguments, r#"{"action":"mouse-click","button":"left"}"#,
         "split argument deltas must reassemble byte-for-byte"
     );
-    let ToolEvent::Result(result) = &events[1] else { panic!("second event must be Result") };
-    assert!(!result.ok, "FallbackInput must fail typed, not silently succeed");
+    let ToolEvent::Result(result) = &events[1] else {
+        panic!("second event must be Result")
+    };
+    assert!(
+        !result.ok,
+        "FallbackInput must fail typed, not silently succeed"
+    );
     assert_eq!(result.name, INPUT_ACTION_TOOL);
     assert_eq!(result.failure.as_deref(), Some("unsupported"));
 
@@ -498,7 +546,12 @@ async fn live_input_tool_drives_real_backend() {
     // Scripted model: one input_action mouse-move, then a text acknowledgement.
     let round0 = scripted::sse_200(&[
         scripted::sse_tool_delta(0, Some("call_hid_live"), Some(INPUT_ACTION_TOOL), None),
-        scripted::sse_tool_delta(0, None, None, Some(r#"{"action":"mouse-move","x":200,"y":200}"#)),
+        scripted::sse_tool_delta(
+            0,
+            None,
+            None,
+            Some(r#"{"action":"mouse-move","x":200,"y":200}"#),
+        ),
         "data: [DONE]\n\n".to_string(),
     ]);
     let round1 = scripted::sse_200(&[
@@ -537,7 +590,10 @@ async fn live_input_tool_drives_real_backend() {
     else {
         unreachable!()
     };
-    eprintln!("live HID result: ok={} failure={:?}", result.ok, result.failure);
+    eprintln!(
+        "live HID result: ok={} failure={:?}",
+        result.ok, result.failure
+    );
     if !result.ok {
         // On an ungranted machine the only allowed failure is the typed
         // permission-denied the walkthrough keys on.
@@ -628,10 +684,15 @@ async fn live_tool_calling_against_lm_studio() {
             _ => None,
         })
         .collect();
-    assert!(!calls.is_empty(), "the model must call memory_search for a memory question");
+    assert!(
+        !calls.is_empty(),
+        "the model must call memory_search for a memory question"
+    );
     assert!(calls.iter().all(|c| c.call.name == MEMORY_SEARCH_TOOL));
     assert!(
-        events.iter().any(|e| matches!(e, ToolEvent::Result(r) if r.ok)),
+        events
+            .iter()
+            .any(|e| matches!(e, ToolEvent::Result(r) if r.ok)),
         "at least one memory_search must succeed: {events:?}"
     );
 
@@ -639,7 +700,9 @@ async fn live_tool_calling_against_lm_studio() {
     // baking one.
     let answer = outcome.text.to_lowercase();
     assert!(
-        ["tokio", "broadcast", "watcher", "lag"].iter().any(|kw| answer.contains(kw)),
+        ["tokio", "broadcast", "watcher", "lag"]
+            .iter()
+            .any(|kw| answer.contains(kw)),
         "answer must cite the seeded debugging memory: {}",
         outcome.text
     );
@@ -676,7 +739,12 @@ async fn live_screen_query_then_aim() {
     ]);
     let round1 = scripted::sse_200(&[
         scripted::sse_tool_delta(0, Some("call_aim_live"), Some(INPUT_ACTION_TOOL), None),
-        scripted::sse_tool_delta(0, None, None, Some(r#"{"action":"mouse-move","x":200,"y":200}"#)),
+        scripted::sse_tool_delta(
+            0,
+            None,
+            None,
+            Some(r#"{"action":"mouse-move","x":200,"y":200}"#),
+        ),
         "data: [DONE]\n\n".to_string(),
     ]);
     let round2 = scripted::sse_200(&[
@@ -705,7 +773,9 @@ async fn live_screen_query_then_aim() {
     let outcome = run_tool_loop(
         &client,
         &executor,
-        vec![ChatMessage::user("look at the screen, then move the mouse to a target")],
+        vec![ChatMessage::user(
+            "look at the screen, then move the mouse to a target",
+        )],
         1,
         &|t| capture.tokens.lock().unwrap().push_str(t),
         &|e| capture.events.lock().unwrap().push(e.clone()),
@@ -727,7 +797,11 @@ async fn live_screen_query_then_aim() {
             _ => None,
         })
         .collect();
-    assert_eq!(results.len(), 2, "one result per tool call (screen_query, input_action)");
+    assert_eq!(
+        results.len(),
+        2,
+        "one result per tool call (screen_query, input_action)"
+    );
     for result in results {
         eprintln!(
             "live query-then-aim: {} ok={} failure={:?}",
@@ -763,14 +837,19 @@ struct RecordingInput {
 
 impl RecordingInput {
     fn new() -> Self {
-        Self { actions: Mutex::new(Vec::new()) }
+        Self {
+            actions: Mutex::new(Vec::new()),
+        }
     }
 }
 
 #[async_trait]
 impl InputControl for RecordingInput {
     fn permission(&self) -> InputPermission {
-        InputPermission { granted: true, supported: true }
+        InputPermission {
+            granted: true,
+            supported: true,
+        }
     }
     fn request_permission(&self) -> bool {
         true
@@ -790,7 +869,9 @@ struct RecordingFocus {
 
 impl RecordingFocus {
     fn new() -> Self {
-        Self { focused: Mutex::new(Vec::new()) }
+        Self {
+            focused: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -798,7 +879,10 @@ impl RecordingFocus {
 impl AppFocus for RecordingFocus {
     async fn focus(&self, app_name: &str) -> Result<FocusedApp, AppFocusError> {
         self.focused.lock().unwrap().push(app_name.to_string());
-        Ok(FocusedApp { app: app_name.to_string(), launched: false })
+        Ok(FocusedApp {
+            app: app_name.to_string(),
+            launched: false,
+        })
     }
     async fn running_apps(&self) -> Vec<String> {
         vec!["Google Chrome".into(), "Finder".into()]
@@ -868,7 +952,11 @@ async fn live_small_model_follows_targeting_discipline() {
     let gate = ApprovalGate::new(
         // The tool shares the run's FocusedApp intent, the production shape —
         // RecordingInput reports no focus readback, so verification stays inert.
-        InputTool::new(input.clone(), Arc::new(HidArmState::new(true)), focused_app.clone()),
+        InputTool::new(
+            input.clone(),
+            Arc::new(HidArmState::new(true)),
+            focused_app.clone(),
+        ),
         FocusAppTool::new(focus.clone()),
         HidRunMode::AutoRun,
         Arc::new(std::sync::Mutex::new(SessionWhitelist::new())),
@@ -878,7 +966,11 @@ async fn live_small_model_follows_targeting_discipline() {
     );
     let executor = CompositeExecutor::new(vec![
         Box::new(gate),
-        Box::new(ScreenQueryTool::new(Arc::new(FixedScreen), screen_seen, focused_app)),
+        Box::new(ScreenQueryTool::new(
+            Arc::new(FixedScreen),
+            screen_seen,
+            focused_app,
+        )),
     ]);
 
     let model = std::env::var("THIRD_EYE_TOOL_MODEL")
@@ -898,9 +990,7 @@ async fn live_small_model_follows_targeting_discipline() {
         &executor,
         vec![
             ChatMessage::system(HID_SYSTEM_PROMPT),
-            ChatMessage::user(
-                "Click the Google Chrome address bar so I can type a new URL.",
-            ),
+            ChatMessage::user("Click the Google Chrome address bar so I can type a new URL."),
         ],
         1,
         &|t| capture.tokens.lock().unwrap().push_str(t),

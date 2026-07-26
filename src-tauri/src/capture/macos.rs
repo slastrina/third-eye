@@ -56,7 +56,10 @@ pub fn request_permission() -> bool {
 
 /// Current permission state as the IPC health-as-value shape.
 pub fn permission_status() -> CapturePermission {
-    CapturePermission { granted: has_permission(), supported: true }
+    CapturePermission {
+        granted: has_permission(),
+        supported: true,
+    }
 }
 
 /// The live macOS backend: one-shot ScreenCaptureKit capture of the primary
@@ -98,7 +101,9 @@ async fn capture_primary_inner() -> Result<CapturedFrame, CaptureError> {
     // a capture can never stall the overlay's IPC thread.
     tokio::task::spawn_blocking(capture_frame_blocking)
         .await
-        .map_err(|e| CaptureError::CaptureFailed { detail: format!("capture task panicked: {e}") })?
+        .map_err(|e| CaptureError::CaptureFailed {
+            detail: format!("capture task panicked: {e}"),
+        })?
 }
 
 fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
@@ -107,7 +112,11 @@ fn capture_frame_blocking() -> Result<CapturedFrame, CaptureError> {
     let rgba = image.rgba_data().map_err(|e| CaptureError::CaptureFailed {
         detail: format!("pixel render failed: {e}"),
     })?;
-    encode::encode_rgba_frame(RawRgbaFrame { width, height, rgba })
+    encode::encode_rgba_frame(RawRgbaFrame {
+        width,
+        height,
+        rgba,
+    })
 }
 
 /// One on-screen window's owning-app name and its bounding rect, converted into
@@ -207,7 +216,9 @@ fn capture_inner(
 
     let displays = content.displays();
     if displays.is_empty() {
-        return Err(CaptureError::NoDisplay { detail: "no shareable displays".into() });
+        return Err(CaptureError::NoDisplay {
+            detail: "no shareable displays".into(),
+        });
     }
     // Prefer the primary display (the one hosting the overlay's summon
     // context); fall back to the first if CGMainDisplayID matches nothing.
@@ -259,12 +270,30 @@ fn capture_inner(
     // factor the capture applied — rather than assuming `scale`.
     let display_frame = display.frame();
     let (dpw, dph) = (display.width() as f64, display.height() as f64);
-    let sx = if dpw > 0.0 { target_w as f64 / dpw } else { 0.0 };
-    let sy = if dph > 0.0 { target_h as f64 / dph } else { 0.0 };
-    let window_rects = window_app_rects(&windows, own_pid, display_frame.origin.x, display_frame.origin.y, sx, sy);
+    let sx = if dpw > 0.0 {
+        target_w as f64 / dpw
+    } else {
+        0.0
+    };
+    let sy = if dph > 0.0 {
+        target_h as f64 / dph
+    } else {
+        0.0
+    };
+    let window_rects = window_app_rects(
+        &windows,
+        own_pid,
+        display_frame.origin.x,
+        display_frame.origin.y,
+        sx,
+        sy,
+    );
 
-    let image = SCScreenshotManager::capture_image(&filter, &config)
-        .map_err(|e| CaptureError::CaptureFailed { detail: format!("screenshot failed: {e}") })?;
+    let image = SCScreenshotManager::capture_image(&filter, &config).map_err(|e| {
+        CaptureError::CaptureFailed {
+            detail: format!("screenshot failed: {e}"),
+        }
+    })?;
     // The geometry the screen_query path uses to convert captured-pixel boxes
     // back to logical screen points: the captured image dims (pixel basis) and
     // the display's logical point dims (input-backend basis). The point→pixel

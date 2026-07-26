@@ -120,7 +120,10 @@ async fn launch(app: AppHandle) {
 /// Build the stdio [`TokioChildProcess`] transport and run the bounded handshake.
 /// A spawn failure (bad command) funnels through [`fail`] → `crashed` and yields
 /// `None` (the S04 path, unchanged in behaviour).
-async fn connect_stdio(app: &AppHandle, cfg: &McpServerConfig) -> Option<RunningService<RoleClient, ()>> {
+async fn connect_stdio(
+    app: &AppHandle,
+    cfg: &McpServerConfig,
+) -> Option<RunningService<RoleClient, ()>> {
     let transport = match TokioChildProcess::new(Command::new(&cfg.command).configure(|c| {
         for a in &cfg.args {
             c.arg(a);
@@ -130,7 +133,10 @@ async fn connect_stdio(app: &AppHandle, cfg: &McpServerConfig) -> Option<Running
         Err(e) => {
             fail(
                 app,
-                format!("failed to spawn MCP server '{}' (command `{}`): {e}", cfg.id, cfg.command),
+                format!(
+                    "failed to spawn MCP server '{}' (command `{}`): {e}",
+                    cfg.id, cfg.command
+                ),
             );
             return None;
         }
@@ -145,11 +151,18 @@ async fn connect_stdio(app: &AppHandle, cfg: &McpServerConfig) -> Option<Running
 /// a keychain read error, or a handshake-time auth 401 all funnel through
 /// [`fail`] → `crashed` with the cause named (never a panic, never the token in a
 /// log line).
-async fn connect_http(app: &AppHandle, cfg: &McpServerConfig) -> Option<RunningService<RoleClient, ()>> {
+async fn connect_http(
+    app: &AppHandle,
+    cfg: &McpServerConfig,
+) -> Option<RunningService<RoleClient, ()>> {
     // Resolve the optional bearer token from the OS keychain (the one
     // side-effecting step). The non-secret `auth_ref` names the account; the
     // secret bytes are read crate-internally and NEVER logged.
-    let token = if let Some(auth_ref) = cfg.auth_ref.as_deref().map(str::trim).filter(|r| !r.is_empty())
+    let token = if let Some(auth_ref) = cfg
+        .auth_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
     {
         match app.state::<McpAuthState>().store().get_token(auth_ref) {
             Ok(Some(token)) => {
@@ -257,7 +270,10 @@ where
             None
         }
         Ok(Err(e)) => {
-            fail(app, format!("MCP server '{}' handshake returned an error: {e}", cfg.id));
+            fail(
+                app,
+                format!("MCP server '{}' handshake returned an error: {e}", cfg.id),
+            );
             None
         }
         Ok(Ok(client)) => Some(client),
@@ -269,12 +285,19 @@ where
 /// retain the cancellation token, mark `ready`, and spawn the crash supervisor.
 /// Reused verbatim from the S04 stdio path — the http peer is a `Peer<RoleClient>`
 /// indistinguishable from a stdio one here.
-async fn finish_launch(app: AppHandle, cfg: McpServerConfig, client: RunningService<RoleClient, ()>) {
+async fn finish_launch(
+    app: AppHandle,
+    cfg: McpServerConfig,
+    client: RunningService<RoleClient, ()>,
+) {
     // --- tools/list (bounded) — the health tool_count and a liveness proof --
     let tools = match tokio::time::timeout(OP_TIMEOUT, client.list_all_tools()).await {
         Ok(Ok(tools)) => tools,
         Ok(Err(e)) => {
-            fail(&app, format!("MCP server '{}' tools/list returned an error: {e}", cfg.id));
+            fail(
+                &app,
+                format!("MCP server '{}' tools/list returned an error: {e}", cfg.id),
+            );
             // Cancel the just-connected server so a handshaked-but-unusable server
             // does not leak (its peer is never injected).
             let _ = client.cancel().await;
@@ -283,7 +306,10 @@ async fn finish_launch(app: AppHandle, cfg: McpServerConfig, client: RunningServ
         Err(_) => {
             fail(
                 &app,
-                format!("MCP server '{}' tools/list did not complete within {:?}", cfg.id, OP_TIMEOUT),
+                format!(
+                    "MCP server '{}' tools/list did not complete within {:?}",
+                    cfg.id, OP_TIMEOUT
+                ),
             );
             let _ = client.cancel().await;
             return;
@@ -334,13 +360,17 @@ async fn supervise(app: AppHandle, server_id: String, client: RunningService<Rol
         Ok(reason) => {
             fail(
                 &app,
-                format!("MCP server '{server_id}' exited mid-session ({reason:?}) — tools unavailable"),
+                format!(
+                    "MCP server '{server_id}' exited mid-session ({reason:?}) — tools unavailable"
+                ),
             );
         }
         Err(join) => {
             fail(
                 &app,
-                format!("MCP server '{server_id}' service task join error: {join} — tools unavailable"),
+                format!(
+                    "MCP server '{server_id}' service task join error: {join} — tools unavailable"
+                ),
             );
         }
     }
@@ -361,7 +391,10 @@ fn select_enabled_server(servers: &[McpServerConfig]) -> Option<&McpServerConfig
                  Others ({}) are not spawned — multi-server support is a later slice.",
                 enabled.len(),
                 first.id,
-                rest.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
+                rest.iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             Some(first)
         }
@@ -392,14 +425,17 @@ fn broadcast(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mcp::McpTransport;
+    use super::*;
 
     fn cfg(id: &str, enabled: bool) -> McpServerConfig {
         McpServerConfig {
             id: id.to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-everything".to_string(),
+            ],
             enabled,
             transport: McpTransport::Stdio,
             url: None,
@@ -420,7 +456,11 @@ mod tests {
     fn select_picks_the_first_enabled_entry_skipping_disabled() {
         // A disabled entry ahead of an enabled one is skipped — enabled is the
         // gate on whether the startup task spawns a child.
-        let servers = vec![cfg("disabled", false), cfg("wanted", true), cfg("later", true)];
+        let servers = vec![
+            cfg("disabled", false),
+            cfg("wanted", true),
+            cfg("later", true),
+        ];
         let picked = select_enabled_server(&servers).expect("an enabled server exists");
         assert_eq!(picked.id, "wanted", "the first ENABLED server is chosen");
     }
@@ -441,7 +481,10 @@ mod tests {
         assert!(build_http_config(None, None).is_err());
         for blank in ["", "   ", "\n\t"] {
             let err = build_http_config(Some(blank), None).expect_err("blank url is corrupt");
-            assert!(err.contains("url"), "the reason names the missing url: {err}");
+            assert!(
+                err.contains("url"),
+                "the reason names the missing url: {err}"
+            );
         }
     }
 

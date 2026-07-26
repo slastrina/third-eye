@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "hud",
+  "description": "HUD windows (pill + canvas) and the tray panel: core:default only \u2014 they listen to the global llm:// broadcasts and invoke the custom show_hud/hide_hud/stop_chat commands; all window geometry and click-through is backend-side (hud.rs). MEM115: a window absent from every capability is denied the event ACL, so listen() would silently fail without this entry.",
+  "windows": [
+    "hud-pill",
+    "hud-canvas",
+    "tray-panel"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

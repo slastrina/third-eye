@@ -25,11 +25,13 @@
 //!   env vars so the cannot-be-simulated acceptance runs against any real remote
 //!   MCP server:
 //!
-//!     THIRD_EYE_MCP_HTTP_URL=https://mcp.example.com/mcp \
-//!     THIRD_EYE_MCP_HTTP_TOKEN=... \
-//!     THIRD_EYE_MCP_HTTP_TOOL=echo \
-//!     THIRD_EYE_MCP_HTTP_ARGS='{"message":"hi"}' \
-//!     cargo test --locked --test mcp_http_live -- --ignored --nocapture
+//! ```text
+//! THIRD_EYE_MCP_HTTP_URL=https://mcp.example.com/mcp \
+//! THIRD_EYE_MCP_HTTP_TOKEN=... \
+//! THIRD_EYE_MCP_HTTP_TOOL=echo \
+//! THIRD_EYE_MCP_HTTP_ARGS='{"message":"hi"}' \
+//! cargo test --locked --test mcp_http_live -- --ignored --nocapture
+//! ```
 
 use std::time::Duration;
 
@@ -68,7 +70,9 @@ async fn capture_first_request_authorization(token: Option<&str>) -> Option<Stri
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind the loopback contract HTTP server");
-    let addr = listener.local_addr().expect("mock server has no local addr");
+    let addr = listener
+        .local_addr()
+        .expect("mock server has no local addr");
     let url = format!("http://{addr}/mcp");
 
     // The mock: accept exactly one connection, read the request head (up to the
@@ -229,7 +233,10 @@ async fn live_remote_http_tools_reach_agent_through_the_guarded_gate() {
         .await
         .expect("McpExecutor::connect must complete tools/list against the remote server");
     let defs = executor.definitions();
-    assert!(!defs.is_empty(), "the remote server must advertise at least one tool");
+    assert!(
+        !defs.is_empty(),
+        "the remote server must advertise at least one tool"
+    );
     assert!(
         defs.iter().all(|d| d.name.starts_with(MCP_TOOL_PREFIX)),
         "every advertised remote tool is namespaced under mcp__ (no built-in collision)"

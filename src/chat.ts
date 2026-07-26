@@ -629,6 +629,53 @@ export function completeFirstRun(): Promise<FirstRunStatus> {
   return invoke<FirstRunStatus>("complete_first_run");
 }
 
+/** Memory-retention snapshot — the serde camelCase serialization of Rust's
+ *  MemoryRetentionStatus (memory/commands.rs). `retention` is always one of
+ *  the wire values ("7d" | "30d" | "90d" | "forever"); `error` carries a
+ *  rejected value or persist failure as data (never an IPC rejection). */
+export interface MemoryRetentionStatus {
+  retention: string;
+  error: string | null;
+}
+
+/** Read the effective memory-retention setting (tour Memory step, Settings). */
+export function memoryRetention(): Promise<MemoryRetentionStatus> {
+  return invoke<MemoryRetentionStatus>("memory_retention");
+}
+
+/** Persist the memory-retention setting. Display/persist only this milestone —
+ *  pruning that honors it is a specced follow-up. */
+export function setMemoryRetention(retention: string): Promise<MemoryRetentionStatus> {
+  return invoke<MemoryRetentionStatus>("set_memory_retention", { retention });
+}
+
+/** Global-hotkey registration snapshot — serde camelCase of Rust's
+ *  HotkeyStatus (hotkey.rs): the live shortcut string (e.g.
+ *  "super+shift+space"), whether it registered, and any conflict error. */
+export interface HotkeyStatus {
+  shortcut: string;
+  registered: boolean;
+  error: string | null;
+}
+
+/** Read the live hotkey binding (tour Summon step shows the real shortcut). */
+export function hotkeyStatus(): Promise<HotkeyStatus> {
+  return invoke<HotkeyStatus>("hotkey_status");
+}
+
+/** Whether an LLM endpoint URL points at this machine — the truth condition
+ *  for the palette's "● on-device" badge (no-fake-data rule: the badge only
+ *  renders when the model actually runs locally). Unparseable URLs are not
+ *  local: when we can't tell, we don't claim. */
+export function isLocalEndpoint(endpoint: string): boolean {
+  try {
+    const host = new URL(endpoint).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Chat state machine (pure)
 // ---------------------------------------------------------------------------

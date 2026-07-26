@@ -41,7 +41,11 @@ pub const OCR_MAX_DIMENSION: u32 = 2048;
 /// as [`CaptureError`] and [`crate::llm::LlmError`]; consumers match on
 /// `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum OcrError {
     /// Screen Recording permission is not granted (TCC) — the capture stage
     /// refused before any pixel was read. The watcher surfaces the same
@@ -104,7 +108,10 @@ impl std::fmt::Display for OcrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OcrError::PermissionDenied { detail } => {
-                write!(f, "ocr permission-denied: Screen Recording not granted ({detail})")
+                write!(
+                    f,
+                    "ocr permission-denied: Screen Recording not granted ({detail})"
+                )
             }
             OcrError::CaptureFailed { detail } => {
                 write!(f, "ocr capture-failed: {detail}")
@@ -179,7 +186,9 @@ mod tests {
     #[tokio::test]
     async fn errors_propagate_through_dyn_with_kind() {
         let engine: Arc<dyn OcrEngine> = Arc::new(MockOcr {
-            fail_with: Some(OcrError::RecognitionFailed { detail: "vision failed".into() }),
+            fail_with: Some(OcrError::RecognitionFailed {
+                detail: "vision failed".into(),
+            }),
         });
         let err = engine.extract().await.unwrap_err();
         assert_eq!(err.kind(), "recognition-failed");
@@ -189,23 +198,31 @@ mod tests {
     fn error_json_shape_is_the_ipc_contract() {
         // Watcher status and diagnostics match on `kind` and read camelCase
         // fields; a change here is a breaking IPC change.
-        let denied = OcrError::PermissionDenied { detail: "TCC denied".into() };
+        let denied = OcrError::PermissionDenied {
+            detail: "TCC denied".into(),
+        };
         let v = serde_json::to_value(&denied).unwrap();
         assert_eq!(v["kind"], "permission-denied");
         assert_eq!(v["detail"], "TCC denied");
 
-        let capture = OcrError::CaptureFailed { detail: "no-display: asleep".into() };
+        let capture = OcrError::CaptureFailed {
+            detail: "no-display: asleep".into(),
+        };
         let v = serde_json::to_value(&capture).unwrap();
         assert_eq!(v["kind"], "capture-failed");
         assert_eq!(v["detail"], "no-display: asleep");
 
-        let recognition = OcrError::RecognitionFailed { detail: "vision error".into() };
+        let recognition = OcrError::RecognitionFailed {
+            detail: "vision error".into(),
+        };
         let v = serde_json::to_value(&recognition).unwrap();
         assert_eq!(v["kind"], "recognition-failed");
         assert_eq!(v["detail"], "vision error");
 
-        let unsupported =
-            OcrError::Unsupported { platform: "linux".into(), detail: "no backend".into() };
+        let unsupported = OcrError::Unsupported {
+            platform: "linux".into(),
+            detail: "no backend".into(),
+        };
         let v = serde_json::to_value(&unsupported).unwrap();
         assert_eq!(v["kind"], "unsupported");
         assert_eq!(v["platform"], "linux");
@@ -215,10 +232,19 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            OcrError::PermissionDenied { detail: String::new() },
-            OcrError::CaptureFailed { detail: String::new() },
-            OcrError::RecognitionFailed { detail: String::new() },
-            OcrError::Unsupported { platform: String::new(), detail: String::new() },
+            OcrError::PermissionDenied {
+                detail: String::new(),
+            },
+            OcrError::CaptureFailed {
+                detail: String::new(),
+            },
+            OcrError::RecognitionFailed {
+                detail: String::new(),
+            },
+            OcrError::Unsupported {
+                platform: String::new(),
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -228,17 +254,34 @@ mod tests {
 
     #[test]
     fn capture_permission_error_survives_the_mapping() {
-        let err: OcrError =
-            CaptureError::PermissionDenied { detail: "TCC denied".into() }.into();
+        let err: OcrError = CaptureError::PermissionDenied {
+            detail: "TCC denied".into(),
+        }
+        .into();
         assert_eq!(err.kind(), "permission-denied");
-        assert_eq!(err, OcrError::PermissionDenied { detail: "TCC denied".into() });
+        assert_eq!(
+            err,
+            OcrError::PermissionDenied {
+                detail: "TCC denied".into()
+            }
+        );
     }
 
     #[test]
     fn other_capture_errors_collapse_to_capture_failed_with_kind_in_detail() {
         let cases: Vec<(CaptureError, &str)> = vec![
-            (CaptureError::NoDisplay { detail: "asleep".into() }, "no-display"),
-            (CaptureError::CaptureFailed { detail: "stream error".into() }, "capture-failed"),
+            (
+                CaptureError::NoDisplay {
+                    detail: "asleep".into(),
+                },
+                "no-display",
+            ),
+            (
+                CaptureError::CaptureFailed {
+                    detail: "stream error".into(),
+                },
+                "capture-failed",
+            ),
             (CaptureError::privacy_mode(), "privacy-mode"),
             (CaptureError::unsupported_here(), "unsupported"),
         ];
@@ -259,7 +302,9 @@ mod tests {
 
     #[test]
     fn error_display_names_kind_and_detail() {
-        let err = OcrError::RecognitionFailed { detail: "vision gave up".into() };
+        let err = OcrError::RecognitionFailed {
+            detail: "vision gave up".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("recognition-failed"), "kind missing: {msg}");
         assert!(msg.contains("vision gave up"), "detail missing: {msg}");

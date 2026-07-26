@@ -39,8 +39,8 @@ use third_eye_lib::cloud::client::{build_cloud_client, CloudTransport};
 use third_eye_lib::cloud::keystore::{CloudProvider, KeyStore};
 use third_eye_lib::cloud::optin::CloudOptIn;
 use third_eye_lib::llm::guard::{EndpointTrust, GuardState};
-use third_eye_lib::privacy::DetectionKind;
 use third_eye_lib::llm::{Attachment, ChatMessage, ChatRequest, LlmClient};
+use third_eye_lib::privacy::DetectionKind;
 
 // The committed fixture — a self-signed RSA-2048 cert (CN/SAN cloud.test, CA +
 // serverAuth) and its PKCS#8 key. Both server identity (native-tls) and client
@@ -99,14 +99,18 @@ async fn spawn_mock_provider() -> MockProvider {
     let conns = connections.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = listener.accept().await else { break };
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
             // Count at accept: a connection reaching TLS means the client
             // actually opened a socket to us.
             conns.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             let cap = cap.clone();
             tokio::spawn(async move {
-                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
                 // Read the full decrypted request (headers + content-length body).
                 let mut buf: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -124,17 +128,29 @@ async fn spawn_mock_provider() -> MockProvider {
         }
     });
 
-    MockProvider { addr, captured, connections }
+    MockProvider {
+        addr,
+        captured,
+        connections,
+    }
 }
 
 /// True once `buf` holds the full request: complete headers plus
 /// `content-length` bytes of body (mirrors the in-crate llm test helper).
 fn request_complete(buf: &[u8]) -> bool {
     let text = String::from_utf8_lossy(buf);
-    let Some(header_end) = text.find("\r\n\r\n") else { return false };
+    let Some(header_end) = text.find("\r\n\r\n") else {
+        return false;
+    };
     let content_length = text
         .lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:")?.trim().parse::<usize>().ok())
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")?
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
         .unwrap_or(0);
     buf.len() >= header_end + 4 + content_length
 }
@@ -157,7 +173,10 @@ fn sse_completion_response() -> Vec<u8> {
 }
 
 fn sse_token(token: &str) -> String {
-    format!("data: {}\n\n", serde_json::json!({ "choices": [{ "delta": { "content": token } }] }))
+    format!(
+        "data: {}\n\n",
+        serde_json::json!({ "choices": [{ "delta": { "content": token } }] })
+    )
 }
 
 /// A keystore pointed at a unique per-run service, drop-guarded so the real OS
@@ -172,7 +191,9 @@ impl TestStore {
             "com.slastrina.thirdeye.test.cloudwire.{tag}.{}.{nanos}",
             std::process::id()
         );
-        Self { store: KeyStore::with_service(&service) }
+        Self {
+            store: KeyStore::with_service(&service),
+        }
     }
 }
 
@@ -196,7 +217,10 @@ fn test_transport(addr: SocketAddr) -> CloudTransport {
 }
 
 fn now_nanos() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,17 +257,30 @@ async fn guarded_cloud_client_streams_over_tls_with_redacted_body_and_bearer_aut
     let seen = Mutex::new(String::new());
     let outcome = client
         .stream_chat(
-            &ChatRequest::new(vec![ChatMessage::user(format!("password: {content_secret}"))]),
+            &ChatRequest::new(vec![ChatMessage::user(format!(
+                "password: {content_secret}"
+            ))]),
             &|t| seen.lock().unwrap().push_str(t),
         )
         .await
         .expect("streamed completion arrives through the guarded TLS client");
 
     // (a) The streamed OpenAI-shape SSE completion arrived and accumulated.
-    assert_eq!(outcome.text, "Hello", "two content deltas accumulate to 'Hello'");
+    assert_eq!(
+        outcome.text, "Hello",
+        "two content deltas accumulate to 'Hello'"
+    );
     assert_eq!(outcome.token_count, 2);
-    assert_eq!(*seen.lock().unwrap(), "Hello", "tokens were delivered in order");
-    assert_eq!(mock.connection_count(), 1, "exactly one TLS connection served the stream");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "Hello",
+        "tokens were delivered in order"
+    );
+    assert_eq!(
+        mock.connection_count(),
+        1,
+        "exactly one TLS connection served the stream"
+    );
 
     // Inspect the decrypted request the mock actually received.
     let captured = mock.captured();
@@ -258,14 +295,18 @@ async fn guarded_cloud_client_streams_over_tls_with_redacted_body_and_bearer_aut
         "redacted placeholder must be on the decrypted wire: {wire}"
     );
     assert!(
-        !raw.windows(content_secret.len()).any(|w| w == content_secret.as_bytes()),
+        !raw.windows(content_secret.len())
+            .any(|w| w == content_secret.as_bytes()),
         "the seeded content secret must NEVER appear on the wire"
     );
 
     // (c) Bearer auth on the real TLS wire — the key rides the Authorization
     // header (headers are not redacted; only message content is).
     assert!(
-        wire_lower.contains(&format!("authorization: bearer {}", api_key.to_ascii_lowercase())),
+        wire_lower.contains(&format!(
+            "authorization: bearer {}",
+            api_key.to_ascii_lowercase()
+        )),
         "the API key must ride as an Authorization: Bearer header on the TLS wire"
     );
 
@@ -281,7 +322,9 @@ async fn guarded_cloud_client_streams_over_tls_with_redacted_body_and_bearer_aut
     // connections — the guard refuses before the inner client's socket write.
     let connections_before = mock.connection_count();
     let attachment_req = ChatRequest::new(vec![ChatMessage::user("what is on my screen?")
-        .with_attachments(vec![Attachment { base64_png: "QUJD".into() }])]);
+        .with_attachments(vec![Attachment {
+            base64_png: "QUJD".into(),
+        }])]);
     let err = client
         .stream_chat(&attachment_req, &|_| {})
         .await

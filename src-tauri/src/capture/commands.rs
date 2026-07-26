@@ -118,8 +118,10 @@ pub async fn capture_screen(
     // included); the guard drops on both the success and error paths.
     #[cfg(desktop)]
     let _activity = crate::tray::begin_activity(&app, crate::tray::ActivityKind::Capture);
-    let privacy_enabled =
-        app.try_state::<PrivacyState>().map(|p| p.enabled()).unwrap_or(false);
+    let privacy_enabled = app
+        .try_state::<PrivacyState>()
+        .map(|p| p.enabled())
+        .unwrap_or(false);
     state.capture(privacy_enabled).await
 }
 
@@ -256,7 +258,11 @@ mod tests {
 
     impl ScriptedCapture {
         fn frame() -> CapturedFrame {
-            CapturedFrame { width: 4, height: 2, base64_png: "cGl4ZWxz".into() }
+            CapturedFrame {
+                width: 4,
+                height: 2,
+                base64_png: "cGl4ZWxz".into(),
+            }
         }
     }
 
@@ -284,7 +290,10 @@ mod tests {
     #[tokio::test]
     async fn granted_permission_captures_without_prompting() {
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: true, supported: true },
+            permission: CapturePermission {
+                granted: true,
+                supported: true,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
@@ -301,7 +310,10 @@ mod tests {
     async fn missing_permission_prompts_once_then_captures_when_granted() {
         // First-run UX: TCC prompt appears, user grants, capture proceeds.
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: true },
+            permission: CapturePermission {
+                granted: false,
+                supported: true,
+            },
             grant_on_request: true,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
@@ -313,7 +325,10 @@ mod tests {
     #[tokio::test]
     async fn denied_permission_is_typed_permission_denied_not_a_capture_attempt() {
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: true },
+            permission: CapturePermission {
+                granted: false,
+                supported: true,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
@@ -321,14 +336,20 @@ mod tests {
         let err = state.capture(false).await.unwrap_err();
         assert_eq!(err.kind(), "permission-denied");
         // The walkthrough matches on the serialized kind tag over IPC.
-        assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "permission-denied");
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["kind"],
+            "permission-denied"
+        );
         assert!(backend.prompt_requested.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn unsupported_platform_skips_prompt_and_bubbles_typed_error() {
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: false },
+            permission: CapturePermission {
+                granted: false,
+                supported: false,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
             capture_result: Err(CaptureError::unsupported_here()),
@@ -344,13 +365,23 @@ mod tests {
     #[tokio::test]
     async fn backend_capture_errors_bubble_untouched() {
         let (state, _) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: true, supported: true },
+            permission: CapturePermission {
+                granted: true,
+                supported: true,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
-            capture_result: Err(CaptureError::NoDisplay { detail: "asleep".into() }),
+            capture_result: Err(CaptureError::NoDisplay {
+                detail: "asleep".into(),
+            }),
         });
         let err = state.capture(false).await.unwrap_err();
-        assert_eq!(err, CaptureError::NoDisplay { detail: "asleep".into() });
+        assert_eq!(
+            err,
+            CaptureError::NoDisplay {
+                detail: "asleep".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -359,7 +390,10 @@ mod tests {
         // privacy mode must return the typed error without touching the
         // backend — no TCC prompt, no capture attempt.
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: true },
+            permission: CapturePermission {
+                granted: false,
+                supported: true,
+            },
             grant_on_request: true,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
@@ -377,12 +411,18 @@ mod tests {
     #[tokio::test]
     async fn privacy_mode_blocks_even_granted_capture() {
         let (state, _) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: true, supported: true },
+            permission: CapturePermission {
+                granted: true,
+                supported: true,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
         });
-        assert_eq!(state.capture(true).await.unwrap_err().kind(), "privacy-mode");
+        assert_eq!(
+            state.capture(true).await.unwrap_err().kind(),
+            "privacy-mode"
+        );
     }
 
     #[test]
@@ -394,12 +434,21 @@ mod tests {
     #[test]
     fn permission_status_is_a_backend_passthrough_value() {
         let (state, _) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: true },
+            permission: CapturePermission {
+                granted: false,
+                supported: true,
+            },
             grant_on_request: false,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
         });
-        assert_eq!(state.permission(), CapturePermission { granted: false, supported: true });
+        assert_eq!(
+            state.permission(),
+            CapturePermission {
+                granted: false,
+                supported: true
+            }
+        );
     }
 
     #[test]
@@ -416,14 +465,26 @@ mod tests {
         // scripted backend holds its permission fixed, so we assert the prompt
         // fired and the returned value equals that live read).
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: true, supported: true },
+            permission: CapturePermission {
+                granted: true,
+                supported: true,
+            },
             grant_on_request: true,
             prompt_requested: AtomicBool::new(false),
             capture_result: Ok(ScriptedCapture::frame()),
         });
         let result = state.request_permission();
-        assert!(backend.prompt_requested.load(Ordering::SeqCst), "a supported backend must be prompted");
-        assert_eq!(result, CapturePermission { granted: true, supported: true });
+        assert!(
+            backend.prompt_requested.load(Ordering::SeqCst),
+            "a supported backend must be prompted"
+        );
+        assert_eq!(
+            result,
+            CapturePermission {
+                granted: true,
+                supported: true
+            }
+        );
     }
 
     #[test]
@@ -431,14 +492,26 @@ mod tests {
         // Off macOS there is no prompt to spend — the request must be a no-op
         // that still reports the truthful unsupported value.
         let (state, backend) = state_with(ScriptedCapture {
-            permission: CapturePermission { granted: false, supported: false },
+            permission: CapturePermission {
+                granted: false,
+                supported: false,
+            },
             grant_on_request: true,
             prompt_requested: AtomicBool::new(false),
             capture_result: Err(CaptureError::unsupported_here()),
         });
         let result = state.request_permission();
-        assert!(!backend.prompt_requested.load(Ordering::SeqCst), "no prompt exists on unsupported platforms");
-        assert_eq!(result, CapturePermission { granted: false, supported: false });
+        assert!(
+            !backend.prompt_requested.load(Ordering::SeqCst),
+            "no prompt exists on unsupported platforms"
+        );
+        assert_eq!(
+            result,
+            CapturePermission {
+                granted: false,
+                supported: false
+            }
+        );
     }
 
     #[test]

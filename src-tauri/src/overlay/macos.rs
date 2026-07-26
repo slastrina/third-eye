@@ -109,7 +109,9 @@ pub fn yield_key_focus(app: &AppHandle) -> Result<(), String> {
             panel.resign_key_window();
             panel.hide();
             panel.order_front_regardless();
-            log::debug!("overlay: yielded key focus to the active app for synthesized keyboard input");
+            log::debug!(
+                "overlay: yielded key focus to the active app for synthesized keyboard input"
+            );
         }
         let _ = done_tx.send(());
     })

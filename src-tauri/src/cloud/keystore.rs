@@ -42,7 +42,11 @@ impl CloudProvider {
 /// Keystore failure taxonomy. Serialized with a `kind` tag over IPC, same
 /// convention as `ocr::OcrError`. Details never contain key material.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum CloudKeyError {
     /// The submitted key was empty/whitespace — refused before the OS store
     /// was touched.
@@ -65,7 +69,9 @@ impl CloudKeyError {
 }
 
 fn store_failed(e: keyring::Error) -> CloudKeyError {
-    CloudKeyError::StoreFailed { detail: e.to_string() }
+    CloudKeyError::StoreFailed {
+        detail: e.to_string(),
+    }
 }
 
 /// Handle to the OS credential store, scoped to one service name.
@@ -83,7 +89,9 @@ impl KeyStore {
     /// a unique per-run name so they never collide with (or leak into) the
     /// real app's entries.
     pub fn with_service(service: &str) -> Self {
-        Self { service: service.to_string() }
+        Self {
+            service: service.to_string(),
+        }
     }
 
     fn entry(&self, provider: CloudProvider) -> Result<keyring::Entry, CloudKeyError> {
@@ -100,8 +108,13 @@ impl KeyStore {
                 detail: "key is empty — use delete to remove a stored key".into(),
             });
         }
-        self.entry(provider)?.set_password(trimmed).map_err(store_failed)?;
-        log::info!("cloud: api key stored for {} (key bytes never logged)", provider.account());
+        self.entry(provider)?
+            .set_password(trimmed)
+            .map_err(store_failed)?;
+        log::info!(
+            "cloud: api key stored for {} (key bytes never logged)",
+            provider.account()
+        );
         Ok(())
     }
 
@@ -148,12 +161,16 @@ mod tests {
     /// OcrError. A change here is a breaking IPC change.
     #[test]
     fn error_json_shape_is_the_ipc_contract() {
-        let invalid = CloudKeyError::InvalidKey { detail: "key is empty".into() };
+        let invalid = CloudKeyError::InvalidKey {
+            detail: "key is empty".into(),
+        };
         let v = serde_json::to_value(&invalid).unwrap();
         assert_eq!(v["kind"], "invalid-key");
         assert_eq!(v["detail"], "key is empty");
 
-        let failed = CloudKeyError::StoreFailed { detail: "keychain locked".into() };
+        let failed = CloudKeyError::StoreFailed {
+            detail: "keychain locked".into(),
+        };
         let v = serde_json::to_value(&failed).unwrap();
         assert_eq!(v["kind"], "store-failed");
         assert_eq!(v["detail"], "keychain locked");
@@ -162,8 +179,12 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            CloudKeyError::InvalidKey { detail: String::new() },
-            CloudKeyError::StoreFailed { detail: String::new() },
+            CloudKeyError::InvalidKey {
+                detail: String::new(),
+            },
+            CloudKeyError::StoreFailed {
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -212,10 +233,16 @@ mod tests {
     /// service + drop guard keep the real store clean even on panic.
     #[test]
     fn key_round_trips_byte_identical_through_the_real_store() {
+        let _keychain = crate::cloud::real_keychain_test_lock();
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let service =
-            format!("com.slastrina.thirdeye.test.unit.{}.{nanos}", std::process::id());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let service = format!(
+            "com.slastrina.thirdeye.test.unit.{}.{nanos}",
+            std::process::id()
+        );
         let seeded = format!("sk-test-UNIT-{nanos}");
 
         struct Guard(KeyStore);
@@ -227,13 +254,17 @@ mod tests {
         let guard = Guard(KeyStore::with_service(&service));
         let store = &guard.0;
 
-        store.set_key(CloudProvider::Openai, &seeded).expect("set against the real store");
+        store
+            .set_key(CloudProvider::Openai, &seeded)
+            .expect("set against the real store");
         assert_eq!(
             store.get_key(CloudProvider::Openai).unwrap().as_deref(),
             Some(seeded.as_str()),
             "round-tripped key must be byte-identical"
         );
-        store.delete_key(CloudProvider::Openai).expect("delete stored key");
+        store
+            .delete_key(CloudProvider::Openai)
+            .expect("delete stored key");
         assert!(store.get_key(CloudProvider::Openai).unwrap().is_none());
     }
 
@@ -242,11 +273,12 @@ mod tests {
     /// (no item is ever created), so it runs unprompted everywhere.
     #[test]
     fn absent_key_is_ok_false_not_an_error() {
+        let _keychain = crate::cloud::real_keychain_test_lock();
         let store = KeyStore::with_service(&format!(
             "com.third-eye.test.absent-probe.{}",
             std::process::id()
         ));
-        assert_eq!(store.key_present(CloudProvider::Anthropic).unwrap(), false);
+        assert!(!store.key_present(CloudProvider::Anthropic).unwrap());
         assert!(store.get_key(CloudProvider::Anthropic).unwrap().is_none());
     }
 }

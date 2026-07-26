@@ -23,7 +23,11 @@ use crate::cloud::keystore::KEYCHAIN_SERVICE;
 /// `kind` tag over IPC (same convention as `ocr::OcrError`). Details never
 /// contain token material.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum McpAuthError {
     /// The submitted account key was empty/whitespace — a token cannot be
     /// filed under a blank account. Refused before the OS store is touched.
@@ -51,7 +55,9 @@ impl McpAuthError {
 }
 
 fn store_failed(e: keyring::Error) -> McpAuthError {
-    McpAuthError::StoreFailed { detail: e.to_string() }
+    McpAuthError::StoreFailed {
+        detail: e.to_string(),
+    }
 }
 
 /// Handle to the OS credential store for MCP bearer tokens, scoped to one
@@ -71,7 +77,9 @@ impl McpAuthStore {
     /// unique per-run name so they never collide with (or leak into) the real
     /// app's entries.
     pub fn with_service(service: &str) -> Self {
-        Self { service: service.to_string() }
+        Self {
+            service: service.to_string(),
+        }
     }
 
     fn entry(&self, account: &str) -> Result<keyring::Entry, McpAuthError> {
@@ -97,7 +105,10 @@ impl McpAuthStore {
         }
         let entry = self.entry(account)?;
         entry.set_password(trimmed).map_err(store_failed)?;
-        log::info!("mcp: auth token stored for account {} (token bytes never logged)", account.trim());
+        log::info!(
+            "mcp: auth token stored for account {} (token bytes never logged)",
+            account.trim()
+        );
         Ok(())
     }
 
@@ -145,24 +156,33 @@ mod tests {
     /// default store has been set" (MEM137/138/149), so the real-store tests
     /// below skip cleanly there rather than reporting a false regression.
     fn store_available(store: &McpAuthStore, account: &str) -> bool {
-        !matches!(store.token_present(account), Err(McpAuthError::StoreFailed { .. }))
+        !matches!(
+            store.token_present(account),
+            Err(McpAuthError::StoreFailed { .. })
+        )
     }
 
     /// The IPC error contract: kind tag + camelCase fields, mirroring
     /// CloudKeyError. A change here is a breaking IPC change.
     #[test]
     fn error_json_shape_is_the_ipc_contract() {
-        let invalid_ref = McpAuthError::InvalidRef { detail: "auth_ref is empty".into() };
+        let invalid_ref = McpAuthError::InvalidRef {
+            detail: "auth_ref is empty".into(),
+        };
         let v = serde_json::to_value(&invalid_ref).unwrap();
         assert_eq!(v["kind"], "invalid-ref");
         assert_eq!(v["detail"], "auth_ref is empty");
 
-        let invalid_token = McpAuthError::InvalidToken { detail: "token is empty".into() };
+        let invalid_token = McpAuthError::InvalidToken {
+            detail: "token is empty".into(),
+        };
         let v = serde_json::to_value(&invalid_token).unwrap();
         assert_eq!(v["kind"], "invalid-token");
         assert_eq!(v["detail"], "token is empty");
 
-        let failed = McpAuthError::StoreFailed { detail: "keychain locked".into() };
+        let failed = McpAuthError::StoreFailed {
+            detail: "keychain locked".into(),
+        };
         let v = serde_json::to_value(&failed).unwrap();
         assert_eq!(v["kind"], "store-failed");
         assert_eq!(v["detail"], "keychain locked");
@@ -171,9 +191,15 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            McpAuthError::InvalidRef { detail: String::new() },
-            McpAuthError::InvalidToken { detail: String::new() },
-            McpAuthError::StoreFailed { detail: String::new() },
+            McpAuthError::InvalidRef {
+                detail: String::new(),
+            },
+            McpAuthError::InvalidToken {
+                detail: String::new(),
+            },
+            McpAuthError::StoreFailed {
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -201,7 +227,10 @@ mod tests {
             let err = store.set_token(blank, "tok-abc").unwrap_err();
             assert_eq!(err.kind(), "invalid-ref");
             // A blank account is also rejected on read paths, before any store hit.
-            assert_eq!(store.token_present(blank).unwrap_err().kind(), "invalid-ref");
+            assert_eq!(
+                store.token_present(blank).unwrap_err().kind(),
+                "invalid-ref"
+            );
             assert_eq!(store.delete_token(blank).unwrap_err().kind(), "invalid-ref");
         }
     }
@@ -215,9 +244,14 @@ mod tests {
     #[test]
     fn token_round_trips_byte_identical_through_the_real_store() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let service =
-            format!("com.slastrina.thirdeye.test.mcp.{}.{nanos}", std::process::id());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let service = format!(
+            "com.slastrina.thirdeye.test.mcp.{}.{nanos}",
+            std::process::id()
+        );
         let account = "mcp:weather";
         let seeded = format!("bearer-UNIT-{nanos}");
 
@@ -235,7 +269,9 @@ mod tests {
             return;
         }
 
-        store.set_token(account, &seeded).expect("set against the real store");
+        store
+            .set_token(account, &seeded)
+            .expect("set against the real store");
         assert_eq!(
             store.get_token(account).unwrap().as_deref(),
             Some(seeded.as_str()),
@@ -250,9 +286,14 @@ mod tests {
     #[test]
     fn distinct_accounts_are_independent() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let service =
-            format!("com.slastrina.thirdeye.test.mcp.multi.{}.{nanos}", std::process::id());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let service = format!(
+            "com.slastrina.thirdeye.test.mcp.multi.{}.{nanos}",
+            std::process::id()
+        );
 
         struct Guard(McpAuthStore, Vec<String>);
         impl Drop for Guard {
@@ -264,7 +305,10 @@ mod tests {
         }
         let a = format!("mcp:weather-{nanos}");
         let b = format!("mcp:calendar-{nanos}");
-        let guard = Guard(McpAuthStore::with_service(&service), vec![a.clone(), b.clone()]);
+        let guard = Guard(
+            McpAuthStore::with_service(&service),
+            vec![a.clone(), b.clone()],
+        );
         let store = &guard.0;
 
         if !store_available(store, &a) {
@@ -274,7 +318,10 @@ mod tests {
 
         store.set_token(&a, "token-a").expect("set a");
         assert!(store.token_present(&a).unwrap());
-        assert!(!store.token_present(&b).unwrap(), "b must be absent after only a was set");
+        assert!(
+            !store.token_present(&b).unwrap(),
+            "b must be absent after only a was set"
+        );
         store.set_token(&b, "token-b").expect("set b");
         assert_eq!(store.get_token(&a).unwrap().as_deref(), Some("token-a"));
         assert_eq!(store.get_token(&b).unwrap().as_deref(), Some("token-b"));
@@ -295,7 +342,7 @@ mod tests {
             eprintln!("skipping: no platform credential store available (sandbox)");
             return;
         }
-        assert_eq!(store.token_present(account).unwrap(), false);
+        assert!(!store.token_present(account).unwrap());
         assert!(store.get_token(account).unwrap().is_none());
     }
 }

@@ -31,7 +31,11 @@ use third_eye_lib::overlay::OverlayState;
 use third_eye_lib::watcher::TextObservation;
 
 fn observation(text: &str, app: &str, at: u64) -> TextObservation {
-    TextObservation { text: text.into(), app_context: Some(app.into()), captured_at: at }
+    TextObservation {
+        text: text.into(),
+        app_context: Some(app.into()),
+        captured_at: at,
+    }
 }
 
 /// An interval's worth of seeded observations shaped like the prompt's own
@@ -99,7 +103,9 @@ async fn live_classify_and_nudge_against_lm_studio() {
         Arc::new(GuardState::new()),
     ));
     // Sanity: the lane resolves before spending time on the round.
-    router.lane_client(THIN_LANE).expect("thin lane must resolve");
+    router
+        .lane_client(THIN_LANE)
+        .expect("thin lane must resolve");
 
     let state = NudgeState::new();
     let batch = stuck_on_error_batch();
@@ -108,7 +114,14 @@ async fn live_classify_and_nudge_against_lm_studio() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        classification_round(&state, &router, &batch, OverlayState::Hidden, now_ms, cooldown_secs),
+        classification_round(
+            &state,
+            &router,
+            &batch,
+            OverlayState::Hidden,
+            now_ms,
+            cooldown_secs,
+        ),
     )
     .await
     .expect("one live classification must finish well inside 2 minutes");
@@ -126,9 +139,15 @@ async fn live_classify_and_nudge_against_lm_studio() {
     // The wire contract on a live payload: kind-tagged, a real one-liner,
     // grounded in the newest seeded observation, and pixel-free by field set.
     assert_eq!(payload.kind, NudgePayload::KIND);
-    assert!(!payload.message.trim().is_empty(), "nudge message must be usable");
+    assert!(
+        !payload.message.trim().is_empty(),
+        "nudge message must be usable"
+    );
     let newest = batch.last().unwrap();
-    assert_eq!(payload.screen_text, newest.text, "grounded in the newest observation");
+    assert_eq!(
+        payload.screen_text, newest.text,
+        "grounded in the newest observation"
+    );
     assert_eq!(payload.app_context.as_deref(), Some("Safari"));
     assert_eq!(payload.captured_at_ms, newest.captured_at as i64);
     assert!(
@@ -151,7 +170,11 @@ async fn live_classify_and_nudge_against_lm_studio() {
     assert_eq!(next, RoundOutcome::Skipped(SkipReason::CoolingDown));
     let status = state.status();
     eprintln!("live nudge status: {status:?}");
-    assert!(status.last_error.is_none(), "live classification failed: {:?}", status.last_error);
+    assert!(
+        status.last_error.is_none(),
+        "live classification failed: {:?}",
+        status.last_error
+    );
     assert_eq!(status.last_nudge_at_ms, Some(now_ms));
     assert_eq!(status.suppressed.cooling_down, 1);
 }

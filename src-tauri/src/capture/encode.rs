@@ -52,7 +52,11 @@ fn encode_rgba_frame_with_max(
     frame: RawRgbaFrame,
     max: u32,
 ) -> Result<CapturedFrame, CaptureError> {
-    let RawRgbaFrame { width, height, rgba } = frame;
+    let RawRgbaFrame {
+        width,
+        height,
+        rgba,
+    } = frame;
     if width == 0 || height == 0 {
         return Err(CaptureError::CaptureFailed {
             detail: format!("empty frame: {width}x{height}"),
@@ -74,9 +78,10 @@ fn encode_rgba_frame_with_max(
     }
     // Length was validated above, so from_raw cannot fail; keep the typed
     // error anyway rather than unwrap so no panic path exists (R007).
-    let img = RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
-        CaptureError::CaptureFailed { detail: "pixel buffer rejected by image layer".into() }
-    })?;
+    let img =
+        RgbaImage::from_raw(width, height, rgba).ok_or_else(|| CaptureError::CaptureFailed {
+            detail: "pixel buffer rejected by image layer".into(),
+        })?;
 
     let (target_w, target_h) = fit_within(width, height, max);
     let img = if (target_w, target_h) == (width, height) {
@@ -87,7 +92,9 @@ fn encode_rgba_frame_with_max(
 
     let mut png: Vec<u8> = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| CaptureError::CaptureFailed { detail: format!("png encode failed: {e}") })?;
+        .map_err(|e| CaptureError::CaptureFailed {
+            detail: format!("png encode failed: {e}"),
+        })?;
 
     Ok(CapturedFrame {
         width: target_w,
@@ -109,7 +116,11 @@ mod tests {
                 rgba.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 0x2a, 0xff]);
             }
         }
-        RawRgbaFrame { width, height, rgba }
+        RawRgbaFrame {
+            width,
+            height,
+            rgba,
+        }
     }
 
     fn decode(frame: &CapturedFrame) -> RgbaImage {
@@ -157,8 +168,12 @@ mod tests {
 
     #[test]
     fn zero_dimension_frame_is_typed_capture_failed() {
-        let err = encode_rgba_frame(RawRgbaFrame { width: 0, height: 4, rgba: vec![] })
-            .unwrap_err();
+        let err = encode_rgba_frame(RawRgbaFrame {
+            width: 0,
+            height: 4,
+            rgba: vec![],
+        })
+        .unwrap_err();
         assert_eq!(err.kind(), "capture-failed");
         assert!(err.to_string().contains("empty frame"), "{err}");
     }

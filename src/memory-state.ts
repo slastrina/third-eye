@@ -108,6 +108,22 @@ export function memoryStatus(): Promise<MemoryStatus> {
   return invoke<MemoryStatus>("memory_status");
 }
 
+/** `memory_search` outcome — the serde camelCase serialization of Rust's
+ *  SearchOutcome (embed.rs): ranked records plus how they were ranked
+ *  ("semantic" | "keyword"); `degradeReason` names the embedder failure when
+ *  ranking fell back to keyword-only (the honesty the Recall tab shows). */
+export interface SearchOutcome {
+  mode: "semantic" | "keyword";
+  degradeReason?: LlmError;
+  results: MemoryRecord[];
+}
+
+/** Hybrid recall over the store (memory window Recall tab; the same command
+ *  the chat tool loop calls). */
+export function memorySearch(query: string, limit?: number): Promise<SearchOutcome> {
+  return invoke<SearchOutcome>("memory_search", { query, limit });
+}
+
 /** `set_chat_memory_enabled` result — the serde camelCase serialization of
  *  Rust's ChatMemoryStatus (memory/commands.rs). Health-as-value like
  *  PrivacyStatus: a persist failure comes back as `error` with `enabled`

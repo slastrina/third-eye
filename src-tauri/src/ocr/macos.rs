@@ -23,7 +23,7 @@ use objc2_foundation::{NSArray, NSDictionary};
 use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
 };
-use screencapturekit::screenshot_manager::{CGImage as ScCGImage, CGImageExt};
+use screencapturekit::screenshot_manager::CGImage as ScCGImage;
 
 use super::{OcrEngine, OcrError};
 use crate::capture::macos::{
@@ -60,7 +60,11 @@ impl OcrEngine for VisionOcr {
         match &result {
             Ok(lines) => {
                 // Mirrors the capture frame log shape: outcome + latency.
-                log::debug!("ocr: {} line(s) in {} ms", lines.len(), start.elapsed().as_millis());
+                log::debug!(
+                    "ocr: {} line(s) in {} ms",
+                    lines.len(),
+                    start.elapsed().as_millis()
+                );
             }
             Err(err) => log::error!("ocr: {} ({err})", err.kind()),
         }
@@ -109,7 +113,10 @@ fn recognize_text(image: &objc2_core_graphics::CGImage) -> Result<Vec<String>, O
     handler
         .performRequests_error(&NSArray::from_retained_slice(&[base]))
         .map_err(|e| OcrError::RecognitionFailed {
-            detail: format!("Vision performRequests failed: {}", e.localizedDescription()),
+            detail: format!(
+                "Vision performRequests failed: {}",
+                e.localizedDescription()
+            ),
         })?;
 
     // No results (nil) and zero results both mean "no text on screen" — a
@@ -161,10 +168,7 @@ pub fn attribute_app(center_x: i32, center_y: i32, windows: &[WindowAppRect]) ->
     windows
         .iter()
         .find(|w| {
-            center_x >= w.x
-                && center_x < w.x + w.w
-                && center_y >= w.y
-                && center_y < w.y + w.h
+            center_x >= w.x && center_x < w.x + w.w && center_y >= w.y && center_y < w.y + w.h
         })
         .map(|w| w.app.clone())
 }
@@ -207,7 +211,10 @@ fn recognize_text_with_bounds(
     handler
         .performRequests_error(&NSArray::from_retained_slice(&[base]))
         .map_err(|e| OcrError::RecognitionFailed {
-            detail: format!("Vision performRequests failed: {}", e.localizedDescription()),
+            detail: format!(
+                "Vision performRequests failed: {}",
+                e.localizedDescription()
+            ),
         })?;
 
     let cwf = cw as f64;
@@ -234,7 +241,14 @@ fn recognize_text_with_bounds(
                 // Attribute to the app whose topmost window covers the box's
                 // center — the same pixel space the box lives in (M005).
                 let app = attribute_app(x + width / 2, y + height / 2, windows);
-                elements.push(TextElement { text, x, y, width, height, app });
+                elements.push(TextElement {
+                    text,
+                    x,
+                    y,
+                    width,
+                    height,
+                    app,
+                });
             }
         }
     }
@@ -251,15 +265,17 @@ pub fn extract_elements_blocking(max_dimension: u32) -> Result<Vec<TextElement>,
     let start = Instant::now();
     // The window→app rects come back in the SAME pixel space the captured image
     // is normalized to, so each element can be labelled with its owning app.
-    let (image, windows, geometry) =
-        capture_display_image_with_geometry_blocking(max_dimension)?;
+    let (image, windows, geometry) = capture_display_image_with_geometry_blocking(max_dimension)?;
     let (cw, ch) = (image.width() as u32, image.height() as u32);
     let result = recognize_text_with_bounds(as_vision_cgimage(&image), cw, ch, &windows)
         // Attribution ran in captured-pixel space (windows are in that space);
         // NOW map every box back to logical screen points so the model aims a
         // click in the coordinate space the input backend actually clicks in.
         .map(|elements| -> Vec<TextElement> {
-            elements.into_iter().map(|el| to_screen_points(el, geometry)).collect()
+            elements
+                .into_iter()
+                .map(|el| to_screen_points(el, geometry))
+                .collect()
         });
     match &result {
         Ok(elements) => log::debug!(
@@ -342,7 +358,10 @@ mod tests {
             Some(&ctx),
             CGRect {
                 origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize { width: width as f64, height: height as f64 },
+                size: CGSize {
+                    width: width as f64,
+                    height: height as f64,
+                },
             },
         );
 
@@ -351,8 +370,7 @@ mod tests {
         // standard CFType callbacks.
         unsafe {
             let font = CTFont::with_name(&CFString::from_str("Helvetica"), font_size, null());
-            let mut keys: [*const c_void; 1] =
-                [(kCTFontAttributeName as *const CFString).cast()];
+            let mut keys: [*const c_void; 1] = [(kCTFontAttributeName as *const CFString).cast()];
             let mut values: [*const c_void; 1] = [(&*font as *const CTFont).cast()];
             let attributes = CFDictionary::new(
                 None,
@@ -363,12 +381,9 @@ mod tests {
                 &kCFTypeDictionaryValueCallBacks,
             )
             .expect("attribute dictionary");
-            let attributed = CFAttributedString::new(
-                None,
-                Some(&CFString::from_str(text)),
-                Some(&attributes),
-            )
-            .expect("attributed string");
+            let attributed =
+                CFAttributedString::new(None, Some(&CFString::from_str(text)), Some(&attributes))
+                    .expect("attributed string");
             let line = CTLine::with_attributed_string(&attributed);
             CGContext::set_text_position(Some(&ctx), 24.0, height as f64 / 2.0 - font_size / 2.0);
             line.draw(&ctx);
@@ -429,13 +444,23 @@ mod tests {
             assert!(el.width > 0, "width not positive: {el:?}");
             assert!(el.height > 0, "height not positive: {el:?}");
             assert!(el.x + el.width <= w as i32, "box exceeds width: {el:?}");
-            assert!(el.y >= 0 && el.y < h as i32, "flipped y out of [0,h): {el:?}");
+            assert!(
+                el.y >= 0 && el.y < h as i32,
+                "flipped y out of [0,h): {el:?}"
+            );
             assert!(el.y + el.height <= h as i32, "box exceeds height: {el:?}");
         }
     }
 
     fn win(app: &str, x: i32, y: i32, w: i32, h: i32, layer: i32) -> WindowAppRect {
-        WindowAppRect { app: app.into(), x, y, w, h, layer }
+        WindowAppRect {
+            app: app.into(),
+            x,
+            y,
+            w,
+            h,
+            layer,
+        }
     }
 
     #[test]
@@ -445,7 +470,12 @@ mod tests {
         // at pixel (1680, 480) 800x80 maps to point (840, 240) 400x40 — exactly
         // the space the input backend clicks in. This is the fix: without it the
         // model clicks pixel coords as if they were points and lands off-target.
-        let geom = CaptureGeometry { pixel_w: 3840, pixel_h: 2160, point_w: 1920.0, point_h: 1080.0 };
+        let geom = CaptureGeometry {
+            pixel_w: 3840,
+            pixel_h: 2160,
+            point_w: 1920.0,
+            point_h: 1080.0,
+        };
         let el = TextElement {
             text: "Search Google or type a URL".into(),
             x: 1680,
@@ -463,8 +493,20 @@ mod tests {
     fn to_screen_points_is_identity_when_pixels_equal_points() {
         // Non-Retina 1:1 display: captured pixels already ARE points, so the box
         // is unchanged.
-        let geom = CaptureGeometry { pixel_w: 1440, pixel_h: 900, point_w: 1440.0, point_h: 900.0 };
-        let el = TextElement { text: "x".into(), x: 100, y: 200, width: 60, height: 24, app: None };
+        let geom = CaptureGeometry {
+            pixel_w: 1440,
+            pixel_h: 900,
+            point_w: 1440.0,
+            point_h: 900.0,
+        };
+        let el = TextElement {
+            text: "x".into(),
+            x: 100,
+            y: 200,
+            width: 60,
+            height: 24,
+            app: None,
+        };
         let pt = to_screen_points(el.clone(), geom);
         assert_eq!(pt, el);
     }
@@ -472,8 +514,20 @@ mod tests {
     #[test]
     fn to_screen_points_leaves_box_unchanged_on_degenerate_geometry() {
         // Zero-pixel geometry must not divide by zero — return the box as-is.
-        let geom = CaptureGeometry { pixel_w: 0, pixel_h: 0, point_w: 1920.0, point_h: 1080.0 };
-        let el = TextElement { text: "x".into(), x: 5, y: 6, width: 7, height: 8, app: None };
+        let geom = CaptureGeometry {
+            pixel_w: 0,
+            pixel_h: 0,
+            point_w: 1920.0,
+            point_h: 1080.0,
+        };
+        let el = TextElement {
+            text: "x".into(),
+            x: 5,
+            y: 6,
+            width: 7,
+            height: 8,
+            app: None,
+        };
         assert_eq!(to_screen_points(el.clone(), geom), el);
     }
 
@@ -481,13 +535,20 @@ mod tests {
     fn attribute_app_center_inside_one_rect() {
         let windows = vec![win("Google Chrome", 100, 100, 400, 300, 0)];
         // A point well inside the single window is attributed to it.
-        assert_eq!(attribute_app(200, 200, &windows).as_deref(), Some("Google Chrome"));
+        assert_eq!(
+            attribute_app(200, 200, &windows).as_deref(),
+            Some("Google Chrome")
+        );
     }
 
     #[test]
     fn attribute_app_outside_all_rects_is_none() {
         let windows = vec![win("Zed", 0, 0, 100, 100, 0)];
-        assert_eq!(attribute_app(200, 200, &windows), None, "the desktop is unattributed");
+        assert_eq!(
+            attribute_app(200, 200, &windows),
+            None,
+            "the desktop is unattributed"
+        );
         // No windows at all → None.
         assert_eq!(attribute_app(10, 10, &[]), None);
     }
@@ -513,10 +574,26 @@ mod tests {
         // Half-open on the far edges so adjacent windows never both claim a
         // boundary pixel: the left/top edge is inside, the right/bottom is not.
         let windows = vec![win("App", 10, 10, 20, 20, 0)]; // covers x∈[10,30), y∈[10,30)
-        assert_eq!(attribute_app(10, 10, &windows).as_deref(), Some("App"), "top-left is inside");
-        assert_eq!(attribute_app(29, 29, &windows).as_deref(), Some("App"), "last inside pixel");
-        assert_eq!(attribute_app(30, 20, &windows), None, "right edge is exclusive");
-        assert_eq!(attribute_app(20, 30, &windows), None, "bottom edge is exclusive");
+        assert_eq!(
+            attribute_app(10, 10, &windows).as_deref(),
+            Some("App"),
+            "top-left is inside"
+        );
+        assert_eq!(
+            attribute_app(29, 29, &windows).as_deref(),
+            Some("App"),
+            "last inside pixel"
+        );
+        assert_eq!(
+            attribute_app(30, 20, &windows),
+            None,
+            "right edge is exclusive"
+        );
+        assert_eq!(
+            attribute_app(20, 30, &windows),
+            None,
+            "bottom edge is exclusive"
+        );
     }
 
     /// Live probe of the coordinate-space fix (M005 targeting): capture the real
@@ -548,9 +625,15 @@ mod tests {
         );
         let elements = extract_elements_blocking(super::super::OCR_MAX_DIMENSION)
             .expect("screen query succeeds with permission");
-        eprintln!("{} element(s); first few in LOGICAL POINTS:", elements.len());
+        eprintln!(
+            "{} element(s); first few in LOGICAL POINTS:",
+            elements.len()
+        );
         for el in elements.iter().take(6) {
-            eprintln!("  {:?} @ ({},{}) {}x{} app={:?}", el.text, el.x, el.y, el.width, el.height, el.app);
+            eprintln!(
+                "  {:?} @ ({},{}) {}x{} app={:?}",
+                el.text, el.x, el.y, el.width, el.height, el.app
+            );
         }
         // Every box must lie within the display's logical-point bounds (with a
         // small margin for rounding) — proof the coordinates are clickable.
@@ -572,7 +655,10 @@ mod tests {
         let engine: Arc<dyn OcrEngine> = Arc::new(VisionOcr::new(super::super::OCR_MAX_DIMENSION));
         match engine.extract().await {
             Ok(lines) => {
-                println!("ocr: recognized {} line(s) from the live screen:", lines.len());
+                println!(
+                    "ocr: recognized {} line(s) from the live screen:",
+                    lines.len()
+                );
                 for line in &lines {
                     println!("  {line}");
                 }

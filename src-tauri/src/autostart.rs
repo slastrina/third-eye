@@ -39,7 +39,10 @@ pub fn status_after_toggle(
     os_enabled: Option<bool>,
 ) -> AutostartStatus {
     match result {
-        Ok(()) => AutostartStatus { enabled: desired, error: None },
+        Ok(()) => AutostartStatus {
+            enabled: desired,
+            error: None,
+        },
         Err(e) => AutostartStatus {
             enabled: os_enabled.unwrap_or(!desired),
             error: Some(format!(
@@ -69,8 +72,12 @@ pub fn toggle(app: &AppHandle) -> AutostartStatus {
 /// on the managed [`AutostartState`].
 pub fn apply(app: &AppHandle, desired: bool) -> AutostartStatus {
     let launcher = app.autolaunch();
-    let result =
-        if desired { launcher.enable() } else { launcher.disable() }.map_err(|e| e.to_string());
+    let result = if desired {
+        launcher.enable()
+    } else {
+        launcher.disable()
+    }
+    .map_err(|e| e.to_string());
     // Re-query after the attempt: the OS owns the state, so the status must
     // report what the launcher entry actually is, not what was requested.
     let os_enabled = launcher.is_enabled().ok();
@@ -92,13 +99,19 @@ pub fn apply(app: &AppHandle, desired: bool) -> AutostartStatus {
 /// Current status as health-as-value: a failed OS query is itself reported
 /// in the value, never as an IPC error.
 pub fn current_status(app: &AppHandle) -> AutostartStatus {
-    let last_error =
-        app.try_state::<AutostartState>().and_then(|s| s.last_error.lock().unwrap().clone());
+    let last_error = app
+        .try_state::<AutostartState>()
+        .and_then(|s| s.last_error.lock().unwrap().clone());
     match app.autolaunch().is_enabled() {
-        Ok(enabled) => AutostartStatus { enabled, error: last_error },
+        Ok(enabled) => AutostartStatus {
+            enabled,
+            error: last_error,
+        },
         Err(e) => AutostartStatus {
             enabled: false,
-            error: Some(format!("autostart: launch-at-login state query failed: {e}")),
+            error: Some(format!(
+                "autostart: launch-at-login state query failed: {e}"
+            )),
         },
     }
 }
@@ -124,7 +137,13 @@ mod tests {
     fn successful_toggle_reports_desired_state_and_no_error() {
         for desired in [true, false] {
             let s = status_after_toggle(desired, Ok(()), Some(desired));
-            assert_eq!(s, AutostartStatus { enabled: desired, error: None });
+            assert_eq!(
+                s,
+                AutostartStatus {
+                    enabled: desired,
+                    error: None
+                }
+            );
         }
     }
 
@@ -153,7 +172,11 @@ mod tests {
 
     #[test]
     fn status_serializes_enabled_and_error_fields() {
-        let v = serde_json::to_value(AutostartStatus { enabled: true, error: None }).unwrap();
+        let v = serde_json::to_value(AutostartStatus {
+            enabled: true,
+            error: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({ "enabled": true, "error": null }));
         let v = serde_json::to_value(AutostartStatus {
             enabled: false,

@@ -144,6 +144,9 @@ objc2-vision = "0.3"
 # Frontmost-app name for TextObservation.appContext (S01 watcher):
 # NSWorkspace/NSRunningApplication — two message sends, no AX spelunking.
 objc2-app-kit = "0.3"
+# NSEvent global-monitor blocks (tray panel outside-click dismiss). Already
+# in the tree transitively via objc2; declared to use RcBlock directly.
+block2 = "0.6"
 # HID event synthesis (input/macos.rs): enigo wraps CGEvent for mouse/keyboard
 # without hand-rolling per-platform FFI. macOS-ONLY (R020) — on Linux it pulls
 # X11/libxdo and on Windows win32; declaring it here keeps the cross-target

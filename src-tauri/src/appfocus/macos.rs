@@ -75,7 +75,9 @@ pub fn best_match(requested: &str, candidates: &[String]) -> Option<usize> {
     if let Some(i) = candidates.iter().position(|c| c.to_lowercase() == needle) {
         return Some(i);
     }
-    candidates.iter().position(|c| c.to_lowercase().contains(&needle))
+    candidates
+        .iter()
+        .position(|c| c.to_lowercase().contains(&needle))
 }
 
 /// Loose two-way containment match (case-insensitive, trimmed) between an
@@ -111,7 +113,9 @@ fn installed_app_roots() -> Vec<PathBuf> {
 pub fn installed_apps(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut apps = Vec::new();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("app") {
@@ -185,8 +189,10 @@ fn activate_running(app_name: &str) -> RunningActivation {
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
     // Read localized names once so the match index lines up with the roster.
-    let names: Vec<Option<String>> =
-        apps.iter().map(|app| app.localizedName().map(|n| n.to_string())).collect();
+    let names: Vec<Option<String>> = apps
+        .iter()
+        .map(|app| app.localizedName().map(|n| n.to_string()))
+        .collect();
     let candidates: Vec<String> = names.iter().flatten().cloned().collect();
 
     let Some(matched_idx) = best_match(app_name, &candidates) else {
@@ -252,11 +258,17 @@ async fn open_and_verify(
             cmd.arg(path);
         }
     }
-    let output =
-        cmd.output().await.map_err(|e| format!("could not run /usr/bin/open: {e}"))?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run /usr/bin/open: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("open exited with {}: {}", output.status, stderr.trim()));
+        return Err(format!(
+            "open exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
     }
     verify_fronted(expected, timeout_ms).await.ok_or_else(|| {
         format!(
@@ -282,7 +294,10 @@ impl AppFocus for MacosAppFocus {
                 if accepted {
                     if let Some(front) = verify_fronted(&matched, ACTIVATE_VERIFY_MS).await {
                         log::info!("focus_app: activated {front:?}");
-                        return Ok(FocusedApp { app: front, launched: false });
+                        return Ok(FocusedApp {
+                            app: front,
+                            launched: false,
+                        });
                     }
                 }
                 // The OS refused, quietly dropped the request (cooperative
@@ -293,12 +308,14 @@ impl AppFocus for MacosAppFocus {
                     "focus_app: plain activation of {matched:?} did not front it \
                      (accepted={accepted}); retrying via Launch Services reopen"
                 );
-                match open_and_verify(OpenTarget::Name(&matched), &matched, REOPEN_VERIFY_MS)
-                    .await
+                match open_and_verify(OpenTarget::Name(&matched), &matched, REOPEN_VERIFY_MS).await
                 {
                     Ok(front) => {
                         log::info!("focus_app: fronted {front:?} via reopen");
-                        Ok(FocusedApp { app: front, launched: false })
+                        Ok(FocusedApp {
+                            app: front,
+                            launched: false,
+                        })
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };
@@ -312,8 +329,7 @@ impl AppFocus for MacosAppFocus {
                 // launch it. The scan is per-request: installs are rare and a
                 // roster-freshness bug would be worse than the ~ms of readdir.
                 let installed = installed_apps(&installed_app_roots());
-                let names: Vec<String> =
-                    installed.iter().map(|(name, _)| name.clone()).collect();
+                let names: Vec<String> = installed.iter().map(|(name, _)| name.clone()).collect();
                 let Some(idx) = best_match(app_name, &names) else {
                     let err = AppFocusError::NotFound {
                         requested: app_name.to_string(),
@@ -327,7 +343,10 @@ impl AppFocus for MacosAppFocus {
                 match open_and_verify(OpenTarget::Bundle(&path), &name, LAUNCH_VERIFY_MS).await {
                     Ok(front) => {
                         log::info!("focus_app: launched and fronted {front:?}");
-                        Ok(FocusedApp { app: front, launched: true })
+                        Ok(FocusedApp {
+                            app: front,
+                            launched: true,
+                        })
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };
@@ -389,7 +408,11 @@ mod tests {
         let apps = roster();
         assert_eq!(best_match("Firefox", &apps), None);
         assert_eq!(best_match("", &apps), None);
-        assert_eq!(best_match("   ", &apps), None, "blank request matches nothing");
+        assert_eq!(
+            best_match("   ", &apps),
+            None,
+            "blank request matches nothing"
+        );
     }
 
     #[test]
@@ -430,8 +453,8 @@ mod tests {
 
     #[test]
     fn installed_apps_scans_only_app_bundles_and_skips_missing_roots() {
-        let root = std::env::temp_dir()
-            .join(format!("third-eye-appfocus-scan-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("third-eye-appfocus-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("Google Chrome.app")).unwrap();
         std::fs::create_dir_all(root.join("Zed.app")).unwrap();
@@ -499,13 +522,21 @@ mod tests {
     #[ignore = "launches and quits a real app (slice UAT)"]
     async fn real_app_launch_smoke() {
         let backend: Arc<dyn AppFocus> = Arc::new(MacosAppFocus);
-        if backend.running_apps().await.iter().any(|a| a == "Calculator") {
+        if backend
+            .running_apps()
+            .await
+            .iter()
+            .any(|a| a == "Calculator")
+        {
             println!("focus_app launch smoke: Calculator already running — skipping");
             return;
         }
         let focused = backend.focus("Calculator").await.unwrap();
         assert_eq!(focused.app, "Calculator");
-        assert!(focused.launched, "Calculator was not running — this must be a launch");
+        assert!(
+            focused.launched,
+            "Calculator was not running — this must be a launch"
+        );
         // Clean up: quit the app the test started.
         let _ = std::process::Command::new("/usr/bin/osascript")
             .args(["-e", "quit app \"Calculator\""])

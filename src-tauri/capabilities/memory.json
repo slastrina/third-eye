@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "memory",
+  "description": "Memory window: core:default only (event listen + custom-command invokes; show/hide is backend-side via memory_window.rs, settings-window posture).",
+  "windows": [
+    "memory"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

@@ -58,12 +58,19 @@ pub struct FocusedApp {
 /// the same IPC error contract shape as [`crate::screenquery::ScreenQueryError`]
 /// and [`crate::input::InputError`]; consumers match on `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum AppFocusError {
     /// No running *or installed* app matched the requested name. `candidates`
     /// lists the currently running app names so the model can retry against a
     /// real one rather than guess again.
-    NotFound { requested: String, candidates: Vec<String> },
+    NotFound {
+        requested: String,
+        candidates: Vec<String>,
+    },
     /// A matching app was found but never made it to the front — the OS
     /// refused or silently dropped the activation request, the launch failed,
     /// or the app quit between the match and the activate.
@@ -98,7 +105,10 @@ impl AppFocusError {
 impl std::fmt::Display for AppFocusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AppFocusError::NotFound { requested, candidates } => {
+            AppFocusError::NotFound {
+                requested,
+                candidates,
+            } => {
                 write!(
                     f,
                     "app-focus not-found: no running or installed app matched {requested:?} (running: {})",
@@ -158,9 +168,15 @@ mod tests {
                 .running
                 .iter()
                 .find(|a| a.to_lowercase() == needle)
-                .or_else(|| self.running.iter().find(|a| a.to_lowercase().contains(&needle)))
-            {
-                Some(app) => Ok(FocusedApp { app: app.clone(), launched: false }),
+                .or_else(|| {
+                    self.running
+                        .iter()
+                        .find(|a| a.to_lowercase().contains(&needle))
+                }) {
+                Some(app) => Ok(FocusedApp {
+                    app: app.clone(),
+                    launched: false,
+                }),
                 None => Err(AppFocusError::NotFound {
                     requested: app_name.to_string(),
                     candidates: self.running.clone(),
@@ -193,7 +209,10 @@ mod tests {
         let err = backend.focus("Firefox").await.unwrap_err();
         assert_eq!(err.kind(), "not-found");
         match err {
-            AppFocusError::NotFound { requested, candidates } => {
+            AppFocusError::NotFound {
+                requested,
+                candidates,
+            } => {
                 assert_eq!(requested, "Firefox");
                 assert_eq!(candidates, vec!["Zed"]);
             }
@@ -203,7 +222,10 @@ mod tests {
 
     #[test]
     fn focused_json_shape_is_camel_case() {
-        let f = FocusedApp { app: "Google Chrome".into(), launched: true };
+        let f = FocusedApp {
+            app: "Google Chrome".into(),
+            launched: true,
+        };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["app"], "Google Chrome");
         assert_eq!(v["launched"], true);
@@ -223,13 +245,17 @@ mod tests {
         assert_eq!(v["candidates"][0], "Zed");
         assert_eq!(v["candidates"][1], "Finder");
 
-        let activation = AppFocusError::ActivationFailed { detail: "app quit".into() };
+        let activation = AppFocusError::ActivationFailed {
+            detail: "app quit".into(),
+        };
         let v = serde_json::to_value(&activation).unwrap();
         assert_eq!(v["kind"], "activation-failed");
         assert_eq!(v["detail"], "app quit");
 
-        let unsupported =
-            AppFocusError::Unsupported { platform: "linux".into(), detail: "no backend".into() };
+        let unsupported = AppFocusError::Unsupported {
+            platform: "linux".into(),
+            detail: "no backend".into(),
+        };
         let v = serde_json::to_value(&unsupported).unwrap();
         assert_eq!(v["kind"], "unsupported");
         assert_eq!(v["platform"], "linux");
@@ -239,9 +265,17 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            AppFocusError::NotFound { requested: String::new(), candidates: Vec::new() },
-            AppFocusError::ActivationFailed { detail: String::new() },
-            AppFocusError::Unsupported { platform: String::new(), detail: String::new() },
+            AppFocusError::NotFound {
+                requested: String::new(),
+                candidates: Vec::new(),
+            },
+            AppFocusError::ActivationFailed {
+                detail: String::new(),
+            },
+            AppFocusError::Unsupported {
+                platform: String::new(),
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -251,7 +285,9 @@ mod tests {
 
     #[test]
     fn error_display_names_kind_and_detail() {
-        let err = AppFocusError::ActivationFailed { detail: "activate refused".into() };
+        let err = AppFocusError::ActivationFailed {
+            detail: "activate refused".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("activation-failed"), "kind missing: {msg}");
         assert!(msg.contains("activate refused"), "detail missing: {msg}");

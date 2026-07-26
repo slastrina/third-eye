@@ -22,10 +22,12 @@ import {
   onHidStateChanged,
   onModelInfoBroadcast,
   onNudgeState,
+  memoryRetention,
   onPrivacyChanged,
   openInputSettings,
   privacyStatus,
   setHidRunMode,
+  setMemoryRetention,
   setNudgesEnabled,
   type HidRunMode,
   type InputError,
@@ -80,6 +82,9 @@ import {
   type SectionId,
 } from "./settings-nav";
 import { OVERLAY_MIN_HEIGHT, OVERLAY_MIN_WIDTH, type Edge } from "./overlay-geometry";
+import { Toggle } from "./ui/Toggle";
+import { ChoiceChips } from "./ui/Chip";
+import { RETENTION_OPTIONS, type Retention } from "./tour-state";
 import {
   drawerEdgeOf,
   drawerExtentFor,
@@ -257,6 +262,11 @@ function Settings() {
   // toggle response, nudge://state broadcast all land the same shape), so a
   // plain state cell suffices — no transitions to keep pure.
   const [nudges, setNudges] = useState<NudgeStatus | null>(null);
+  // Memory retention (tour Memory step's setting, mirrored here). Optimistic
+  // select, then the backend's effective value folds back — a rejected value
+  // or persist failure lands the truthful state, never a lying chip.
+  const [retention, setRetention] = useState<Retention>("30d");
+  const [retentionError, setRetentionError] = useState<string | null>(null);
   // Guard telemetry is likewise a single authoritative backend snapshot
   // (mount query and privacy://state broadcast land the same shape); all
   // display logic lives in pure privacy-state.ts helpers.
@@ -334,6 +344,10 @@ function Settings() {
     nudgeStatus().then(
       (status) => setNudges(status),
       (err) => console.debug("settings: nudge_status unavailable:", err),
+    );
+    memoryRetention().then(
+      (status) => setRetention(status.retention as Retention),
+      (err) => console.debug("settings: memory_retention unavailable:", err),
     );
     guardStatus().then(
       (telemetry) => setGuard(telemetry),
@@ -487,6 +501,19 @@ function Settings() {
       // and a rolled-back toggle comes back as the authoritative snapshot.
       (status) => dispatchMemory({ type: "chat-memory", status }),
       (err) => console.debug("settings: set_chat_memory_enabled unavailable:", err),
+    );
+  };
+
+  const chooseRetention = (value: Retention) => {
+    setRetention(value);
+    setMemoryRetention(value).then(
+      (status) => {
+        // The backend's effective value wins (rejected value / persist
+        // failure comes back as data — the chips must not lie).
+        setRetention(status.retention as Retention);
+        setRetentionError(status.error);
+      },
+      (err) => console.debug("settings: set_memory_retention unavailable:", err),
     );
   };
 
@@ -979,13 +1006,11 @@ function Settings() {
           </h2>
           <label className="settings-row">
             <span className="settings-row-label">Privacy Mode</span>
-            <input
-              type="checkbox"
-              className="settings-toggle"
-              aria-label="Privacy Mode"
+            <Toggle
+              ariaLabel="Privacy Mode"
               disabled={state.privacy === null}
-              checked={state.privacy?.enabled ?? false}
-              onChange={(event) => togglePrivacy(event.target.checked)}
+              on={state.privacy?.enabled ?? false}
+              onChange={(next) => togglePrivacy(next)}
             />
           </label>
           <p className="settings-hint">
@@ -1151,13 +1176,11 @@ function Settings() {
           </h2>
           <label className="settings-row">
             <span className="settings-row-label">Watch Screen</span>
-            <input
-              type="checkbox"
-              className="settings-toggle"
-              aria-label="Watch Screen"
+            <Toggle
+              ariaLabel="Watch Screen"
               disabled={watcher.status === null}
-              checked={watcher.status?.enabled ?? false}
-              onChange={(event) => toggleWatcher(event.target.checked)}
+              on={watcher.status?.enabled ?? false}
+              onChange={(next) => toggleWatcher(next)}
             />
           </label>
           <p className="settings-hint">
@@ -1298,13 +1321,11 @@ function Settings() {
           </h2>
           <label className="settings-row">
             <span className="settings-row-label">Nudges</span>
-            <input
-              type="checkbox"
-              className="settings-toggle"
-              aria-label="Nudges"
+            <Toggle
+              ariaLabel="Nudges"
               disabled={nudges === null}
-              checked={nudges?.enabled ?? false}
-              onChange={(event) => toggleNudges(event.target.checked)}
+              on={nudges?.enabled ?? false}
+              onChange={(next) => toggleNudges(next)}
             />
           </label>
           <p className="settings-hint">
@@ -1339,13 +1360,11 @@ function Settings() {
           </h2>
           <label className="settings-row">
             <span className="settings-row-label">Use cloud providers</span>
-            <input
-              type="checkbox"
-              className="settings-toggle"
-              aria-label="Use cloud providers"
+            <Toggle
+              ariaLabel="Use cloud providers"
               disabled={cloud.optin === null}
-              checked={cloud.optin?.enabled ?? false}
-              onChange={(event) => toggleCloudOptin(event.target.checked)}
+              on={cloud.optin?.enabled ?? false}
+              onChange={(next) => toggleCloudOptin(next)}
             />
           </label>
           <p className="settings-hint">
@@ -1631,17 +1650,15 @@ function Settings() {
                 </div>
               )}
               <div className="settings-row">
-                <label className="settings-row-label">
-                  <input
-                    type="checkbox"
-                    className="settings-toggle"
-                    aria-label={`Enable ${server.id}`}
+                <span className="settings-row-label">
+                  <Toggle
+                    ariaLabel={`Enable ${server.id}`}
                     data-mcp-server-enabled={server.id}
-                    checked={server.enabled}
-                    onChange={(event) => toggleServerEnabled(server.id, event.target.checked)}
+                    on={server.enabled}
+                    onChange={(next) => toggleServerEnabled(server.id, next)}
                   />
                   Enabled
-                </label>
+                </span>
                 <button
                   type="button"
                   className="memory-delete"
@@ -1773,22 +1790,39 @@ function Settings() {
           </h2>
           <label className="settings-row">
             <span className="settings-row-label">Chat memory</span>
-            <input
-              type="checkbox"
-              className="settings-toggle"
-              aria-label="Chat memory"
+            <Toggle
+              ariaLabel="Chat memory"
               disabled={memory.status === null && memory.chatMemory === null}
-              checked={
+              on={
                 // A set response is fresher than the mount snapshot, so it wins.
                 memory.chatMemory?.enabled ?? memory.status?.chatIngest.enabled ?? false
               }
-              onChange={(event) => toggleChatMemory(event.target.checked)}
+              onChange={(next) => toggleChatMemory(next)}
             />
           </label>
           {memory.chatMemory?.error && (
             <div className="settings-error" role="alert">
               <strong>Chat memory couldn't be saved</strong>
               <span>{memory.chatMemory.error}</span>
+            </div>
+          )}
+          <div className="settings-row settings-row--stack">
+            <span className="settings-row-label">Keep memory for</span>
+            <ChoiceChips
+              label="Keep memory for"
+              options={RETENTION_OPTIONS}
+              value={retention}
+              onChange={chooseRetention}
+            />
+          </div>
+          <p className="settings-hint">
+            Saved now; automatic pruning that enforces the window ships in a
+            later update.
+          </p>
+          {retentionError && (
+            <div className="settings-error" role="alert">
+              <strong>Retention couldn't be saved</strong>
+              <span>{retentionError}</span>
             </div>
           )}
           {memory.status && (

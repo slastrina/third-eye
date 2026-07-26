@@ -18,7 +18,7 @@ test("overlay shell renders with the hidden-state DOM", async ({ page }) => {
 
   const input = page.getByLabel("Overlay input");
   await expect(input).toBeVisible();
-  await expect(input).toHaveAttribute("placeholder", "Third Eye");
+  await expect(input).toHaveAttribute("placeholder", "Ask, act, or recall anything…");
 });
 
 test("drag handle and resize grip render inside the overlay panel", async ({ page }) => {
@@ -85,6 +85,27 @@ test("modal (floating) mode shows the corner grip and no drawer edge handle", as
   const panel = page.locator(".overlay-panel");
   await expect(panel.locator(".overlay-resize-grip")).toHaveCount(1);
   await expect(panel.locator(".overlay-drawer-resize-edge")).toHaveCount(0);
+});
+
+test("a docked drawer's chat transcript flex-fills the panel height", async ({ page }) => {
+  // The floating panel caps .chat-messages at 40vh; a full-height drawer must
+  // NOT inherit that cap — docked to an edge, the leftover vertical space IS
+  // the chat (the "docked right but chat stops two-thirds down" regression).
+  await page.goto("/?edge=right");
+  const input = page.getByLabel("Overlay input");
+  await input.fill("fill the drawer");
+  await input.press("Enter");
+
+  const messages = page.locator(".chat-messages");
+  await expect(messages).toBeVisible();
+  const panelBox = await page.locator(".overlay-panel").boundingBox();
+  const messagesBox = await messages.boundingBox();
+  if (!panelBox || !messagesBox) throw new Error("panel/messages not laid out");
+  // Grew past the floating-mode cap (40vh of the default 720px viewport = 288).
+  expect(messagesBox.height).toBeGreaterThan(0.4 * 720);
+  // And its bottom edge reaches the panel's, minus the panel padding.
+  const gap = panelBox.y + panelBox.height - (messagesBox.y + messagesBox.height);
+  expect(gap).toBeLessThan(40);
 });
 
 test("overlay input accepts keyboard text", async ({ page }) => {

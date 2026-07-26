@@ -48,11 +48,12 @@ impl ScreenQuery for MacosScreenQuery {
         let max_dimension = self.max_dimension;
         // Capture blocks on Swift completion handlers and Vision recognition is
         // CPU-heavy — both stay off the async runtime (OCR precedent).
-        let elements = tokio::task::spawn_blocking(move || extract_elements_blocking(max_dimension))
-            .await
-            .map_err(|e| ScreenQueryError::RecognitionFailed {
-                detail: format!("screen-query task panicked: {e}"),
-            })??;
+        let elements =
+            tokio::task::spawn_blocking(move || extract_elements_blocking(max_dimension))
+                .await
+                .map_err(|e| ScreenQueryError::RecognitionFailed {
+                    detail: format!("screen-query task panicked: {e}"),
+                })??;
         Ok(elements.into_iter().map(ScreenElement::from).collect())
     }
 }
@@ -64,12 +65,25 @@ mod tests {
 
     #[test]
     fn text_element_maps_to_screen_element_verbatim() {
-        let te =
-            TextElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) };
+        let te = TextElement {
+            text: "hi".into(),
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+            app: Some("Zed".into()),
+        };
         let se: ScreenElement = te.into();
         assert_eq!(
             se,
-            ScreenElement { text: "hi".into(), x: 1, y: 2, width: 3, height: 4, app: Some("Zed".into()) }
+            ScreenElement {
+                text: "hi".into(),
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+                app: Some("Zed".into())
+            }
         );
     }
 
@@ -83,7 +97,10 @@ mod tests {
             Arc::new(MacosScreenQuery::new(crate::ocr::OCR_MAX_DIMENSION));
         match backend.query().await {
             Ok(elements) => {
-                println!("screen_query: {} element(s) from the live screen:", elements.len());
+                println!(
+                    "screen_query: {} element(s) from the live screen:",
+                    elements.len()
+                );
                 for el in &elements {
                     println!(
                         "  {:?} @ ({},{}) {}x{} app={:?}",

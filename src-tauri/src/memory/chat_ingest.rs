@@ -99,7 +99,10 @@ fn capture_with_redactor(
     match redact(&composed) {
         Ok(text) => {
             log::debug!("memory: chat exchange captured ({} chars)", text.len());
-            Some(Exchange { text, captured_at_ms: now_ms() })
+            Some(Exchange {
+                text,
+                captured_at_ms: now_ms(),
+            })
         }
         Err(e) => {
             log::warn!(
@@ -169,7 +172,11 @@ pub fn distill_messages(exchange: &Exchange) -> Vec<ChatMessage> {
 /// drop policy).
 pub fn parse_distilled(text: &str) -> Option<String> {
     let first = super::ingest::parse_summaries(text).into_iter().next()?;
-    if first.trim().trim_end_matches('.').eq_ignore_ascii_case(NOTHING_TOKEN) {
+    if first
+        .trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(NOTHING_TOKEN)
+    {
         return None;
     }
     Some(first)
@@ -223,7 +230,7 @@ pub struct ChatIngestState {
     /// setup installs the tray's "noted" flash here (guard-notifier
     /// pattern: macOS tray code stays out of this module, and app-less
     /// test call sites construct the state raw).
-    on_stored: Mutex<Option<Box<dyn Fn(u64) + Send>>>,
+    on_stored: Mutex<Option<super::ingest::StoredHook>>,
     /// Exchanges awaiting distillation, retained across failures for
     /// retry. Bounded at [`QUEUE_CAP`], drop-oldest.
     queue: Mutex<VecDeque<Exchange>>,
@@ -365,12 +372,22 @@ impl ChatIngestState {
 
     #[cfg(test)]
     fn queued_texts(&self) -> Vec<String> {
-        self.queue.lock().unwrap().iter().map(|e| e.text.clone()).collect()
+        self.queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
     }
 
     #[cfg(test)]
     fn session_texts(&self) -> Vec<String> {
-        self.session.lock().unwrap().iter().map(|e| e.text.clone()).collect()
+        self.session
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
     }
 }
 
@@ -473,11 +490,7 @@ pub async fn ingest_exchange(
 /// `lastError` until a success clears it (R006), so the next completed
 /// exchange retries the summary. The stored memory's span covers the
 /// buffered session oldest..newest.
-async fn maybe_session_summary(
-    state: &ChatIngestState,
-    router: &ModelRouter,
-    store: &MemoryStore,
-) {
+async fn maybe_session_summary(state: &ChatIngestState, router: &ModelRouter, store: &MemoryStore) {
     if !state.session_at_threshold() {
         return;
     }
@@ -503,10 +516,14 @@ async fn maybe_session_summary(
     match client.stream_chat(&request, &|_| {}).await {
         Ok(outcome) => match parse_distilled(&outcome.text) {
             Some(summary) => {
-                let span_start_ms =
-                    exchanges.first().map(|e| e.captured_at_ms).unwrap_or_default();
-                let span_end_ms =
-                    exchanges.last().map(|e| e.captured_at_ms).unwrap_or(span_start_ms);
+                let span_start_ms = exchanges
+                    .first()
+                    .map(|e| e.captured_at_ms)
+                    .unwrap_or_default();
+                let span_end_ms = exchanges
+                    .last()
+                    .map(|e| e.captured_at_ms)
+                    .unwrap_or(span_start_ms);
                 let stored = match store.insert(NewMemory {
                     summary,
                     apps: Vec::new(),
@@ -561,7 +578,11 @@ fn record_session_exchange(state: &ChatIngestState, exchange: Exchange) {
     let depth = state.session_push(exchange);
     log::debug!(
         "memory: chat session buffer at {depth}/{SESSION_SUMMARY_THRESHOLD}{}",
-        if state.session_at_threshold() { " (summary threshold reached)" } else { "" }
+        if state.session_at_threshold() {
+            " (summary threshold reached)"
+        } else {
+            ""
+        }
     );
 }
 
@@ -570,14 +591,18 @@ async fn distill_one(
     client: &Arc<dyn LlmClient>,
     exchange: &Exchange,
 ) -> Result<Option<String>, LlmError> {
-    let outcome =
-        client.stream_chat(&ChatRequest::new(distill_messages(exchange)), &|_| {}).await?;
+    let outcome = client
+        .stream_chat(&ChatRequest::new(distill_messages(exchange)), &|_| {})
+        .await?;
     Ok(parse_distilled(&outcome.text))
 }
 
 /// Milliseconds since the Unix epoch — `Exchange.captured_at_ms`.
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -639,16 +664,27 @@ mod tests {
                     detail: "connection refused".into(),
                 });
             }
-            Ok(StreamOutcome { text: self.reply.clone(), token_count: 1, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: self.reply.clone(),
+                token_count: 1,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
     fn thin_router(client: Arc<ScriptedClient>) -> Arc<ModelRouter> {
-        Arc::new(ModelRouter::new(vec![Lane::new(THIN_LANE, Some("thin-test".into()), client)]))
+        Arc::new(ModelRouter::new(vec![Lane::new(
+            THIN_LANE,
+            Some("thin-test".into()),
+            client,
+        )]))
     }
 
     /// One scripted call outcome for [`SequenceClient`].
@@ -668,7 +704,10 @@ mod tests {
 
     impl SequenceClient {
         fn new(script: Vec<Step>) -> Arc<Self> {
-            Arc::new(Self { script, calls: AtomicUsize::new(0) })
+            Arc::new(Self {
+                script,
+                calls: AtomicUsize::new(0),
+            })
         }
 
         fn calls(&self) -> usize {
@@ -688,7 +727,11 @@ mod tests {
             _on_token: TokenSink<'_>,
         ) -> Result<StreamOutcome, LlmError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            let step = self.script.get(call).or(self.script.last()).expect("non-empty script");
+            let step = self
+                .script
+                .get(call)
+                .or(self.script.last())
+                .expect("non-empty script");
             match step {
                 Step::Ok(reply) => Ok(StreamOutcome {
                     text: (*reply).into(),
@@ -703,19 +746,30 @@ mod tests {
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
     fn thin_seq_router(client: Arc<SequenceClient>) -> Arc<ModelRouter> {
-        Arc::new(ModelRouter::new(vec![Lane::new(THIN_LANE, Some("thin-test".into()), client)]))
+        Arc::new(ModelRouter::new(vec![Lane::new(
+            THIN_LANE,
+            Some("thin-test".into()),
+            client,
+        )]))
     }
 
     fn call_event(id: &str, name: &str, arguments: &str) -> ToolEvent {
         ToolEvent::Call(ToolCallEvent {
             request_id: 1,
             round: 0,
-            call: ToolCall { id: id.into(), name: name.into(), arguments: arguments.into() },
+            call: ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            },
         })
     }
 
@@ -733,7 +787,10 @@ mod tests {
     }
 
     fn plain_exchange(text: &str) -> Exchange {
-        Exchange { text: text.into(), captured_at_ms: 1234 }
+        Exchange {
+            text: text.into(),
+            captured_at_ms: 1234,
+        }
     }
 
     // --- capture ---
@@ -748,16 +805,31 @@ mod tests {
             call_event("c3", "key_press", r#"{"key":"return"}"#),
             // c3 has no result: the run was cut short.
         ];
-        let exchange =
-            capture_exchange("search for rust async traits in Chrome", &events, "Done, I searched.")
-                .expect("non-trivial exchange must capture");
+        let exchange = capture_exchange(
+            "search for rust async traits in Chrome",
+            &events,
+            "Done, I searched.",
+        )
+        .expect("non-trivial exchange must capture");
         let text = &exchange.text;
-        assert!(text.contains("search for rust async traits in Chrome"), "{text}");
+        assert!(
+            text.contains("search for rust async traits in Chrome"),
+            "{text}"
+        );
         assert!(text.contains("type_text"), "{text}");
-        assert!(text.contains("rust async traits"), "arguments JSON must ride along: {text}");
+        assert!(
+            text.contains("rust async traits"),
+            "arguments JSON must ride along: {text}"
+        );
         assert!(text.contains("-> ok"), "{text}");
-        assert!(text.contains("failed (input-failed)"), "verified failure outcome: {text}");
-        assert!(text.contains("-> no result"), "cut-short call must not panic: {text}");
+        assert!(
+            text.contains("failed (input-failed)"),
+            "verified failure outcome: {text}"
+        );
+        assert!(
+            text.contains("-> no result"),
+            "cut-short call must not panic: {text}"
+        );
         assert!(text.contains("Done, I searched."), "{text}");
     }
 
@@ -778,7 +850,11 @@ mod tests {
             "I will not store that.",
         )
         .expect("redaction success must capture");
-        assert!(!exchange.text.contains(secret), "raw secret leaked: {}", exchange.text);
+        assert!(
+            !exchange.text.contains(secret),
+            "raw secret leaked: {}",
+            exchange.text
+        );
         assert!(
             exchange.text.contains("[REDACTED:card]"),
             "placeholder missing: {}",
@@ -828,16 +904,29 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, crate::llm::Role::System);
         let system = &messages[0].content;
-        assert!(system.contains("ONE line"), "one-line contract missing: {system}");
-        assert!(system.contains("NOTHING"), "trivial-session escape missing: {system}");
-        assert!(system.contains("ONE conversation"), "session framing missing: {system}");
+        assert!(
+            system.contains("ONE line"),
+            "one-line contract missing: {system}"
+        );
+        assert!(
+            system.contains("NOTHING"),
+            "trivial-session escape missing: {system}"
+        );
+        assert!(
+            system.contains("ONE conversation"),
+            "session framing missing: {system}"
+        );
         let body = &messages[1].content;
         let idx = |label: &str| {
-            body.find(label).unwrap_or_else(|| panic!("label {label} missing: {body}"))
+            body.find(label)
+                .unwrap_or_else(|| panic!("label {label} missing: {body}"))
         };
         assert!(idx("[exchange 1]") < idx("[exchange 2]"), "{body}");
         assert!(idx("[exchange 2]") < idx("[exchange 3]"), "{body}");
-        assert!(idx("[exchange 1]") < idx("whales"), "text must follow its label: {body}");
+        assert!(
+            idx("[exchange 1]") < idx("whales"),
+            "text must follow its label: {body}"
+        );
         assert!(body.contains("rust traits"), "{body}");
         assert!(body.contains("tax forms"), "{body}");
     }
@@ -848,8 +937,9 @@ mod tests {
         // blow the thin model's context — the body stays bounded by
         // threshold * per-exchange cap (plus small per-exchange framing).
         let long = "x".repeat(SESSION_EXCHANGE_MAX_CHARS * 3);
-        let exchanges: Vec<Exchange> =
-            (0..SESSION_SUMMARY_THRESHOLD).map(|_| plain_exchange(&long)).collect();
+        let exchanges: Vec<Exchange> = (0..SESSION_SUMMARY_THRESHOLD)
+            .map(|_| plain_exchange(&long))
+            .collect();
         let messages = compose_session_summary_prompt(&exchanges);
         let body = &messages[1].content;
         let bound = SESSION_SUMMARY_THRESHOLD * (SESSION_EXCHANGE_MAX_CHARS + 32);
@@ -900,12 +990,18 @@ mod tests {
         assert_eq!(v["buffered"], 1);
         assert_eq!(v["ingestedCount"], 0);
         assert_eq!(v["lastError"]["kind"], "offline");
-        assert_eq!(v["enabled"], true, "S03 toggle rides the wire as \"enabled\"");
+        assert_eq!(
+            v["enabled"], true,
+            "S03 toggle rides the wire as \"enabled\""
+        );
 
         state.record_success(2);
         let v = serde_json::to_value(state.status()).unwrap();
         assert_eq!(v["ingestedCount"], 2);
-        assert!(v["lastError"].is_null(), "success must clear the persisted error");
+        assert!(
+            v["lastError"].is_null(),
+            "success must clear the persisted error"
+        );
     }
 
     // --- chat-memory toggle (S03 T01) ---
@@ -944,7 +1040,11 @@ mod tests {
             sink.fetch_add(stored, Ordering::SeqCst);
         });
         state.record_success(0);
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "empty success must not notify");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "empty success must not notify"
+        );
         state.record_success(1);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
@@ -957,7 +1057,10 @@ mod tests {
         for i in 0..QUEUE_CAP {
             assert!(!state.push(plain_exchange(&format!("exchange {i}"))));
         }
-        assert!(state.push(plain_exchange("overflow")), "17th push must drop the oldest");
+        assert!(
+            state.push(plain_exchange("overflow")),
+            "17th push must drop the oldest"
+        );
         let texts = state.queued_texts();
         assert_eq!(texts.len(), QUEUE_CAP);
         assert_eq!(texts.first().unwrap(), "exchange 1", "oldest must be gone");
@@ -970,8 +1073,14 @@ mod tests {
     fn session_buffer_caps_at_threshold_dropping_oldest() {
         let state = ChatIngestState::new();
         for i in 0..SESSION_SUMMARY_THRESHOLD {
-            assert_eq!(state.session_push(plain_exchange(&format!("exchange {i}"))), i + 1);
-            assert_eq!(state.session_at_threshold(), i + 1 == SESSION_SUMMARY_THRESHOLD);
+            assert_eq!(
+                state.session_push(plain_exchange(&format!("exchange {i}"))),
+                i + 1
+            );
+            assert_eq!(
+                state.session_at_threshold(),
+                i + 1 == SESSION_SUMMARY_THRESHOLD
+            );
         }
         assert_eq!(
             state.session_push(plain_exchange("overflow")),
@@ -990,15 +1099,28 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         let client = ScriptedClient::ok("User searched for whales.");
         let router = thin_router(client);
-        ingest_exchange(state.clone(), router.clone(), store.clone(), plain_exchange("stored"))
-            .await;
+        ingest_exchange(
+            state.clone(),
+            router.clone(),
+            store.clone(),
+            plain_exchange("stored"),
+        )
+        .await;
         // A trivial (NOTHING) settle counts toward the session too — the
         // session summary covers the whole conversation, not just the
         // exchanges the per-exchange distiller found memorable.
         let trivial = ScriptedClient::ok("NOTHING");
-        ingest_exchange(state.clone(), thin_router(trivial), store, plain_exchange("trivial"))
-            .await;
-        assert_eq!(state.session_texts(), vec!["stored".to_string(), "trivial".to_string()]);
+        ingest_exchange(
+            state.clone(),
+            thin_router(trivial),
+            store,
+            plain_exchange("trivial"),
+        )
+        .await;
+        assert_eq!(
+            state.session_texts(),
+            vec!["stored".to_string(), "trivial".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1008,10 +1130,22 @@ mod tests {
         let client = ScriptedClient::failing_then(1, "User searched for whales.");
         let router = thin_router(client);
 
-        ingest_exchange(state.clone(), router.clone(), store.clone(), plain_exchange("first"))
-            .await;
-        assert_eq!(state.status().buffered, 1, "retry queue retains the failed exchange");
-        assert!(state.session_texts().is_empty(), "a retained failure must not enter the session");
+        ingest_exchange(
+            state.clone(),
+            router.clone(),
+            store.clone(),
+            plain_exchange("first"),
+        )
+        .await;
+        assert_eq!(
+            state.status().buffered,
+            1,
+            "retry queue retains the failed exchange"
+        );
+        assert!(
+            state.session_texts().is_empty(),
+            "a retained failure must not enter the session"
+        );
 
         ingest_exchange(state.clone(), router, store, plain_exchange("second")).await;
         assert_eq!(
@@ -1024,7 +1158,10 @@ mod tests {
     // --- session summary dispatch (S02 T03) ---
 
     fn stamped_exchange(text: &str, ms: i64) -> Exchange {
-        Exchange { text: text.into(), captured_at_ms: ms }
+        Exchange {
+            text: text.into(),
+            captured_at_ms: ms,
+        }
     }
 
     const EXCHANGE_NOTE: &str = "User did one thing.";
@@ -1034,8 +1171,9 @@ mod tests {
     async fn session_summary_fires_once_at_threshold_and_resets() {
         // Script: 5 per-exchange distills, then the session summary with a
         // distinct reply, then the 6th exchange's distill.
-        let mut script: Vec<Step> =
-            (0..SESSION_SUMMARY_THRESHOLD).map(|_| Step::Ok(EXCHANGE_NOTE)).collect();
+        let mut script: Vec<Step> = (0..SESSION_SUMMARY_THRESHOLD)
+            .map(|_| Step::Ok(EXCHANGE_NOTE))
+            .collect();
         script.push(Step::Ok(SESSION_NOTE));
         script.push(Step::Ok(EXCHANGE_NOTE));
         let client = SequenceClient::new(script);
@@ -1062,7 +1200,10 @@ mod tests {
             SESSION_SUMMARY_THRESHOLD + 1,
             "exactly one summary call at the Nth exchange"
         );
-        assert!(state.session_texts().is_empty(), "stored summary must reset the session buffer");
+        assert!(
+            state.session_texts().is_empty(),
+            "stored summary must reset the session buffer"
+        );
         assert_eq!(store.count().unwrap(), SESSION_SUMMARY_THRESHOLD + 1);
         let summary = store
             .list(50, 0)
@@ -1071,8 +1212,14 @@ mod tests {
             .find(|r| r.summary == SESSION_NOTE)
             .expect("session summary memory stored");
         assert_eq!(summary.source, MemorySource::Chat);
-        assert_eq!(summary.span_start_ms, 1, "span covers the oldest buffered exchange");
-        assert_eq!(summary.span_end_ms, SESSION_SUMMARY_THRESHOLD as i64, "…to the newest");
+        assert_eq!(
+            summary.span_start_ms, 1,
+            "span covers the oldest buffered exchange"
+        );
+        assert_eq!(
+            summary.span_end_ms, SESSION_SUMMARY_THRESHOLD as i64,
+            "…to the newest"
+        );
         let status = state.status();
         assert_eq!(
             status.ingested_count,
@@ -1112,20 +1259,35 @@ mod tests {
             )
             .await;
         }
-        assert_eq!(client.calls(), SESSION_SUMMARY_THRESHOLD + 1, "summary was attempted");
-        assert_eq!(store.count().unwrap(), 0, "all-NOTHING session stores nothing");
-        assert!(state.session_texts().is_empty(), "trivial summary still resets the window");
+        assert_eq!(
+            client.calls(),
+            SESSION_SUMMARY_THRESHOLD + 1,
+            "summary was attempted"
+        );
+        assert_eq!(
+            store.count().unwrap(),
+            0,
+            "all-NOTHING session stores nothing"
+        );
+        assert!(
+            state.session_texts().is_empty(),
+            "trivial summary still resets the window"
+        );
         let status = state.status();
         assert_eq!(status.ingested_count, 0);
-        assert!(status.last_error.is_none(), "NOTHING summary is success, not failure");
+        assert!(
+            status.last_error.is_none(),
+            "NOTHING summary is success, not failure"
+        );
     }
 
     #[tokio::test]
     async fn session_summary_failure_retains_buffer_and_next_exchange_retries() {
         // Script: 5 per-exchange ok, summary FAILS, 6th exchange ok, summary
         // retry succeeds.
-        let mut script: Vec<Step> =
-            (0..SESSION_SUMMARY_THRESHOLD).map(|_| Step::Ok(EXCHANGE_NOTE)).collect();
+        let mut script: Vec<Step> = (0..SESSION_SUMMARY_THRESHOLD)
+            .map(|_| Step::Ok(EXCHANGE_NOTE))
+            .collect();
         script.push(Step::Fail);
         script.push(Step::Ok(EXCHANGE_NOTE));
         script.push(Step::Ok(SESSION_NOTE));
@@ -1154,20 +1316,39 @@ mod tests {
             Some("offline"),
             "summary failure persists on lastError like per-exchange ones"
         );
-        assert_eq!(store.count().unwrap(), SESSION_SUMMARY_THRESHOLD as usize);
+        assert_eq!(store.count().unwrap(), SESSION_SUMMARY_THRESHOLD);
 
         // Next exchange settles (drop-oldest keeps depth at threshold) and
         // the summary retries and succeeds.
-        ingest_exchange(state.clone(), router, store.clone(), plain_exchange("retry")).await;
+        ingest_exchange(
+            state.clone(),
+            router,
+            store.clone(),
+            plain_exchange("retry"),
+        )
+        .await;
         assert_eq!(client.calls(), SESSION_SUMMARY_THRESHOLD + 3);
-        assert!(state.session_texts().is_empty(), "successful retry clears the buffer");
         assert!(
-            store.list(50, 0).unwrap().iter().any(|r| r.summary == SESSION_NOTE),
+            state.session_texts().is_empty(),
+            "successful retry clears the buffer"
+        );
+        assert!(
+            store
+                .list(50, 0)
+                .unwrap()
+                .iter()
+                .any(|r| r.summary == SESSION_NOTE),
             "retried summary stored"
         );
         let status = state.status();
-        assert!(status.last_error.is_none(), "summary success clears the persisted error");
-        assert_eq!(status.ingested_count, (SESSION_SUMMARY_THRESHOLD + 2) as u64);
+        assert!(
+            status.last_error.is_none(),
+            "summary success clears the persisted error"
+        );
+        assert_eq!(
+            status.ingested_count,
+            (SESSION_SUMMARY_THRESHOLD + 2) as u64
+        );
     }
 
     // --- ingest end-to-end (mock lane, real store) ---
@@ -1179,9 +1360,18 @@ mod tests {
         let client = ScriptedClient::ok(
             "User searched for rust async traits in Chrome.\nUser also opened a tab.\nExtra.",
         );
-        ingest_exchange(state.clone(), thin_router(client), store.clone(), plain_exchange("x"))
-            .await;
-        assert_eq!(store.count().unwrap(), 1, "one exchange → at most one memory");
+        ingest_exchange(
+            state.clone(),
+            thin_router(client),
+            store.clone(),
+            plain_exchange("x"),
+        )
+        .await;
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "one exchange → at most one memory"
+        );
         assert_eq!(
             store.list(10, 0).unwrap()[0].summary,
             "User searched for rust async traits in Chrome."
@@ -1197,7 +1387,10 @@ mod tests {
         let state = Arc::new(ChatIngestState::new());
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         let client = ScriptedClient::ok("User searched for whales.");
-        let exchange = Exchange { text: "x".into(), captured_at_ms: 777 };
+        let exchange = Exchange {
+            text: "x".into(),
+            captured_at_ms: 777,
+        };
         ingest_exchange(state, thin_router(client), store.clone(), exchange).await;
         let record = store.list(10, 0).unwrap().remove(0);
         assert_eq!(record.source, MemorySource::Chat);
@@ -1217,13 +1410,21 @@ mod tests {
             sink.fetch_add(n, Ordering::SeqCst);
         });
         let client = ScriptedClient::ok("NOTHING");
-        ingest_exchange(state.clone(), thin_router(client), store.clone(), plain_exchange("hi"))
-            .await;
+        ingest_exchange(
+            state.clone(),
+            thin_router(client),
+            store.clone(),
+            plain_exchange("hi"),
+        )
+        .await;
         assert_eq!(store.count().unwrap(), 0);
         let status = state.status();
         assert_eq!(status.buffered, 0, "trivial exchange dropped, not retained");
         assert_eq!(status.ingested_count, 0);
-        assert!(status.last_error.is_none(), "NOTHING is success, not failure");
+        assert!(
+            status.last_error.is_none(),
+            "NOTHING is success, not failure"
+        );
         assert_eq!(notified.load(Ordering::SeqCst), 0, "no note, no flash");
     }
 
@@ -1234,8 +1435,13 @@ mod tests {
         let client = ScriptedClient::failing_then(1, "User searched for whales in Chrome.");
         let router = thin_router(client.clone());
 
-        ingest_exchange(state.clone(), router.clone(), store.clone(), plain_exchange("first"))
-            .await;
+        ingest_exchange(
+            state.clone(),
+            router.clone(),
+            store.clone(),
+            plain_exchange("first"),
+        )
+        .await;
         assert_eq!(store.count().unwrap(), 0, "nothing stored on failure");
         let status = state.status();
         assert_eq!(status.buffered, 1, "exchange retained for retry");
@@ -1245,13 +1451,26 @@ mod tests {
             "typed error must be queryable until a success clears it"
         );
 
-        ingest_exchange(state.clone(), router, store.clone(), plain_exchange("second")).await;
-        assert_eq!(client.calls(), 3, "one failure, then both queued exchanges distilled");
+        ingest_exchange(
+            state.clone(),
+            router,
+            store.clone(),
+            plain_exchange("second"),
+        )
+        .await;
+        assert_eq!(
+            client.calls(),
+            3,
+            "one failure, then both queued exchanges distilled"
+        );
         assert_eq!(store.count().unwrap(), 2, "retained + new both stored");
         let status = state.status();
         assert_eq!(status.buffered, 0);
         assert_eq!(status.ingested_count, 2);
-        assert!(status.last_error.is_none(), "success must clear the persisted error");
+        assert!(
+            status.last_error.is_none(),
+            "success must clear the persisted error"
+        );
     }
 
     #[tokio::test]
@@ -1271,7 +1490,10 @@ mod tests {
         ingest_exchange(state, thin_router(client.clone()), store, exchange).await;
         let sent = client.last_messages.lock().unwrap().clone();
         assert_eq!(sent.len(), 2);
-        assert!(!sent[1].content.contains(secret), "secret reached the distiller");
+        assert!(
+            !sent[1].content.contains(secret),
+            "secret reached the distiller"
+        );
         assert!(sent[1].content.contains("[REDACTED:card]"));
     }
 
@@ -1288,7 +1510,11 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         ingest_exchange(state, router, store.clone(), plain_exchange("x")).await;
         assert_eq!(thin.calls(), 1, "chat distillation must ride the thin lane");
-        assert_eq!(heavy.calls(), 0, "the user's active lane must never see ingest traffic");
+        assert_eq!(
+            heavy.calls(),
+            0,
+            "the user's active lane must never see ingest traffic"
+        );
         assert_eq!(store.count().unwrap(), 1);
     }
 }

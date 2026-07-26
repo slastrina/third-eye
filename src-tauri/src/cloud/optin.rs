@@ -53,7 +53,10 @@ pub struct CloudOptIn {
 
 impl Default for CloudOptIn {
     fn default() -> Self {
-        Self { enabled: AtomicBool::new(false), persist_error: Mutex::new(None) }
+        Self {
+            enabled: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+        }
     }
 }
 
@@ -85,7 +88,10 @@ impl CloudOptIn {
 
     /// Current opt-in state as health-as-value — never an error, safe to poll.
     pub fn status(&self) -> CloudOptInStatus {
-        CloudOptInStatus { enabled: self.enabled(), persist_error: self.persist_error() }
+        CloudOptInStatus {
+            enabled: self.enabled(),
+            persist_error: self.persist_error(),
+        }
     }
 }
 
@@ -249,8 +255,12 @@ pub fn apply_cloud_heavy_provider(
 /// are logged inside `config`, never fatal.
 pub fn apply_persisted_cloud_heavy_provider(app: &AppHandle) {
     if let Some(provider) = crate::config::load_cloud_heavy_provider(app) {
-        app.state::<CloudHeavyProvider>().set_provider(Some(provider));
-        log::info!("cloud: applied persisted heavy provider ({})", provider.account());
+        app.state::<CloudHeavyProvider>()
+            .set_provider(Some(provider));
+        log::info!(
+            "cloud: applied persisted heavy provider ({})",
+            provider.account()
+        );
     }
 }
 
@@ -328,14 +338,25 @@ mod tests {
         let status = CloudOptIn::new().status();
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["enabled"], false);
-        assert!(v["persistError"].is_null(), "absent persist error must be JSON null");
+        assert!(
+            v["persistError"].is_null(),
+            "absent persist error must be JSON null"
+        );
     }
 
     #[test]
     fn heavy_provider_defaults_unselected_and_toggles_returning_previous() {
         let hp = CloudHeavyProvider::new();
-        assert_eq!(hp.provider(), None, "heavy provider must default to unselected");
-        assert_eq!(hp.set_provider(Some(CloudProvider::Openai)), None, "previous was none");
+        assert_eq!(
+            hp.provider(),
+            None,
+            "heavy provider must default to unselected"
+        );
+        assert_eq!(
+            hp.set_provider(Some(CloudProvider::Openai)),
+            None,
+            "previous was none"
+        );
         assert_eq!(hp.provider(), Some(CloudProvider::Openai));
         assert_eq!(
             hp.set_provider(Some(CloudProvider::Anthropic)),
@@ -361,7 +382,13 @@ mod tests {
         hp.set_provider(None);
         hp.record_persist_error(Some("failed to persist cloudHeavyProvider".into()));
         let v = serde_json::to_value(hp.status()).unwrap();
-        assert!(v["provider"].is_null(), "unselected provider must be JSON null");
-        assert!(v["persistError"].as_str().unwrap().contains("cloudHeavyProvider"));
+        assert!(
+            v["provider"].is_null(),
+            "unselected provider must be JSON null"
+        );
+        assert!(v["persistError"]
+            .as_str()
+            .unwrap()
+            .contains("cloudHeavyProvider"));
     }
 }

@@ -1,0 +1,141 @@
+/* Third Eye design tokens — extracted from the Claude Design prototype
+ * (specs/2026-07-26-redesign-and-first-start-tour.md, "Design system").
+ * Every src/ui component styles itself exclusively from these variables;
+ * literal colors outside this file are a review error (phase H greps for
+ * them). Font is the system stack by decision — no bundled fonts. */
+
+:root {
+  /* Type */
+  --te-font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --te-font-mono: ui-monospace, Menlo, monospace;
+
+  /* Navy surfaces (dark chrome: palette, tray panel, memory, settings, HUD) */
+  --te-navy-deep: #040c22;
+  --te-navy: #071d49;
+  --te-navy-panel: #0b2050;
+  --te-navy-raised: #0f2c66;
+  --te-glass: rgba(12, 31, 74, 0.94);
+  --te-glass-heavy: rgba(11, 29, 68, 0.96);
+  --te-desktop-gradient: linear-gradient(140deg, #040c22 0%, #071d49 48%, #0f2c66 100%);
+
+  /* Accent — the eye's green */
+  --te-green: #93da49;
+  --te-green-hover: #a7e465;
+  --te-green-deep: #6bb22e;
+  --te-green-ink: #4e8f1e; /* green-tinted text on light surfaces */
+  --te-green-glow: rgba(147, 218, 73, 0.14);
+  --te-green-border: rgba(147, 218, 73, 0.35);
+
+  /* Acting — amber while Third Eye holds input */
+  --te-amber: #e9a23b;
+  --te-amber-border: rgba(233, 162, 59, 0.45);
+  --te-amber-glow: rgba(233, 162, 59, 0.22);
+
+  /* Danger / stop */
+  --te-red: #e85c5c;
+  --te-red-soft: #ff9d9d;
+  --te-red-glow: rgba(232, 92, 92, 0.15);
+  --te-red-border: rgba(232, 92, 92, 0.45);
+
+  /* Text on dark surfaces (opacity ladder from the design) */
+  --te-text: rgba(255, 255, 255, 0.92);
+  --te-text-strong: #ffffff;
+  --te-text-mid: rgba(255, 255, 255, 0.65);
+  --te-text-dim: rgba(255, 255, 255, 0.55);
+  --te-text-faint: rgba(255, 255, 255, 0.45);
+  --te-text-ghost: rgba(255, 255, 255, 0.4);
+
+  /* Hairlines and fills on dark surfaces */
+  --te-line: rgba(255, 255, 255, 0.07);
+  --te-line-strong: rgba(255, 255, 255, 0.14);
+  --te-fill-hover: rgba(255, 255, 255, 0.08);
+  --te-fill-input: rgba(255, 255, 255, 0.07);
+
+  /* Light surface (tour card, dialogs) */
+  --te-light-surface: #ffffff;
+  --te-light-bg: #f7f8fa;
+  --te-light-ink: #071d49;
+  --te-light-body: #2a3242;
+  --te-light-muted: #5b6474;
+  --te-light-faint: #8a93a3;
+  --te-light-line: #e3e6ec;
+  --te-light-line-strong: #c9cfda;
+
+  /* Radii */
+  --te-r-sm: 8px;
+  --te-r-md: 10px;
+  --te-r-lg: 12px;
+  --te-r-xl: 14px;
+  --te-r-2xl: 16px;
+  --te-r-pill: 99px;
+
+  /* Elevation */
+  --te-shadow-panel: 0 26px 70px rgba(2, 8, 24, 0.65);
+  --te-shadow-modal: 0 40px 100px rgba(2, 8, 24, 0.7);
+  --te-shadow-card-light: 0 40px 120px rgba(0, 0, 0, 0.5);
+  --te-blur: blur(18px);
+
+  /* Motion */
+  --te-glide: cubic-bezier(0.3, 0.7, 0.3, 1);
+}
+
+/* Shared keyframes (prototype parity). Component CSS references these by
+ * name; they live here so every window that imports tokens gets them. */
+@keyframes te-scan {
+  0%,
+  100% {
+    transform: translateX(-3px);
+  }
+  50% {
+    transform: translateX(3px);
+  }
+}
+@keyframes te-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes te-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes te-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes te-ripple {
+  from {
+    transform: scale(0.4);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+@keyframes te-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--te-amber-glow);
+  }
+  70% {
+    box-shadow: 0 0 0 9px rgba(233, 162, 59, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(233, 162, 59, 0);
+  }
+}

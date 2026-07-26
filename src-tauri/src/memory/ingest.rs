@@ -65,8 +65,12 @@ pub struct IngestState {
     /// visible in the menu bar. Purely cosmetic side-channel: absent in the
     /// unit/live-test loops (which construct [`IngestState`] raw), and its
     /// absence changes nothing about ingestion.
-    on_stored: Mutex<Option<Box<dyn Fn(u64) + Send>>>,
+    on_stored: Mutex<Option<StoredHook>>,
 }
+
+/// The installed on-stored notifier (see the field docs above). Shared with
+/// chat_ingest, whose state carries the same cosmetic side-channel.
+pub(crate) type StoredHook = Box<dyn Fn(u64) + Send>;
 
 impl Default for IngestState {
     fn default() -> Self {
@@ -154,14 +158,9 @@ pub enum PushOutcome {
 /// Dedup-on-entry, bounded, drop-oldest observation buffer. Pure and
 /// synchronous so the dedupe and bounding behavior is unit-testable without
 /// a runtime.
+#[derive(Default)]
 pub struct IngestBuffer {
     items: VecDeque<TextObservation>,
-}
-
-impl Default for IngestBuffer {
-    fn default() -> Self {
-        Self { items: VecDeque::new() }
-    }
 }
 
 impl IngestBuffer {
@@ -269,8 +268,9 @@ fn strip_list_marker(line: &str) -> &str {
     let l = line.trim().trim_start_matches(['-', '*', '•']).trim_start();
     let digits = l.chars().take_while(char::is_ascii_digit).count();
     if digits > 0 {
-        if let Some(rest) =
-            l[digits..].strip_prefix('.').or_else(|| l[digits..].strip_prefix(')'))
+        if let Some(rest) = l[digits..]
+            .strip_prefix('.')
+            .or_else(|| l[digits..].strip_prefix(')'))
         {
             return rest.trim();
         }
@@ -321,7 +321,10 @@ pub fn spawn(app: &tauri::AppHandle) {
     let store = match MemoryStore::open(&path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            log::error!("memory: store open failed ({}); ingestion disabled: {e}", e.kind());
+            log::error!(
+                "memory: store open failed ({}); ingestion disabled: {e}",
+                e.kind()
+            );
             return;
         }
     };
@@ -420,7 +423,10 @@ async fn distill_and_store(
         batch.len()
     );
     let messages = distill_messages(&batch);
-    match client.stream_chat(&ChatRequest::new(messages), &|_| {}).await {
+    match client
+        .stream_chat(&ChatRequest::new(messages), &|_| {})
+        .await
+    {
         Ok(outcome) => {
             let summaries = parse_summaries(&outcome.text);
             if summaries.is_empty() {
@@ -464,7 +470,10 @@ async fn distill_and_store(
 
 /// Milliseconds since the Unix epoch — `IngestStatus.last_distill_at_ms`.
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -484,7 +493,11 @@ mod tests {
             sink.fetch_add(stored, Ordering::SeqCst);
         });
         ingest.record_success(0, 1);
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "empty success must not notify");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "empty success must not notify"
+        );
         ingest.record_success(3, 2);
         assert_eq!(seen.load(Ordering::SeqCst), 3);
         // The health surface counted both successes regardless.
@@ -561,11 +574,18 @@ mod tests {
                     detail: "connection refused".into(),
                 });
             }
-            Ok(StreamOutcome { text: self.reply.clone(), token_count: 1, tool_calls: Vec::new() })
+            Ok(StreamOutcome {
+                text: self.reply.clone(),
+                token_count: 1,
+                tool_calls: Vec::new(),
+            })
         }
 
         async fn health(&self) -> LlmHealth {
-            LlmHealth { online: true, endpoint: self.endpoint().into() }
+            LlmHealth {
+                online: true,
+                endpoint: self.endpoint().into(),
+            }
         }
     }
 
@@ -581,9 +601,15 @@ mod tests {
 
     #[test]
     fn identical_and_reordered_texts_are_near_duplicates() {
-        assert!(is_near_duplicate("editing ingest.rs in zed", "editing ingest.rs in zed"));
+        assert!(is_near_duplicate(
+            "editing ingest.rs in zed",
+            "editing ingest.rs in zed"
+        ));
         // Word-set comparison: order does not matter.
-        assert!(is_near_duplicate("editing ingest.rs in zed", "in zed editing ingest.rs"));
+        assert!(is_near_duplicate(
+            "editing ingest.rs in zed",
+            "in zed editing ingest.rs"
+        ));
     }
 
     #[test]
@@ -600,7 +626,10 @@ mod tests {
     #[test]
     fn different_screens_are_not_near_duplicates() {
         assert!(!is_near_duplicate(&distinct_text(1), &distinct_text(2)));
-        assert!(!is_near_duplicate("rust compiler output", "browser article about whales"));
+        assert!(!is_near_duplicate(
+            "rust compiler output",
+            "browser article about whales"
+        ));
     }
 
     #[test]
@@ -617,10 +646,22 @@ mod tests {
     #[test]
     fn buffer_accepts_distinct_skips_duplicates_and_empties() {
         let mut buf = IngestBuffer::new();
-        assert_eq!(buf.push(obs(&distinct_text(0), None, 1)), PushOutcome::Accepted);
-        assert_eq!(buf.push(obs(&distinct_text(0), None, 2)), PushOutcome::SkippedDuplicate);
-        assert_eq!(buf.push(obs("   \n\t ", None, 3)), PushOutcome::SkippedEmpty);
-        assert_eq!(buf.push(obs(&distinct_text(1), None, 4)), PushOutcome::Accepted);
+        assert_eq!(
+            buf.push(obs(&distinct_text(0), None, 1)),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            buf.push(obs(&distinct_text(0), None, 2)),
+            PushOutcome::SkippedDuplicate
+        );
+        assert_eq!(
+            buf.push(obs("   \n\t ", None, 3)),
+            PushOutcome::SkippedEmpty
+        );
+        assert_eq!(
+            buf.push(obs(&distinct_text(1), None, 4)),
+            PushOutcome::Accepted
+        );
         assert_eq!(buf.len(), 2);
     }
 
@@ -628,7 +669,10 @@ mod tests {
     fn buffer_drops_oldest_at_cap() {
         let mut buf = IngestBuffer::new();
         for i in 0..BUFFER_CAP {
-            assert_eq!(buf.push(obs(&distinct_text(i), None, i as u64)), PushOutcome::Accepted);
+            assert_eq!(
+                buf.push(obs(&distinct_text(i), None, i as u64)),
+                PushOutcome::Accepted
+            );
         }
         assert_eq!(
             buf.push(obs(&distinct_text(BUFFER_CAP), None, BUFFER_CAP as u64)),
@@ -636,7 +680,11 @@ mod tests {
         );
         assert_eq!(buf.len(), BUFFER_CAP);
         let snapshot = buf.snapshot();
-        assert_eq!(snapshot.first().unwrap().text, distinct_text(1), "oldest must be gone");
+        assert_eq!(
+            snapshot.first().unwrap().text,
+            distinct_text(1),
+            "oldest must be gone"
+        );
         assert_eq!(snapshot.last().unwrap().text, distinct_text(BUFFER_CAP));
     }
 
@@ -656,8 +704,7 @@ mod tests {
     #[test]
     fn distill_messages_label_apps_and_truncate_long_text() {
         let long = "x".repeat(SNIPPET_MAX_CHARS * 2);
-        let batch =
-            vec![obs("short text", Some("Zed"), 1), obs(&long, None, 2)];
+        let batch = vec![obs("short text", Some("Zed"), 1), obs(&long, None, 2)];
         let messages = distill_messages(&batch);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, crate::llm::Role::System);
@@ -692,7 +739,10 @@ mod tests {
     #[test]
     fn parse_summaries_keeps_plain_lines_and_drops_blanks() {
         let summaries = parse_summaries("\nFirst summary line.\n\n   \nSecond summary line.\n");
-        assert_eq!(summaries, vec!["First summary line.", "Second summary line."]);
+        assert_eq!(
+            summaries,
+            vec!["First summary line.", "Second summary line."]
+        );
     }
 
     #[test]
@@ -717,7 +767,11 @@ mod tests {
         for row in &rows {
             assert_eq!(row.span_start_ms, 100);
             assert_eq!(row.span_end_ms, 300);
-            assert_eq!(row.apps, vec!["Zed", "Safari"], "apps deduped, order preserved");
+            assert_eq!(
+                row.apps,
+                vec!["Zed", "Safari"],
+                "apps deduped, order preserved"
+            );
             assert_eq!(row.embedding, None, "embeddings backfill lazily (T02)");
         }
         assert_eq!(rows[0].summary, "One.");
@@ -746,7 +800,10 @@ mod tests {
         let v = serde_json::to_value(state.status()).unwrap();
         assert_eq!(v["distilledCount"], 2);
         assert_eq!(v["lastDistillAtMs"], 1234);
-        assert!(v["lastError"].is_null(), "success must clear the persisted error");
+        assert!(
+            v["lastError"].is_null(),
+            "success must clear the persisted error"
+        );
     }
 
     // --- loop end-to-end (mock lane, real store) ---
@@ -760,8 +817,12 @@ mod tests {
         let client = ScriptedClient::ok(
             "User debugged the ingest pipeline in Rust.\nUser read tokio broadcast docs.",
         );
-        let task =
-            tokio::spawn(run_loop(rx, store.clone(), ingest.clone(), thin_router(client.clone())));
+        let task = tokio::spawn(run_loop(
+            rx,
+            store.clone(),
+            ingest.clone(),
+            thin_router(client.clone()),
+        ));
 
         for i in 0..BATCH_SIZE {
             watcher.publish(obs(&distinct_text(i), Some("Zed"), 1000 + i as u64));
@@ -789,8 +850,12 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         let ingest = Arc::new(IngestState::new());
         let client = ScriptedClient::failing_then(usize::MAX, "never");
-        let task =
-            tokio::spawn(run_loop(rx, store.clone(), ingest.clone(), thin_router(client.clone())));
+        let task = tokio::spawn(run_loop(
+            rx,
+            store.clone(),
+            ingest.clone(),
+            thin_router(client.clone()),
+        ));
 
         for i in 0..BATCH_SIZE {
             watcher.publish(obs(&distinct_text(i), None, i as u64));
@@ -817,8 +882,12 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         let ingest = Arc::new(IngestState::new());
         let client = ScriptedClient::failing_then(1, "User recovered from an LM Studio outage.");
-        let task =
-            tokio::spawn(run_loop(rx, store.clone(), ingest.clone(), thin_router(client.clone())));
+        let task = tokio::spawn(run_loop(
+            rx,
+            store.clone(),
+            ingest.clone(),
+            thin_router(client.clone()),
+        ));
 
         // Batch fills → first distillation fails; the next accepted
         // observation retries over the retained (now larger) buffer.
@@ -833,7 +902,10 @@ mod tests {
         let status = ingest.status();
         assert_eq!(status.buffered, 0);
         assert_eq!(status.distilled_count, 1);
-        assert!(status.last_error.is_none(), "success must clear the persisted error");
+        assert!(
+            status.last_error.is_none(),
+            "success must clear the persisted error"
+        );
         // The retry batch covered the retained observations, not just the new one.
         let sent = client.last_messages.lock().unwrap().clone();
         assert!(sent[1].content.contains(&distinct_text(0)));
@@ -862,7 +934,11 @@ mod tests {
         task.await.unwrap();
 
         assert_eq!(thin.calls(), 1, "distillation must ride the thin lane");
-        assert_eq!(heavy.calls(), 0, "the user's active lane must never see ingest traffic");
+        assert_eq!(
+            heavy.calls(),
+            0,
+            "the user's active lane must never see ingest traffic"
+        );
         assert_eq!(store.count().unwrap(), 1);
     }
 
@@ -876,8 +952,12 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory().unwrap());
         let ingest = Arc::new(IngestState::new());
         let client = ScriptedClient::ok("   \n  ");
-        let task =
-            tokio::spawn(run_loop(rx, store.clone(), ingest.clone(), thin_router(client.clone())));
+        let task = tokio::spawn(run_loop(
+            rx,
+            store.clone(),
+            ingest.clone(),
+            thin_router(client.clone()),
+        ));
         for i in 0..BATCH_SIZE {
             watcher.publish(obs(&distinct_text(i), None, i as u64));
         }

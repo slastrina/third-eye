@@ -34,7 +34,11 @@ use serde::{Deserialize, Serialize};
 /// enum keeps the composite executor's dispatch-by-name simple and the model's
 /// tool list short.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "action",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum InputAction {
     /// Move the mouse cursor to an absolute screen coordinate.
     MouseMove { x: i32, y: i32 },
@@ -87,14 +91,22 @@ impl InputAction {
     /// [`InputAction::MouseClick`]. Keeps construction terse at call sites that
     /// don't aim (tests, the coordless fallback path).
     pub fn click(button: MouseButton) -> Self {
-        InputAction::MouseClick { button, x: None, y: None }
+        InputAction::MouseClick {
+            button,
+            x: None,
+            y: None,
+        }
     }
 
     /// A click that moves to `(x, y)` first — the coordinate-bearing
     /// [`InputAction::MouseClick`], the shape the model emits when it aims a
     /// click at a `screen_query` coordinate.
     pub fn click_at(button: MouseButton, x: i32, y: i32) -> Self {
-        InputAction::MouseClick { button, x: Some(x), y: Some(y) }
+        InputAction::MouseClick {
+            button,
+            x: Some(x),
+            y: Some(y),
+        }
     }
 
     /// The target coordinate a `mouse-move` or coordinate-bearing `mouse-click`
@@ -104,7 +116,11 @@ impl InputAction {
     pub fn aim_target(&self) -> Option<(i32, i32)> {
         match self {
             InputAction::MouseMove { x, y } => Some((*x, *y)),
-            InputAction::MouseClick { x: Some(x), y: Some(y), .. } => Some((*x, *y)),
+            InputAction::MouseClick {
+                x: Some(x),
+                y: Some(y),
+                ..
+            } => Some((*x, *y)),
             _ => None,
         }
     }
@@ -159,7 +175,11 @@ pub enum MouseButton {
 /// camelCase fields — the same IPC error contract shape as
 /// [`crate::capture::CaptureError`]; the UI matches on `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum InputError {
     /// HID is disarmed: the Settings arming toggle is off, so no input is
     /// synthesized. This is the structural-inertness refusal (D038): a
@@ -217,7 +237,10 @@ impl std::fmt::Display for InputError {
                 write!(f, "input disabled: {detail}")
             }
             InputError::PermissionDenied { detail } => {
-                write!(f, "input permission-denied: Accessibility not granted ({detail})")
+                write!(
+                    f,
+                    "input permission-denied: Accessibility not granted ({detail})"
+                )
             }
             InputError::Unsupported { platform, detail } => {
                 write!(f, "input unsupported on {platform}: {detail}")
@@ -374,7 +397,10 @@ impl InputControl for KeyboardFocusYield {
     }
 
     async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
-        if matches!(action, InputAction::TypeText { .. } | InputAction::KeyPress { .. }) {
+        if matches!(
+            action,
+            InputAction::TypeText { .. } | InputAction::KeyPress { .. }
+        ) {
             let yield_focus = self.yield_focus.clone();
             // The hook blocks on a main-thread handshake; keep the async worker
             // clean. The keystrokes MUST NOT race the handoff, so the failure of
@@ -413,18 +439,27 @@ mod tests {
 
     impl MockInput {
         fn ok() -> Self {
-            Self { fail_with: None, last: std::sync::Mutex::new(None) }
+            Self {
+                fail_with: None,
+                last: std::sync::Mutex::new(None),
+            }
         }
 
         fn failing(err: InputError) -> Self {
-            Self { fail_with: Some(err), last: std::sync::Mutex::new(None) }
+            Self {
+                fail_with: Some(err),
+                last: std::sync::Mutex::new(None),
+            }
         }
     }
 
     #[async_trait]
     impl InputControl for MockInput {
         fn permission(&self) -> InputPermission {
-            InputPermission { granted: self.fail_with.is_none(), supported: true }
+            InputPermission {
+                granted: self.fail_with.is_none(),
+                supported: true,
+            }
         }
 
         fn request_permission(&self) -> bool {
@@ -443,7 +478,10 @@ mod tests {
     #[tokio::test]
     async fn trait_is_object_safe_and_performs_through_dyn() {
         let backend: Arc<dyn InputControl> = Arc::new(MockInput::ok());
-        backend.perform(InputAction::click(MouseButton::Left)).await.unwrap();
+        backend
+            .perform(InputAction::click(MouseButton::Left))
+            .await
+            .unwrap();
         assert!(backend.permission().granted);
         assert!(backend.request_permission());
     }
@@ -451,8 +489,13 @@ mod tests {
     #[tokio::test]
     async fn errors_propagate_through_dyn_with_kind() {
         let backend: Arc<dyn InputControl> =
-            Arc::new(MockInput::failing(InputError::PermissionDenied { detail: "AX denied".into() }));
-        let err = backend.perform(InputAction::TypeText { text: "hi".into() }).await.unwrap_err();
+            Arc::new(MockInput::failing(InputError::PermissionDenied {
+                detail: "AX denied".into(),
+            }));
+        let err = backend
+            .perform(InputAction::TypeText { text: "hi".into() })
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "permission-denied");
         assert!(!backend.permission().granted);
     }
@@ -461,19 +504,25 @@ mod tests {
     fn error_json_shape_is_the_ipc_contract() {
         // The UI matches on `kind` and reads camelCase fields; a change here is
         // a breaking IPC change and must be coordinated with the frontend.
-        let denied = InputError::PermissionDenied { detail: "AX denied".into() };
+        let denied = InputError::PermissionDenied {
+            detail: "AX denied".into(),
+        };
         let v = serde_json::to_value(&denied).unwrap();
         assert_eq!(v["kind"], "permission-denied");
         assert_eq!(v["detail"], "AX denied");
 
-        let unsupported =
-            InputError::Unsupported { platform: "linux".into(), detail: "no backend".into() };
+        let unsupported = InputError::Unsupported {
+            platform: "linux".into(),
+            detail: "no backend".into(),
+        };
         let v = serde_json::to_value(&unsupported).unwrap();
         assert_eq!(v["kind"], "unsupported");
         assert_eq!(v["platform"], "linux");
         assert_eq!(v["detail"], "no backend");
 
-        let failed = InputError::InputFailed { detail: "post failed".into() };
+        let failed = InputError::InputFailed {
+            detail: "post failed".into(),
+        };
         let v = serde_json::to_value(&failed).unwrap();
         assert_eq!(v["kind"], "input-failed");
         assert_eq!(v["detail"], "post failed");
@@ -482,10 +531,19 @@ mod tests {
     #[test]
     fn kind_matches_serde_tag_for_every_variant() {
         let all = [
-            InputError::Disabled { detail: String::new() },
-            InputError::PermissionDenied { detail: String::new() },
-            InputError::Unsupported { platform: String::new(), detail: String::new() },
-            InputError::InputFailed { detail: String::new() },
+            InputError::Disabled {
+                detail: String::new(),
+            },
+            InputError::PermissionDenied {
+                detail: String::new(),
+            },
+            InputError::Unsupported {
+                platform: String::new(),
+                detail: String::new(),
+            },
+            InputError::InputFailed {
+                detail: String::new(),
+            },
         ];
         for err in all {
             let v = serde_json::to_value(&err).unwrap();
@@ -502,7 +560,10 @@ mod tests {
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["kind"], "disabled");
         assert!(v["detail"].as_str().unwrap().contains("Settings"));
-        assert!(err.to_string().contains("disabled"), "display must name the kind");
+        assert!(
+            err.to_string().contains("disabled"),
+            "display must name the kind"
+        );
     }
 
     #[test]
@@ -519,7 +580,9 @@ mod tests {
 
     #[test]
     fn error_display_names_kind_and_detail() {
-        let err = InputError::PermissionDenied { detail: "AX denied".into() };
+        let err = InputError::PermissionDenied {
+            detail: "AX denied".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("permission-denied"), "kind missing: {msg}");
         assert!(msg.contains("AX denied"), "detail missing: {msg}");
@@ -531,7 +594,11 @@ mod tests {
         // wire contract: camelCase keys, and unobserved fields are ABSENT (not
         // null) so a small model never has to reason about nulls.
         let empty = serde_json::to_value(ActionReport::default()).unwrap();
-        assert_eq!(empty, serde_json::json!({}), "a no-evidence report must be empty");
+        assert_eq!(
+            empty,
+            serde_json::json!({}),
+            "a no-evidence report must be empty"
+        );
 
         let full = ActionReport {
             cursor: Some(CursorPosition { x: 640, y: 220 }),
@@ -555,7 +622,10 @@ mod tests {
 
     #[test]
     fn permission_serializes_camel_case() {
-        let p = InputPermission { granted: false, supported: true };
+        let p = InputPermission {
+            granted: false,
+            supported: true,
+        };
         let v = serde_json::to_value(p).unwrap();
         assert_eq!(v["granted"], false);
         assert_eq!(v["supported"], true);
@@ -567,12 +637,19 @@ mod tests {
             InputAction::MouseMove { x: 10, y: 20 },
             InputAction::click(MouseButton::Right),
             InputAction::click_at(MouseButton::Left, 30, 40),
-            InputAction::TypeText { text: "hello".into() },
-            InputAction::KeyPress { key: "return".into() },
+            InputAction::TypeText {
+                text: "hello".into(),
+            },
+            InputAction::KeyPress {
+                key: "return".into(),
+            },
         ];
         for action in actions {
             let v = serde_json::to_value(&action).unwrap();
-            assert!(v.get("action").is_some(), "action tag missing for {action:?}");
+            assert!(
+                v.get("action").is_some(),
+                "action tag missing for {action:?}"
+            );
             let back: InputAction = serde_json::from_value(v).unwrap();
             assert_eq!(back, action);
         }
@@ -613,22 +690,50 @@ mod tests {
         // TypeText actions with different text are one kind. And a kind must
         // serialize the same kebab string as its action's `action` tag.
         let cases = [
-            (InputAction::MouseMove { x: 1, y: 2 }, ActionKind::MouseMove, "mouse-move"),
-            (InputAction::click(MouseButton::Left), ActionKind::MouseClick, "mouse-click"),
-            (InputAction::TypeText { text: "a".into() }, ActionKind::TypeText, "type-text"),
-            (InputAction::KeyPress { key: "return".into() }, ActionKind::KeyPress, "key-press"),
+            (
+                InputAction::MouseMove { x: 1, y: 2 },
+                ActionKind::MouseMove,
+                "mouse-move",
+            ),
+            (
+                InputAction::click(MouseButton::Left),
+                ActionKind::MouseClick,
+                "mouse-click",
+            ),
+            (
+                InputAction::TypeText { text: "a".into() },
+                ActionKind::TypeText,
+                "type-text",
+            ),
+            (
+                InputAction::KeyPress {
+                    key: "return".into(),
+                },
+                ActionKind::KeyPress,
+                "key-press",
+            ),
         ];
         for (action, kind, tag) in cases {
             assert_eq!(action.kind(), kind, "{action:?} kind mismatch");
-            assert_eq!(serde_json::to_value(kind).unwrap(), tag, "kind tag drift for {kind:?}");
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                tag,
+                "kind tag drift for {kind:?}"
+            );
             // The kind string equals the action's own `action` tag.
             assert_eq!(serde_json::to_value(&action).unwrap()["action"], tag);
         }
 
         // Payload-blind: different text, same kind.
         assert_eq!(
-            InputAction::TypeText { text: "hello".into() }.kind(),
-            InputAction::TypeText { text: "world".into() }.kind(),
+            InputAction::TypeText {
+                text: "hello".into()
+            }
+            .kind(),
+            InputAction::TypeText {
+                text: "world".into()
+            }
+            .kind(),
         );
     }
 
@@ -641,7 +746,10 @@ mod tests {
     #[async_trait]
     impl InputControl for JournalingInput {
         fn permission(&self) -> InputPermission {
-            InputPermission { granted: true, supported: true }
+            InputPermission {
+                granted: true,
+                supported: true,
+            }
         }
 
         fn request_permission(&self) -> bool {
@@ -649,7 +757,10 @@ mod tests {
         }
 
         async fn perform(&self, action: InputAction) -> Result<ActionReport, InputError> {
-            self.journal.lock().unwrap().push(format!("perform:{}", action.kind_str()));
+            self.journal
+                .lock()
+                .unwrap()
+                .push(format!("perform:{}", action.kind_str()));
             Ok(ActionReport::default())
         }
     }
@@ -658,7 +769,9 @@ mod tests {
         hook_result: Result<(), String>,
     ) -> (KeyboardFocusYield, Arc<std::sync::Mutex<Vec<String>>>) {
         let journal = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let inner = Arc::new(JournalingInput { journal: journal.clone() });
+        let inner = Arc::new(JournalingInput {
+            journal: journal.clone(),
+        });
         let hook_journal = journal.clone();
         let wrapped = KeyboardFocusYield::new(
             inner,
@@ -676,8 +789,18 @@ mod tests {
         // BEFORE the first keystroke posts, or the text lands in Third Eye's own
         // prompt. Ordering in the journal is the proof.
         let (backend, journal) = yield_harness(Ok(()));
-        backend.perform(InputAction::TypeText { text: "farts".into() }).await.unwrap();
-        backend.perform(InputAction::KeyPress { key: "return".into() }).await.unwrap();
+        backend
+            .perform(InputAction::TypeText {
+                text: "farts".into(),
+            })
+            .await
+            .unwrap();
+        backend
+            .perform(InputAction::KeyPress {
+                key: "return".into(),
+            })
+            .await
+            .unwrap();
         assert_eq!(
             *journal.lock().unwrap(),
             vec!["yield", "perform:type-text", "yield", "perform:key-press"],
@@ -689,8 +812,14 @@ mod tests {
         // Mouse events route by screen position, not key window — yielding for
         // them would blink the panel ordering for nothing.
         let (backend, journal) = yield_harness(Ok(()));
-        backend.perform(InputAction::MouseMove { x: 10, y: 20 }).await.unwrap();
-        backend.perform(InputAction::click_at(MouseButton::Left, 30, 40)).await.unwrap();
+        backend
+            .perform(InputAction::MouseMove { x: 10, y: 20 })
+            .await
+            .unwrap();
+        backend
+            .perform(InputAction::click_at(MouseButton::Left, 30, 40))
+            .await
+            .unwrap();
         assert_eq!(
             *journal.lock().unwrap(),
             vec!["perform:mouse-move", "perform:mouse-click"],
@@ -702,15 +831,30 @@ mod tests {
         // If the overlay could not resign key, typing would land in the wrong
         // window — the action must fail typed instead of "succeeding" wrong.
         let (backend, journal) = yield_harness(Err("main thread busy".into()));
-        let err =
-            backend.perform(InputAction::TypeText { text: "hi".into() }).await.unwrap_err();
+        let err = backend
+            .perform(InputAction::TypeText { text: "hi".into() })
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "input-failed");
-        assert!(err.to_string().contains("wrong window"), "detail must say why: {err}");
-        assert_eq!(*journal.lock().unwrap(), vec!["yield"], "backend must not be reached");
+        assert!(
+            err.to_string().contains("wrong window"),
+            "detail must say why: {err}"
+        );
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["yield"],
+            "backend must not be reached"
+        );
 
         // Mouse actions are unaffected by a broken yield hook.
-        backend.perform(InputAction::click(MouseButton::Left)).await.unwrap();
-        assert_eq!(*journal.lock().unwrap(), vec!["yield", "perform:mouse-click"]);
+        backend
+            .perform(InputAction::click(MouseButton::Left))
+            .await
+            .unwrap();
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["yield", "perform:mouse-click"]
+        );
     }
 
     #[tokio::test]
@@ -726,7 +870,10 @@ mod tests {
         // The `focus_app` tool has no InputAction payload, but its ActionKind is
         // the unit the ApprovalGate gates and the whitelist grants by; it rides
         // the same camelCase/kebab contract as the input kinds (`focus-app`).
-        assert_eq!(serde_json::to_value(ActionKind::FocusApp).unwrap(), "focus-app");
+        assert_eq!(
+            serde_json::to_value(ActionKind::FocusApp).unwrap(),
+            "focus-app"
+        );
         let back: ActionKind = serde_json::from_str("\"focus-app\"").unwrap();
         assert_eq!(back, ActionKind::FocusApp);
         // Grantable through the whitelist like any other kind.

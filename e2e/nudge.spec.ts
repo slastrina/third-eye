@@ -300,7 +300,7 @@ test("nudges section degrades to a named unavailable state outside Tauri", async
   const nudges = nudgesSection(page);
   await expect(nudges.getByRole("heading", { name: "Nudges" })).toBeVisible();
   // nudge_status rejects (no runtime) → toggle disabled with the named note.
-  await expect(page.getByRole("checkbox", { name: "Nudges" })).toBeDisabled();
+  await expect(page.getByRole("switch", { name: "Nudges" })).toBeDisabled();
   await expect(nudges.locator(".settings-unavailable")).toHaveText(
     "Nudge state is unavailable outside the app.",
   );
@@ -310,7 +310,7 @@ test("nudges section degrades to a named unavailable state outside Tauri", async
 test("the toggle drives set_nudges_enabled and renders the authoritative snapshot", async ({ page }) => {
   await installNudgeIpcMock(page);
   await page.goto("/?view=settings&section=nudges");
-  const toggle = page.getByRole("checkbox", { name: "Nudges" });
+  const toggle = page.getByRole("switch", { name: "Nudges" });
 
   // Mount-time nudge_status resolves → live toggle, default-on.
   await expect(toggle).toBeEnabled();
@@ -326,7 +326,7 @@ test("the toggle drives set_nudges_enabled and renders the authoritative snapsho
 test("a persist failure rolls the toggle back with a named alert", async ({ page }) => {
   await installNudgeIpcMock(page);
   await page.goto("/?view=settings&section=nudges");
-  const toggle = page.getByRole("checkbox", { name: "Nudges" });
+  const toggle = page.getByRole("switch", { name: "Nudges" });
   await expect(toggle).toBeChecked();
 
   await page.evaluate(() =>
@@ -345,7 +345,7 @@ test("a persist failure rolls the toggle back with a named alert", async ({ page
 test("nudge://state broadcasts sync the toggle and surface classifier errors", async ({ page }) => {
   await installNudgeIpcMock(page);
   await page.goto("/?view=settings&section=nudges");
-  const toggle = page.getByRole("checkbox", { name: "Nudges" });
+  const toggle = page.getByRole("switch", { name: "Nudges" });
   await expect(toggle).toBeChecked();
   await waitForListener(page, "nudge://state");
 

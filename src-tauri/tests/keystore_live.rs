@@ -39,9 +39,7 @@ fn assert_absent_under(dir: &Path, needle: &[u8], scanned: &mut usize) {
             assert_absent_under(&path, needle, scanned);
         } else if let Ok(bytes) = std::fs::read(&path) {
             *scanned += 1;
-            let hit = bytes
-                .windows(needle.len())
-                .any(|window| window == needle);
+            let hit = bytes.windows(needle.len()).any(|window| window == needle);
             assert!(
                 !hit,
                 "seeded key bytes leaked into {} — key material must live only in the OS credential store",
@@ -53,13 +51,24 @@ fn assert_absent_under(dir: &Path, needle: &[u8], scanned: &mut usize) {
 
 #[test]
 fn key_round_trips_through_the_real_credential_store_and_never_lands_on_disk() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let service = format!("com.slastrina.thirdeye.test.live.{}.{nanos}", std::process::id());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let service = format!(
+        "com.slastrina.thirdeye.test.live.{}.{nanos}",
+        std::process::id()
+    );
     // Unique, high-entropy, grep-proof seed — if these exact bytes show up
     // in any config file, only this run could have put them there.
-    let seeded = format!("sk-test-SEEDED-{nanos}-{}-NEVER-ON-DISK", std::process::id());
+    let seeded = format!(
+        "sk-test-SEEDED-{nanos}-{}-NEVER-ON-DISK",
+        std::process::id()
+    );
 
-    let cleanup = Cleanup { store: KeyStore::with_service(&service) };
+    let cleanup = Cleanup {
+        store: KeyStore::with_service(&service),
+    };
     let store = &cleanup.store;
 
     // Store → present, against the real platform store. The byte-identical
@@ -70,7 +79,10 @@ fn key_round_trips_through_the_real_credential_store_and_never_lands_on_disk() {
     store
         .set_key(CloudProvider::Openai, &seeded)
         .expect("set_key against the real credential store");
-    assert!(store.key_present(CloudProvider::Openai).unwrap(), "stored key must be present");
+    assert!(
+        store.key_present(CloudProvider::Openai).unwrap(),
+        "stored key must be present"
+    );
     // The other provider's slot stays independent — no cross-talk.
     assert!(!store.key_present(CloudProvider::Anthropic).unwrap());
 
@@ -78,22 +90,34 @@ fn key_round_trips_through_the_real_credential_store_and_never_lands_on_disk() {
     // friends) and the repo-side config files for the seeded bytes.
     let mut scanned = 0usize;
     if let Some(home) = std::env::var_os("HOME") {
-        let app_data = Path::new(&home)
-            .join("Library/Application Support/com.slastrina.thirdeye");
+        let app_data =
+            Path::new(&home).join("Library/Application Support/com.slastrina.thirdeye");
         assert_absent_under(&app_data, seeded.as_bytes(), &mut scanned);
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     for repo_config in ["tauri.conf.json", "capabilities"] {
-        assert_absent_under(&manifest_dir.join(repo_config), seeded.as_bytes(), &mut scanned);
+        assert_absent_under(
+            &manifest_dir.join(repo_config),
+            seeded.as_bytes(),
+            &mut scanned,
+        );
         if let Ok(bytes) = std::fs::read(manifest_dir.join(repo_config)) {
             scanned += 1;
             assert!(!bytes.windows(seeded.len()).any(|w| w == seeded.as_bytes()));
         }
     }
     println!("byte-scan: seeded key absent from {scanned} settings/config files");
-    assert!(scanned > 0, "byte-scan must actually scan files to prove anything");
+    assert!(
+        scanned > 0,
+        "byte-scan must actually scan files to prove anything"
+    );
 
     // Delete → typed absence (Ok(false), never an error).
-    store.delete_key(CloudProvider::Openai).expect("delete stored key");
-    assert!(!store.key_present(CloudProvider::Openai).unwrap(), "deleted key must be absent");
+    store
+        .delete_key(CloudProvider::Openai)
+        .expect("delete stored key");
+    assert!(
+        !store.key_present(CloudProvider::Openai).unwrap(),
+        "deleted key must be absent"
+    );
 }
