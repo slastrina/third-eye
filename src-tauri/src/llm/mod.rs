@@ -17,6 +17,7 @@ pub mod mcp_keystore;
 pub mod mcp_spawn;
 pub mod openai;
 pub mod router;
+pub mod routing;
 pub mod skills;
 pub mod toolloop;
 

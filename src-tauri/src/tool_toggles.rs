@@ -64,6 +64,36 @@ pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
         "Search verbatim transcripts of earlier chat sessions",
     ),
     (
+        crate::workspace::fs_tools::READ_FILE_TOOL,
+        "Read files",
+        "Read text files inside your workspaces",
+    ),
+    (
+        crate::workspace::fs_tools::LIST_DIR_TOOL,
+        "List folders",
+        "List directories inside your workspaces",
+    ),
+    (
+        crate::workspace::fs_tools::WRITE_FILE_TOOL,
+        "Write files",
+        "Write files inside your workspaces (each write approved)",
+    ),
+    (
+        crate::workspace::exec_tool::RUN_IN_WORKSPACE_TOOL,
+        "Run in workspace",
+        "Build/test commands inside your workspaces (each approved)",
+    ),
+    (
+        crate::workspace::diff_tool::WORKSPACE_DIFF_TOOL,
+        "Workspace diff",
+        "See uncommitted changes in your workspaces (read-only)",
+    ),
+    (
+        crate::bridge::debug_tool::VSCODE_DEBUG_TOOL,
+        "VS Code debug",
+        "Request a debug session in VS Code (you approve it there)",
+    ),
+    (
         crate::inventory::FIND_PROGRAMS_TOOL,
         "Installed programs",
         "Search what is installed on this machine",

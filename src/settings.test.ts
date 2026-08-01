@@ -26,6 +26,7 @@ const ENDPOINT = "http://192.168.182.224:1234";
 
 const routing: ModelInfo = {
   activeLane: "thin",
+  auto: false,
   endpoint: ENDPOINT,
   lanes: [
     { name: "thin", modelId: "thin-1b" },

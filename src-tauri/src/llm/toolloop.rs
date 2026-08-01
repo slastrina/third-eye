@@ -154,6 +154,20 @@ facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk s
 battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. \
 Check find_programs before claiming an app or tool is or is not installed, and before running a \
 CLI tool you are not sure exists.\n\n\
+CODING: when the user has designated workspace folders (Settings → Workspaces), you have \
+read_file, list_dir and write_file for real coding work inside them. list_dir first to learn the \
+layout, read_file before changing a file — never write over content you have not read. write_file \
+replaces the WHOLE file, so pass the complete new contents, and the user approves each write. \
+File paths must stay inside the workspaces; anything outside is refused. To compile, test, or \
+run workspace code, use run_in_workspace (never run_command): its working directory is locked \
+inside the workspace, output streams into the chat, and timeoutSecs goes up to 600 for long \
+builds — after writing code, BUILD AND TEST it with run_in_workspace and report the real result. \
+When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: \
+confirm it contains exactly the intended changes, then summarize them for the user. NEVER \
+git-commit or git-push workspace changes unless the user explicitly asks you to. \
+If these tools are not \
+offered, no workspace is configured — say so and point the user at Settings → Workspaces instead \
+of trying run_command to touch files.\n\n\
 You CAN recall the past: memory_search finds distilled memories of the user's activity and \
 earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. \
 When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
@@ -457,10 +471,13 @@ const RESULT_PREVIEW_CHARS: usize = 2000;
 /// The UI preview for one executed call: run_command's report, bounded on a
 /// char boundary; `None` for every other tool.
 fn result_preview(call_name: &str, content: &str) -> Option<String> {
-    // String literal, not crate::command_runner::RUN_COMMAND_TOOL: that
-    // module is cfg(desktop) while the llm module is not; the pair is
-    // pinned equal by a command_runner unit test.
-    if call_name != "run_command" {
+    // String literals, not the cfg(desktop) modules' consts (this module is
+    // not cfg(desktop)); each pair is pinned equal by a unit test in its
+    // own module (command_runner / workspace::exec_tool).
+    if call_name != "run_command"
+        && call_name != "run_in_workspace"
+        && call_name != "workspace_diff"
+    {
         return None;
     }
     if content.len() <= RESULT_PREVIEW_CHARS {

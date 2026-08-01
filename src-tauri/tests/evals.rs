@@ -41,6 +41,14 @@ use third_eye_lib::llm::ChatMessage;
 use third_eye_lib::memory::MemoryStore;
 use third_eye_lib::screenquery::{ScreenElement, ScreenQuery, ScreenQueryError};
 use third_eye_lib::tool_toggles::{ToggleGatedExecutor, ToolToggles};
+use third_eye_lib::workspace::diff_tool::{WorkspaceDiffTool, WORKSPACE_DIFF_TOOL};
+use third_eye_lib::workspace::exec_tool::{
+    RunInWorkspaceTool, TerminalSink, RUN_IN_WORKSPACE_TOOL,
+};
+use third_eye_lib::workspace::fs_tools::{
+    ListDirTool, ReadFileTool, WriteFileTool, READ_FILE_TOOL, WRITE_FILE_TOOL,
+};
+use third_eye_lib::workspace::WorkspaceState;
 
 // ---------------------------------------------------------------------------
 // Scripted HTTP server (chat_tool_calling.rs shape): one pre-baked response
@@ -781,6 +789,368 @@ async fn eval_remember_stores_and_recall_finds() {
     assert_eq!(records[0].source, third_eye_lib::memory::MemorySource::Told);
 }
 
+/// Scratch workspace dir cleaned on drop (coding-agent S3 evals).
+struct ScratchWorkspace {
+    dir: PathBuf,
+}
+
+impl ScratchWorkspace {
+    fn new(tag: &str) -> (Self, Arc<WorkspaceState>) {
+        let dir = std::env::temp_dir().join(format!("te-eval-ws-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(WorkspaceState::new());
+        state.set_roots(vec![dir.display().to_string()]);
+        (Self { dir }, state)
+    }
+}
+
+impl Drop for ScratchWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Scripted approval verdicts, recording every request (S3 write eval).
+struct ScriptedApprover {
+    verdicts: Mutex<Vec<ApprovalVerdict>>,
+    requests: Mutex<Vec<(ActionKind, String)>>,
+}
+
+impl ScriptedApprover {
+    fn new(verdicts: Vec<ApprovalVerdict>) -> Self {
+        Self {
+            verdicts: Mutex::new(verdicts),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalPrompt for ScriptedApprover {
+    async fn request(&self, kind: ActionKind, summary: String) -> ApprovalVerdict {
+        self.requests.lock().unwrap().push((kind, summary));
+        let mut verdicts = self.verdicts.lock().unwrap();
+        assert!(!verdicts.is_empty(), "unexpected extra approval prompt");
+        verdicts.remove(0)
+    }
+}
+
+/// WORKSPACE CONTAINMENT (coding-agent S3): an escape read refuses typed
+/// (`outside-workspace`) with zero io, the loop recovers with a contained
+/// read, and the REAL file contents are what the model is fed — the honest
+/// read result, asserted at the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_workspace_escape_refused_then_contained_read_feeds_real_content() {
+    let (scratch, workspace) = ScratchWorkspace::new("contain");
+    std::fs::write(
+        scratch.dir.join("main.rs"),
+        "fn main() { real_content_marker(); }",
+    )
+    .unwrap();
+
+    let (endpoint, captured) = scripted::spawn(vec![
+        scripted::round_tool("c1", READ_FILE_TOOL, r#"{"path":"/etc/passwd"}"#),
+        scripted::round_tool("c2", READ_FILE_TOOL, r#"{"path":"main.rs"}"#),
+        scripted::round_text("main.rs calls real_content_marker."),
+    ])
+    .await;
+
+    let executor = CompositeExecutor::new(vec![
+        Box::new(ReadFileTool::new(workspace.clone())),
+        Box::new(ListDirTool::new(workspace)),
+    ]);
+    let (text, events) = run_scenario(&endpoint, &executor, "what does main.rs do?").await;
+    assert_eq!(text, "main.rs calls real_content_marker.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(
+        (results[0].1, results[0].2.as_deref()),
+        (false, Some("outside-workspace")),
+        "the escape must refuse typed"
+    );
+    assert!(
+        results[1].1,
+        "the contained read succeeds: {:?}",
+        results[1]
+    );
+    // The tool turn fed to the model carries the REAL file content.
+    let third_request = scripted::body_json(&captured, 2);
+    let fed = third_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fed.contains("real_content_marker"),
+        "the model must be fed the real file contents: {fed}"
+    );
+    assert!(
+        fed.contains("outside every designated workspace"),
+        "the refusal must explain the boundary: {fed}"
+    );
+}
+
+/// WRITE APPROVAL (coding-agent S3): a denied write performs ZERO io and
+/// refuses typed; an approved-for-session write lands on disk; the next
+/// write rides the session grant without prompting again.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_write_approval_deny_then_session_grant() {
+    let (scratch, workspace) = ScratchWorkspace::new("write");
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            WRITE_FILE_TOOL,
+            r#"{"path":"notes/a.txt","content":"alpha"}"#,
+        ),
+        scripted::round_tool(
+            "c2",
+            WRITE_FILE_TOOL,
+            r#"{"path":"notes/a.txt","content":"alpha"}"#,
+        ),
+        scripted::round_tool(
+            "c3",
+            WRITE_FILE_TOOL,
+            r#"{"path":"notes/b.txt","content":"beta"}"#,
+        ),
+        scripted::round_text("Wrote both notes."),
+    ])
+    .await;
+
+    let approver = Arc::new(ScriptedApprover::new(vec![
+        ApprovalVerdict::Deny,
+        ApprovalVerdict::AllowKind,
+    ]));
+    let executor = CompositeExecutor::new(vec![Box::new(WriteFileTool::new(
+        workspace,
+        HidRunMode::Ask,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        approver.clone(),
+    ))]);
+    let (text, events) = run_scenario(&endpoint, &executor, "write my notes").await;
+    assert_eq!(text, "Wrote both notes.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert_eq!(
+        (results[0].1, results[0].2.as_deref()),
+        (false, Some("approval-denied")),
+        "the denied write must refuse typed"
+    );
+    assert!(
+        results[1].1,
+        "the approved write succeeds: {:?}",
+        results[1]
+    );
+    assert!(results[2].1, "the granted-session write succeeds");
+    // Denied → nothing on disk until the grant; then both files land.
+    assert_eq!(
+        std::fs::read_to_string(scratch.dir.join("notes/a.txt")).unwrap(),
+        "alpha"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.dir.join("notes/b.txt")).unwrap(),
+        "beta"
+    );
+    // Exactly TWO prompts: deny, then the session grant covers the third.
+    let requests = approver.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests.iter().all(|(k, _)| *k == ActionKind::WriteFile),
+        "prompts carry the WriteFile kind"
+    );
+    assert!(
+        requests[0].1.contains("a.txt") && requests[0].1.contains("bytes"),
+        "the summary names the file and size: {:?}",
+        requests[0].1
+    );
+}
+
+/// WORKSPACE EXEC (coding-agent S4): a cwd outside every root refuses typed
+/// with zero spawn; the recovered in-workspace command runs for real, its
+/// output STREAMS through the sink mid-run, and the bounded report rides
+/// the result event's preview — the transcript terminal block's feed.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_exec_escape_refused_then_workspace_run_streams_and_previews() {
+    struct CollectSink(Mutex<String>);
+    impl TerminalSink for CollectSink {
+        fn chunk(&self, _call_id: &str, text: &str) {
+            self.0.lock().unwrap().push_str(text);
+        }
+    }
+
+    let (scratch, workspace) = ScratchWorkspace::new("exec");
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            RUN_IN_WORKSPACE_TOOL,
+            r#"{"command":"true","cwd":"/etc"}"#,
+        ),
+        scripted::round_tool(
+            "c2",
+            RUN_IN_WORKSPACE_TOOL,
+            r#"{"command":"echo built-ok"}"#,
+        ),
+        scripted::round_text("Built cleanly."),
+    ])
+    .await;
+
+    let sink = Arc::new(CollectSink(Mutex::new(String::new())));
+    let executor = CompositeExecutor::new(vec![Box::new(RunInWorkspaceTool::new(
+        workspace,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        Arc::new(AllowAll),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sink.clone(),
+    ))]);
+    let (text, events) = run_scenario(&endpoint, &executor, "build my project").await;
+    assert_eq!(text, "Built cleanly.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(
+        (results[0].1, results[0].2.as_deref()),
+        (false, Some("outside-workspace")),
+        "the escape cwd must refuse typed"
+    );
+    assert!(results[1].1, "the workspace run succeeds: {:?}", results[1]);
+    // Output streamed live through the sink…
+    assert!(sink.0.lock().unwrap().contains("built-ok"));
+    // …and the bounded report rides the result event as the preview.
+    let preview = events
+        .iter()
+        .find_map(|e| match e {
+            ToolEvent::Result(r) if r.call_id == "c2" => r.preview.clone(),
+            _ => None,
+        })
+        .expect("run_in_workspace result must carry a preview");
+    assert!(preview.contains("built-ok"), "{preview}");
+    assert!(preview.contains("exit code: 0"), "{preview}");
+    drop(scratch);
+}
+
+/// DIFF REVIEW (coding-agent S5): after a write_file edit in a git
+/// workspace, workspace_diff shows the REAL uncommitted change through the
+/// loop, its report rides the result event's preview (the transcript's diff
+/// block feed), and nothing was committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_edit_then_diff_shows_the_real_change_and_commits_nothing() {
+    let (scratch, workspace) = ScratchWorkspace::new("diffrev");
+    let sh = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&scratch.dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    std::fs::write(scratch.dir.join("main.rs"), "fn main() {}\n").unwrap();
+    sh(&["init", "-q"]);
+    sh(&["add", "."]);
+    sh(&["commit", "-qm", "init"]);
+
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            WRITE_FILE_TOOL,
+            r#"{"path":"main.rs","content":"fn main() { improved(); }\n"}"#,
+        ),
+        scripted::round_tool("c2", WORKSPACE_DIFF_TOOL, "{}"),
+        scripted::round_text("Edited main.rs; the diff shows only that change."),
+    ])
+    .await;
+
+    let executor = CompositeExecutor::new(vec![
+        Box::new(WriteFileTool::new(
+            workspace.clone(),
+            HidRunMode::Ask,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(AllowAll),
+        )),
+        Box::new(WorkspaceDiffTool::new(workspace)),
+    ]);
+    let (text, events) = run_scenario(&endpoint, &executor, "improve main.rs").await;
+    assert_eq!(text, "Edited main.rs; the diff shows only that change.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].1, "the write succeeds: {:?}", results[0]);
+    assert!(results[1].1, "the diff succeeds: {:?}", results[1]);
+    // The diff preview carries the REAL hunk for the transcript block.
+    let preview = events
+        .iter()
+        .find_map(|e| match e {
+            ToolEvent::Result(r) if r.call_id == "c2" => r.preview.clone(),
+            _ => None,
+        })
+        .expect("workspace_diff result must carry a preview");
+    assert!(preview.contains("+fn main() { improved(); }"), "{preview}");
+    assert!(preview.contains("-fn main() {}"), "{preview}");
+    // Nothing was committed: the change is still uncommitted in the repo.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&scratch.dir)
+        .args(["log", "--oneline"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).lines().count(),
+        1,
+        "exactly the init commit — the tools never commit"
+    );
+}
+
+/// NO WORKSPACES (coding-agent S3): with zero roots the file tools are
+/// structurally inert — never offered in the request's tools array — and a
+/// call that names one anyway refuses typed with the Settings language.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_no_workspaces_file_tools_inert_and_refuse_typed() {
+    let (endpoint, captured) = scripted::spawn(vec![
+        scripted::round_tool("c1", READ_FILE_TOOL, r#"{"path":"main.rs"}"#),
+        scripted::round_text("No workspace is configured."),
+    ])
+    .await;
+
+    let workspace = Arc::new(WorkspaceState::new());
+    // A non-workspace tool rides along (production always offers others) so
+    // the request carries a tools array to inspect.
+    let executor = CompositeExecutor::new(vec![
+        Box::new(ReadFileTool::new(workspace.clone())),
+        Box::new(WriteFileTool::new(
+            workspace,
+            HidRunMode::Ask,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(AllowAll),
+        )),
+        Box::new(FocusAppTool::new(Arc::new(AlwaysFocus))),
+    ]);
+    let (text, events) = run_scenario(&endpoint, &executor, "read main.rs").await;
+    assert_eq!(text, "No workspace is configured.");
+    let offered = scripted::body_json(&captured, 0)["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        offered
+            .iter()
+            .all(|t| t["function"]["name"] != READ_FILE_TOOL
+                && t["function"]["name"] != WRITE_FILE_TOOL),
+        "file tools must not be offered without roots: {offered:?}"
+    );
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        (results[0].1, results[0].2.as_deref()),
+        (false, Some("no-workspaces")),
+        "the stray call must refuse typed"
+    );
+}
+
 /// PROMPT CONTRACT: the load-bearing behavioural clauses exist. Each assert
 /// names the behaviour it protects — deleting the clause flips this red
 /// (spec success criterion 5).
@@ -867,6 +1237,37 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
         HID_SYSTEM_PROMPT.contains("open ONE search-results URL"),
         "search-then-choose flow missing"
     );
+    // Coding workflow (S3): read-before-write, whole-file writes, and the
+    // no-workspace path points at Settings instead of run_command tricks.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("never write over content you have not read"),
+        "read-before-write clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("replaces the WHOLE file"),
+        "whole-file write clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("Settings → Workspaces"),
+        "no-workspace guidance missing"
+    );
+    // Exec (S4): builds go through run_in_workspace, and code gets BUILT
+    // after writing — never claimed working unverified.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("BUILD AND TEST it with run_in_workspace"),
+        "build-after-write clause missing"
+    );
+    // Diff review (S5): evaluate-the-goal, coding flavor — review the diff
+    // before declaring done, and never commit/push unasked.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("REVIEW the diff before declaring the task done"),
+        "diff-before-done clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT
+            .contains("git-commit or git-push workspace changes unless the user explicitly asks"),
+        "no-commit rule missing"
+    );
     // Tool descriptions carry their halves of the contract.
     let screen_desc = ScreenQueryTool::definition().description;
     assert!(
@@ -920,4 +1321,104 @@ async fn live_eval_recall_behaviour() {
         text.to_lowercase().contains("carbonara"),
         "the answer should surface the stored question: {text:?}"
     );
+}
+
+/// LIVE coding twin (coding-agent S8, opt-in): the real coder model, given a
+/// scratch git workspace and the full coding tool belt, asked for a small
+/// real task. Success = it READ before writing, WROTE the file, RAN the
+/// program in the workspace, reviewed the DIFF, and committed nothing.
+/// Needs LM Studio serving a tool-capable model at the default endpoint
+/// (pin qwen3-coder-next for the real coder-lane behaviour):
+/// ```sh
+/// cargo test --manifest-path src-tauri/Cargo.toml --test evals \
+///   -- --ignored --nocapture live_eval_coding_end_to_end
+/// ```
+#[tokio::test]
+#[ignore = "requires LM Studio serving a tool-capable coder model"]
+async fn live_eval_coding_end_to_end() {
+    let (scratch, workspace) = ScratchWorkspace::new("live-code");
+    let sh = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&scratch.dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    std::fs::write(
+        scratch.dir.join("greet.py"),
+        "def greet():\n    return \"hello\"\n\nprint(greet())\n",
+    )
+    .unwrap();
+    sh(&["init", "-q"]);
+    sh(&["add", "."]);
+    sh(&["commit", "-qm", "init"]);
+
+    struct StderrSink;
+    impl TerminalSink for StderrSink {
+        fn chunk(&self, _call_id: &str, text: &str) {
+            eprint!("{text}");
+        }
+    }
+    let executor = CompositeExecutor::new(vec![
+        Box::new(ReadFileTool::new(workspace.clone())),
+        Box::new(ListDirTool::new(workspace.clone())),
+        Box::new(WriteFileTool::new(
+            workspace.clone(),
+            HidRunMode::AutoRun,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(AllowAll),
+        )),
+        Box::new(RunInWorkspaceTool::new(
+            workspace.clone(),
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(AllowAll),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(StderrSink),
+        )),
+        Box::new(WorkspaceDiffTool::new(workspace)),
+    ]);
+    let (text, events) = run_scenario(
+        third_eye_lib::llm::openai::DEFAULT_ENDPOINT,
+        &executor,
+        "In my workspace there is a file greet.py. Change greet() to take a `name` \
+         argument and return \"hello, <name>\" (default name \"world\"), run it with \
+         run_in_workspace to prove it works, and review the diff.",
+    )
+    .await;
+    let called = |name: &str| {
+        events
+            .iter()
+            .any(|e| matches!(e, ToolEvent::Call(c) if c.call.name == name))
+    };
+    eprintln!(
+        "live coding eval: read={} write={} run={} diff={} answer={text:?}",
+        called(READ_FILE_TOOL),
+        called(WRITE_FILE_TOOL),
+        called(RUN_IN_WORKSPACE_TOOL),
+        called(WORKSPACE_DIFF_TOOL),
+    );
+    assert!(called(WRITE_FILE_TOOL), "the coder must edit the file");
+    assert!(
+        called(RUN_IN_WORKSPACE_TOOL),
+        "the coder must run the program to verify"
+    );
+    let content = std::fs::read_to_string(scratch.dir.join("greet.py")).unwrap();
+    assert!(
+        content.contains("name"),
+        "greet.py must actually carry the edit: {content}"
+    );
+    // The no-commit rule held: the scratch repo still has only its init commit.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&scratch.dir)
+        .args(["log", "--oneline"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }

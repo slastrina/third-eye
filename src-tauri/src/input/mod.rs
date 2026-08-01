@@ -244,6 +244,15 @@ pub enum ActionKind {
     /// kind. No InputAction payload (not an enigo event); gated on the same
     /// HidRunMode path (reading clipboard contents is user data).
     Clipboard,
+    /// Write a file inside a designated workspace (coding-agent S3) —
+    /// the `write_file` tool's action kind. Same Off/Ask/AutoRun path as
+    /// clipboard; grantable per session or permanently.
+    WriteFile,
+    /// Execute a build/test command with cwd locked inside a designated
+    /// workspace (coding-agent S4) — the `run_in_workspace` tool's action
+    /// kind. Session grants are PER ROOT (WorkspaceState::exec_grants);
+    /// a persisted Always covers the kind everywhere.
+    RunInWorkspace,
     /// Execute a terminal command — the `run_command` tool's action kind
     /// (computer-control I2). No [`InputAction`] payload (not an enigo
     /// event) and gated by its OWN structural switch (`commandsEnabled`,

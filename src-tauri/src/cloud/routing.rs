@@ -29,14 +29,14 @@
 
 use tauri::{AppHandle, Manager};
 
-use crate::config::{load_lane_model, HEAVY_MODEL_KEY};
+use crate::config::{load_lane_model, CODER_MODEL_KEY, HEAVY_MODEL_KEY};
 use crate::llm::commands::LlmState;
-use crate::llm::router::{ModelRouter, HEAVY_LANE};
+use crate::llm::router::{ModelRouter, CODER_LANE, HEAVY_LANE};
 
 use super::client::{build_cloud_client, CloudTransport};
 use super::commands::CloudKeysState;
 use super::keystore::CloudProvider;
-use super::optin::{CloudHeavyProvider, CloudOptIn};
+use super::optin::{CloudCoderProvider, CloudHeavyProvider, CloudOptIn};
 
 /// The heavy-lane routing decision from the current gates, factored out of the
 /// Tauri runtime so it is unit-testable. Only the *selection* is decided here;
@@ -70,8 +70,39 @@ fn heavy_route(optin_enabled: bool, provider: Option<CloudProvider>) -> HeavyRou
 pub fn apply_cloud_routing(app: &AppHandle) {
     let router = app.state::<LlmState>().router();
     let optin_enabled = app.state::<CloudOptIn>().enabled();
-    let provider = app.state::<CloudHeavyProvider>().provider();
+    // Each cloud-capable lane is routed independently from its own persisted
+    // provider selection (coding-agent S6): the heavy lane can be on Claude
+    // while the coder stays local, and vice versa.
+    let heavy_provider = app.state::<CloudHeavyProvider>().provider();
+    apply_lane_routing(
+        app,
+        &router,
+        HEAVY_LANE,
+        HEAVY_MODEL_KEY,
+        optin_enabled,
+        heavy_provider,
+    );
+    let coder_provider = app.state::<CloudCoderProvider>().provider();
+    apply_lane_routing(
+        app,
+        &router,
+        CODER_LANE,
+        CODER_MODEL_KEY,
+        optin_enabled,
+        coder_provider,
+    );
+}
 
+/// Route ONE lane from its gates: cloud when opt-in + provider + key all
+/// hold, local otherwise — fail-safe on every typed build failure.
+fn apply_lane_routing(
+    app: &AppHandle,
+    router: &ModelRouter,
+    lane: &str,
+    model_key: &str,
+    optin_enabled: bool,
+    provider: Option<CloudProvider>,
+) {
     match heavy_route(optin_enabled, provider) {
         HeavyRoute::TryCloud(provider) => {
             // The router's own shared guard: the routed client's block/redaction
@@ -87,60 +118,60 @@ pub fn apply_cloud_routing(app: &AppHandle) {
                 &CloudTransport::default(),
             ) {
                 Ok(client) => {
-                    if let Err(e) = router.set_lane_client(HEAVY_LANE, client) {
-                        // The heavy lane is a construction invariant, so this is
+                    if let Err(e) = router.set_lane_client(lane, client) {
+                        // The lanes are construction invariants, so this is
                         // unreachable in practice; log and leave the lane as-is.
-                        log::error!("cloud: heavy lane route rejected by router: {e}");
+                        log::error!("cloud: {lane} lane route rejected by router: {e}");
                     } else {
-                        log::info!("cloud: heavy lane routed to {}", provider.account());
+                        log::info!("cloud: {lane} lane routed to {}", provider.account());
                     }
                 }
                 Err(e) => {
                     // Typed refusal (opt-in flipped off mid-apply, no stored
                     // key, or a store read failure): logged, lane stays local.
                     log::error!(
-                        "cloud: heavy lane cloud build refused ({}), staying local",
+                        "cloud: {lane} lane cloud build refused ({}), staying local",
                         e.kind()
                     );
-                    revert_heavy_lane_to_local(app, &router);
+                    revert_lane_to_local(app, router, lane, model_key);
                 }
             }
         }
-        HeavyRoute::Local => revert_heavy_lane_to_local(app, &router),
+        HeavyRoute::Local => revert_lane_to_local(app, router, lane, model_key),
     }
 }
 
-/// Rebuild the heavy lane's local guarded client, undoing any prior cloud
+/// Rebuild one lane's local guarded client, undoing any prior cloud
 /// injection. The target model is the store's persisted pin when the store has
 /// spoken ([`load_lane_model`] returns `Some`, including an explicit unpin),
 /// else the lane's *current* local pin — which `set_lane_client` preserves
-/// across a cloud swap — so the `THIRD_EYE_HEAVY_MODEL` env fallback is never
+/// across a cloud swap — so the `THIRD_EYE_*_MODEL` env fallbacks are never
 /// lost. Idempotent: when the lane is already local this simply rebuilds the
 /// same client.
-fn revert_heavy_lane_to_local(app: &AppHandle, router: &ModelRouter) {
-    let target = match load_lane_model(app, HEAVY_MODEL_KEY) {
+fn revert_lane_to_local(app: &AppHandle, router: &ModelRouter, lane: &str, model_key: &str) {
+    let target = match load_lane_model(app, model_key) {
         // The store spoke — its decision wins (Some(id) pins, None unpins).
         Some(pin) => pin,
         // No store key: keep the live local pin (env fallback or default).
-        None => heavy_lane_model(router),
+        None => lane_model(router, lane),
     };
-    match router.set_lane_model(HEAVY_LANE, target.clone()) {
+    match router.set_lane_model(lane, target.clone()) {
         Ok(_) => log::info!(
-            "cloud: heavy lane reverted to local ({})",
+            "cloud: {lane} lane reverted to local ({})",
             target.as_deref().unwrap_or("default")
         ),
-        Err(e) => log::error!("cloud: heavy lane local revert rejected by router: {e}"),
+        Err(e) => log::error!("cloud: {lane} lane local revert rejected by router: {e}"),
     }
 }
 
-/// The heavy lane's current model pin as recorded in [`ModelInfo`], the local
-/// fallback the revert restores when the store has no persisted heavy pin.
-fn heavy_lane_model(router: &ModelRouter) -> Option<String> {
+/// One lane's current model pin as recorded in [`ModelInfo`], the local
+/// fallback the revert restores when the store has no persisted pin.
+fn lane_model(router: &ModelRouter, lane: &str) -> Option<String> {
     router
         .info()
         .lanes
         .into_iter()
-        .find(|l| l.name == HEAVY_LANE)
+        .find(|l| l.name == lane)
         .and_then(|l| l.model_id)
 }
 

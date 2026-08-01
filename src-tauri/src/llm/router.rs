@@ -27,6 +27,10 @@ pub const THIN_LANE: &str = "thin";
 /// Lane for deep work (large model).
 pub const HEAVY_LANE: &str = "heavy";
 
+/// The coding lane (coding-agent S1, 2026-08-01): a dedicated coder model
+/// (locally e.g. qwen3-coder-next; cloud providers in a later slice).
+pub const CODER_LANE: &str = "coder";
+
 /// Placeholder shown in logs and `ModelInfo` when a lane has no pinned model
 /// id (LM Studio then serves whatever single model is loaded).
 const DEFAULT_MODEL_LABEL: &str = "default";
@@ -66,6 +70,10 @@ pub struct ModelInfo {
     pub active_lane: String,
     pub endpoint: String,
     pub lanes: Vec<LaneInfo>,
+    /// AUTO routing mode (coding-agent S1). The router itself only knows
+    /// lanes — `LlmState` stamps this before the info crosses IPC.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// One lane as seen by the UI. `model_id` is `None` when the lane is
@@ -143,6 +151,32 @@ impl ModelRouter {
             Lane::new(name, model.clone(), Arc::new(guarded))
         };
         let lanes = vec![lane(THIN_LANE, &thin_model), lane(HEAVY_LANE, &heavy_model)];
+        Self::with_guard(lanes, guard)
+    }
+
+    /// The production trio (coding-agent S1): thin / heavy / coder against
+    /// one endpoint, every client guard-wrapped exactly like
+    /// [`thin_heavy`](Self::thin_heavy) (which remains for tests).
+    pub fn thin_heavy_coder(
+        endpoint: &str,
+        thin_model: Option<String>,
+        heavy_model: Option<String>,
+        coder_model: Option<String>,
+        guard: Arc<GuardState>,
+    ) -> Self {
+        let lane = |name: &str, model: &Option<String>| {
+            let client = match model {
+                Some(id) => OpenAiClient::new(endpoint).with_model(id.clone()),
+                None => OpenAiClient::new(endpoint),
+            };
+            let guarded = GuardedClient::new(Arc::new(client), guard.clone());
+            Lane::new(name, model.clone(), Arc::new(guarded))
+        };
+        let lanes = vec![
+            lane(THIN_LANE, &thin_model),
+            lane(HEAVY_LANE, &heavy_model),
+            lane(CODER_LANE, &coder_model),
+        ];
         Self::with_guard(lanes, guard)
     }
 
@@ -231,6 +265,7 @@ impl ModelRouter {
         let lanes = self.lanes.read().unwrap();
         let active = *self.active.read().unwrap();
         ModelInfo {
+            auto: false,
             active_lane: lanes[active].name.clone(),
             endpoint: self.endpoint.clone(),
             lanes: lanes

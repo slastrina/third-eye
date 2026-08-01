@@ -30,11 +30,29 @@ export const TOOL_RESULT_EVENT = "llm://tool-result";
 export const MEMORY_SEARCH_TOOL = "memory_search";
 /** The terminal tool (computer-control I2) — Rust's RUN_COMMAND_TOOL twin. */
 export const RUN_COMMAND_TOOL = "run_command";
+/** The workspace exec tool (coding-agent S4) — Rust's RUN_IN_WORKSPACE_TOOL
+ *  twin. Rendered in the same transcript terminal block as run_command. */
+export const RUN_IN_WORKSPACE_TOOL = "run_in_workspace";
+/** The workspace diff tool (coding-agent S5) — Rust's WORKSPACE_DIFF_TOOL
+ *  twin. Rendered as the transcript's collapsible colored diff block. */
+export const WORKSPACE_DIFF_TOOL = "workspace_diff";
+/** Live output of a running run_in_workspace command (coding-agent S4):
+ *  each stdout/stderr chunk streams into the terminal block as it happens.
+ *  Keep in sync with TERMINAL_CHUNK_EVENT in src-tauri/src/llm/commands.rs. */
+export const TERMINAL_CHUNK_EVENT = "llm://terminal-chunk";
 /** Routing-state broadcast (S07): mutation responses only reach the calling
  *  window, so the backend emits the updated ModelInfo app-wide after every
  *  successful set_model / set_lane_model. The overlay consumes this to stay
  *  truthful when the settings window changes routing. */
 export const MODEL_INFO_EVENT = "llm://model-info";
+/** Per-request routed lane (`llm://routed`) — what auto actually picked. */
+export const ROUTED_EVENT = "llm://routed";
+
+export interface RoutedPayload {
+  requestId: number;
+  lane: string;
+  model: string;
+}
 
 export type Role = "system" | "user" | "assistant";
 
@@ -148,6 +166,9 @@ export interface ModelInfo {
   activeLane: string;
   endpoint: string;
   lanes: ModelLane[];
+  /** AUTO routing mode (coding-agent S1): requests pick their own lane;
+   *  the chips become manual overrides. */
+  auto: boolean;
 }
 
 /** Start a streaming completion; resolves to the request id whose llm://*
@@ -185,6 +206,10 @@ export function modelInfo(): Promise<ModelInfo> {
 }
 
 /** Subscribe to the app-wide routing broadcast (`llm://model-info`). */
+export function onRouted(cb: (payload: RoutedPayload) => void): Promise<UnlistenFn> {
+  return listen<RoutedPayload>(ROUTED_EVENT, (e) => cb(e.payload));
+}
+
 export function onModelInfoBroadcast(cb: (info: ModelInfo) => void): Promise<UnlistenFn> {
   return listen<ModelInfo>(MODEL_INFO_EVENT, (e) => cb(e.payload));
 }
@@ -211,6 +236,32 @@ export function onLlmToolCall(cb: (payload: ToolCallPayload) => void): Promise<U
 
 export function onLlmToolResult(cb: (payload: ToolResultPayload) => void): Promise<UnlistenFn> {
   return listen<ToolResultPayload>(TOOL_RESULT_EVENT, (e) => cb(e.payload));
+}
+
+/** The llm://terminal-chunk payload — serde camelCase of Rust's
+ *  TerminalChunkPayload. */
+export interface TerminalChunkPayload {
+  requestId: number;
+  callId: string;
+  chunk: string;
+}
+
+export function onTerminalChunk(cb: (payload: TerminalChunkPayload) => void): Promise<UnlistenFn> {
+  return listen<TerminalChunkPayload>(TERMINAL_CHUNK_EVENT, (e) => cb(e.payload));
+}
+
+/** VS Code bridge snapshot (coding-agent S7) — serde camelCase of Rust's
+ *  BridgeStatus. Health-as-value, never an error. */
+export interface BridgeStatus {
+  running: boolean;
+  port: number | null;
+  connected: number;
+  discoveryPath: string | null;
+  vscodeDetected: boolean;
+}
+
+export function bridgeStatus(): Promise<BridgeStatus> {
+  return invoke<BridgeStatus>("bridge_status");
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +457,21 @@ export interface ToolTogglesStatus {
   persistError: string | null;
 }
 
+/** Workspace roots (coding-agent S2): the only folders the coding tools
+ *  may touch. */
+export interface WorkspaceStatus {
+  roots: string[];
+  persistError: string | null;
+}
+
+export function workspaceRoots(): Promise<WorkspaceStatus> {
+  return invoke<WorkspaceStatus>("workspace_roots");
+}
+
+export function setWorkspaceRoots(roots: string[]): Promise<WorkspaceStatus> {
+  return invoke<WorkspaceStatus>("set_workspace_roots", { roots });
+}
+
 export function toolTogglesStatus(): Promise<ToolTogglesStatus> {
   return invoke<ToolTogglesStatus>("tool_toggles_status");
 }
@@ -564,6 +630,8 @@ export type ActionKind =
   | "key-press"
   | "focus-app"
   | "clipboard"
+  | "write-file"
+  | "run-in-workspace"
   | "run-command";
 
 /** The `hid://approval-request` payload — the serde camelCase serialization of
@@ -946,6 +1014,26 @@ export interface TerminalRun {
   preview: string | null;
 }
 
+/** One workspace_diff review during an assistant turn (coding-agent S5):
+ *  rendered as a collapsible colored diff block. `ok: null` while running;
+ *  `report` is the bounded status+diff text from the result event. */
+export interface DiffBlock {
+  callId: string;
+  ok: boolean | null;
+  report: string | null;
+}
+
+/** Colorization kind for one line of a diff report (pure, CSS-mapped). */
+export function diffLineKind(line: string): "add" | "del" | "hunk" | "meta" | "context" {
+  if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff --git")) {
+    return "meta";
+  }
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "del";
+  return "context";
+}
+
 export interface UiMessage {
   role: "user" | "assistant";
   text: string;
@@ -955,6 +1043,8 @@ export interface UiMessage {
   attached?: boolean;
   /** Assistant only: terminal commands run during this turn (I2). */
   terminal?: TerminalRun[];
+  /** Assistant only: workspace_diff reviews during this turn (S5). */
+  diffs?: DiffBlock[];
   /** Assistant only: EVERY tool step of this turn (the HUD trail's
    *  transcript twin, 2026-08-01) — the process record survives after the
    *  pill dismisses. `ok: null` = still running. */
@@ -1052,7 +1142,8 @@ export type LlmEvent =
   | { type: "done"; payload: DonePayload }
   | { type: "error"; payload: ErrorPayload }
   | { type: "tool-call"; payload: ToolCallPayload }
-  | { type: "tool-result"; payload: ToolResultPayload };
+  | { type: "tool-result"; payload: ToolResultPayload }
+  | { type: "terminal-chunk"; payload: TerminalChunkPayload };
 
 export type ChatAction =
   | { type: "submit"; question: string; retry?: boolean }
@@ -1347,7 +1438,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
               ],
         })),
       };
-      if (action.payload.call.name === RUN_COMMAND_TOOL) {
+      if (
+        action.payload.call.name === RUN_COMMAND_TOOL ||
+        action.payload.call.name === RUN_IN_WORKSPACE_TOOL
+      ) {
         // The exact command line, straight from the call's own arguments —
         // the transcript block shows what actually runs (I2 visibility).
         let command = action.payload.call.arguments;
@@ -1373,6 +1467,16 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           })),
         };
       }
+      if (action.payload.call.name === WORKSPACE_DIFF_TOOL) {
+        const block: DiffBlock = { callId: action.payload.call.id, ok: null, report: null };
+        return {
+          ...withStep,
+          messages: withLastAssistant(withStep.messages, (m) => ({
+            ...m,
+            diffs: [...(m.diffs ?? []), block],
+          })),
+        };
+      }
       if (action.payload.call.name !== MEMORY_SEARCH_TOOL) return withStep;
       return {
         ...withStep,
@@ -1391,7 +1495,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ),
         })),
       };
-      if (action.payload.name === RUN_COMMAND_TOOL) {
+      if (
+        action.payload.name === RUN_COMMAND_TOOL ||
+        action.payload.name === RUN_IN_WORKSPACE_TOOL
+      ) {
         const { callId, ok, preview, failure } = action.payload;
         return {
           ...settled,
@@ -1405,6 +1512,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           })),
         };
       }
+      if (action.payload.name === WORKSPACE_DIFF_TOOL) {
+        const { callId, ok, preview, failure } = action.payload;
+        return {
+          ...settled,
+          messages: withLastAssistant(settled.messages, (m) => ({
+            ...m,
+            diffs: (m.diffs ?? []).map((block) =>
+              block.callId === callId
+                ? { ...block, ok, report: preview ?? (failure ? `[${failure}]` : null) }
+                : block,
+            ),
+          })),
+        };
+      }
       if (action.payload.name !== MEMORY_SEARCH_TOOL) return settled;
       return {
         ...settled,
@@ -1414,6 +1535,25 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           // (the model still answers, ungrounded). It never downgrades a
           // "consulted" earned by an earlier successful round.
           memory: action.payload.ok ? "consulted" : settleMemoryPhase(m.memory),
+        })),
+      };
+    }
+    case "terminal-chunk": {
+      // Live build output (coding-agent S4): append to the RUNNING block's
+      // preview, keeping the tail (a build's latest lines matter most). The
+      // result event's bounded report replaces it when the command settles.
+      if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
+      if (action.payload.requestId !== state.requestId) return state; // stale
+      const { callId, chunk } = action.payload;
+      return {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({
+          ...m,
+          terminal: (m.terminal ?? []).map((run) =>
+            run.callId === callId && run.ok === null
+              ? { ...run, preview: ((run.preview ?? "") + chunk).slice(-16384) }
+              : run,
+          ),
         })),
       };
     }

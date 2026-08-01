@@ -1,0 +1,45 @@
+{
+  "name": "third-eye-vscode",
+  "displayName": "Third Eye",
+  "description": "Live visibility into Third Eye's coding agent: files open as the agent edits them, diffs and run output stream in, and debug sessions start only with your approval.",
+  "version": "0.1.0",
+  "publisher": "slastrina",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "thirdEye.showDiff",
+        "title": "Third Eye: Show Last Workspace Diff"
+      },
+      {
+        "command": "thirdEye.reconnect",
+        "title": "Third Eye: Reconnect to the App"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "tsc -p . && node --test \"out/test/*.test.js\"",
+    "package": "npm run compile && npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  }
+}

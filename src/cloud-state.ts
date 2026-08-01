@@ -117,6 +117,19 @@ export function setCloudHeavyProvider(
   return invoke<CloudHeavyProviderStatus>("set_cloud_heavy_provider", { provider });
 }
 
+/** Current coder-lane provider selection (coding-agent S6) — same shape. */
+export function cloudCoderProvider(): Promise<CloudHeavyProviderStatus> {
+  return invoke<CloudHeavyProviderStatus>("cloud_coder_provider");
+}
+
+/** Set the coder-lane provider (`null` clears it) — same contract as the
+ *  heavy-lane setter. */
+export function setCloudCoderProvider(
+  provider: CloudProvider | null,
+): Promise<CloudHeavyProviderStatus> {
+  return invoke<CloudHeavyProviderStatus>("set_cloud_coder_provider", { provider });
+}
+
 /** Subscribe to the app-wide cloud opt-in broadcast (`cloud://optin`). */
 export function onCloudOptin(cb: (status: CloudOptInStatus) => void): Promise<UnlistenFn> {
   return listen<CloudOptInStatus>(CLOUD_OPTIN_EVENT, (e) => cb(e.payload));
@@ -150,6 +163,9 @@ export interface CloudViewState {
   /** Heavy-lane provider selection; null until `cloud_heavy_provider`
    *  resolves. */
   heavy: CloudHeavyProviderStatus | null;
+  /** Coder-lane provider selection (S6); null until `cloud_coder_provider`
+   *  resolves. */
+  coder: CloudHeavyProviderStatus | null;
   /** Most recent key-op failure (empty key, locked store), kept until the
    *  next key status/response supersedes it. Carries a `detail` string,
    *  never a key. */
@@ -160,6 +176,7 @@ export const initialCloudViewState: CloudViewState = {
   optin: null,
   keys: null,
   heavy: null,
+  coder: null,
   keyError: null,
 };
 
@@ -167,6 +184,7 @@ export type CloudViewAction =
   | { type: "optin"; status: CloudOptInStatus }
   | { type: "keys"; status: CloudKeyStatus }
   | { type: "heavy"; status: CloudHeavyProviderStatus }
+  | { type: "coder"; status: CloudHeavyProviderStatus }
   | { type: "key-error"; error: CloudKeyError };
 
 export function cloudReducer(state: CloudViewState, action: CloudViewAction): CloudViewState {
@@ -181,6 +199,8 @@ export function cloudReducer(state: CloudViewState, action: CloudViewAction): Cl
       return { ...state, keys: action.status, keyError: null };
     case "heavy":
       return { ...state, heavy: action.status };
+    case "coder":
+      return { ...state, coder: action.status };
     case "key-error":
       // A store/validation failure leaves the last presence snapshot intact —
       // the error says what the attempt could not do, without lying about

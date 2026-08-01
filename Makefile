@@ -13,7 +13,7 @@ TAURI := npm run tauri --
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg install-app preview \
+.PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg install-app preview vsix \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
         clean-web clean-rust
@@ -172,3 +172,7 @@ clean-rust:
 #   cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --ignored --nocapture
 evals:
 	cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --nocapture
+
+## vsix: Build the VS Code extension package (vscode-extension/*.vsix)
+vsix:
+	cd vscode-extension && npm install && npm test && npm run package

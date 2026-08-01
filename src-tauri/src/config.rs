@@ -22,6 +22,41 @@ pub const HOTKEY_KEY: &str = "hotkey";
 /// string → pinned to that model id.
 pub const THIN_MODEL_KEY: &str = "thinModel";
 pub const HEAVY_MODEL_KEY: &str = "heavyModel";
+pub const CODER_MODEL_KEY: &str = "coderModel";
+
+/// Store key for the routing mode: "auto" (default — requests pick their
+/// lane) or "manual" (the chips pin one lane).
+pub const ROUTER_MODE_KEY: &str = "routerMode";
+
+/// Read the persisted routing mode; anything but "manual" is auto.
+pub fn load_router_auto(app: &AppHandle) -> bool {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        return true;
+    };
+    match store
+        .get(ROUTER_MODE_KEY)
+        .and_then(|v| v.as_str().map(String::from))
+    {
+        Some(mode) => mode != "manual",
+        None => true,
+    }
+}
+
+/// Persist the routing mode.
+pub fn save_router_auto(app: &AppHandle, auto: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(
+        ROUTER_MODE_KEY,
+        serde_json::json!(if auto { "auto" } else { "manual" }),
+    );
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {ROUTER_MODE_KEY} to {path}: {e}"))?;
+    Ok(())
+}
 
 /// Store key holding the privacy-mode toggle (S07). Absent means off — the
 /// default; there is no env fallback for privacy.
@@ -36,6 +71,7 @@ pub const WATCHER_ENABLED_KEY: &str = "watcherEnabled";
 pub fn lane_model_key(lane: &str) -> Option<&'static str> {
     match lane {
         crate::llm::router::THIN_LANE => Some(THIN_MODEL_KEY),
+        crate::llm::router::CODER_LANE => Some(CODER_MODEL_KEY),
         crate::llm::router::HEAVY_LANE => Some(HEAVY_MODEL_KEY),
         _ => None,
     }
@@ -693,11 +729,28 @@ pub fn save_mcp_servers(
 /// identical to [`crate::cloud::keystore::CloudProvider`]'s serde encoding.
 pub const CLOUD_HEAVY_PROVIDER_KEY: &str = "cloudHeavyProvider";
 
+/// Store key holding the coder-lane cloud provider selection (coding-agent
+/// S6). Same encoding and semantics as [`CLOUD_HEAVY_PROVIDER_KEY`].
+pub const CLOUD_CODER_PROVIDER_KEY: &str = "cloudCoderProvider";
+
 /// Read the persisted heavy-lane provider. `None` means nothing usable is
 /// persisted (no store, no key, null, or garbage — all logged where relevant):
 /// the caller keeps the default (unselected). There is no env fallback, so a
 /// flat `Option` is enough — "absent" and "explicitly none" are the same here.
 pub fn load_cloud_heavy_provider(app: &AppHandle) -> Option<crate::cloud::keystore::CloudProvider> {
+    load_cloud_lane_provider(app, CLOUD_HEAVY_PROVIDER_KEY)
+}
+
+/// Read the persisted coder-lane provider (coding-agent S6) — same contract
+/// as [`load_cloud_heavy_provider`].
+pub fn load_cloud_coder_provider(app: &AppHandle) -> Option<crate::cloud::keystore::CloudProvider> {
+    load_cloud_lane_provider(app, CLOUD_CODER_PROVIDER_KEY)
+}
+
+fn load_cloud_lane_provider(
+    app: &AppHandle,
+    key: &str,
+) -> Option<crate::cloud::keystore::CloudProvider> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,
         Err(e) => {
@@ -708,15 +761,16 @@ pub fn load_cloud_heavy_provider(app: &AppHandle) -> Option<crate::cloud::keysto
             return None;
         }
     };
-    let value = store.get(CLOUD_HEAVY_PROVIDER_KEY)?;
-    stored_cloud_heavy_provider(&value)
+    let value = store.get(key)?;
+    stored_cloud_lane_provider(key, &value)
 }
 
 /// Interpret one stored heavy-provider value. Only a recognized provider wire
 /// name is trusted; null, unknown strings, and non-strings are treated as
 /// unselected rather than silently pinning a garbage provider — there is no
 /// safe "default provider" to fall back to.
-fn stored_cloud_heavy_provider(
+fn stored_cloud_lane_provider(
+    key: &str,
     value: &serde_json::Value,
 ) -> Option<crate::cloud::keystore::CloudProvider> {
     match value {
@@ -726,8 +780,7 @@ fn stored_cloud_heavy_provider(
                 Ok(provider) => Some(provider),
                 Err(_) => {
                     log::warn!(
-                        "config: {CLOUD_HEAVY_PROVIDER_KEY} holds unrecognized value {other}; \
-                     treating as unselected"
+                        "config: {key} holds unrecognized value {other}; treating as unselected"
                     );
                     None
                 }
@@ -745,16 +798,33 @@ pub fn save_cloud_heavy_provider(
     app: &AppHandle,
     provider: Option<crate::cloud::keystore::CloudProvider>,
 ) -> Result<(), String> {
+    save_cloud_lane_provider(app, CLOUD_HEAVY_PROVIDER_KEY, provider)
+}
+
+/// Persist the coder-lane provider selection (coding-agent S6) — same
+/// contract as [`save_cloud_heavy_provider`].
+pub fn save_cloud_coder_provider(
+    app: &AppHandle,
+    provider: Option<crate::cloud::keystore::CloudProvider>,
+) -> Result<(), String> {
+    save_cloud_lane_provider(app, CLOUD_CODER_PROVIDER_KEY, provider)
+}
+
+fn save_cloud_lane_provider(
+    app: &AppHandle,
+    key: &str,
+    provider: Option<crate::cloud::keystore::CloudProvider>,
+) -> Result<(), String> {
     let path = store_path(app);
     let store = app
         .store(SETTINGS_STORE)
         .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
     let wire = provider.map(|p| p.account());
-    store.set(CLOUD_HEAVY_PROVIDER_KEY, serde_json::json!(wire));
-    store.save().map_err(|e| {
-        format!("failed to persist {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}: {e}")
-    })?;
-    log::info!("config: persisted {CLOUD_HEAVY_PROVIDER_KEY}={wire:?} to {path}");
+    store.set(key, serde_json::json!(wire));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {key}={wire:?} to {path}: {e}"))?;
+    log::info!("config: persisted {key}={wire:?} to {path}");
     Ok(())
 }
 
@@ -1723,6 +1793,49 @@ pub fn save_approved_action_kinds(app: &AppHandle, kinds: &[String]) -> Result<(
     Ok(())
 }
 
+/// Store key for the designated workspace roots (coding-agent S2): the
+/// ONLY directories the coding tools may touch. Absolute paths.
+pub const WORKSPACE_ROOTS_KEY: &str = "workspaceRoots";
+
+/// Read the persisted workspace roots (garbage-tolerant, order-preserving
+/// dedupe like the command allowlist).
+pub fn load_workspace_roots(app: &AppHandle) -> Vec<String> {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        return Vec::new();
+    };
+    let Some(value) = store.get(WORKSPACE_ROOTS_KEY) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        log::warn!("config: {WORKSPACE_ROOTS_KEY} holds a non-array value; treating as empty");
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| item.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect()
+}
+
+/// Persist the workspace roots (already cleaned by the caller).
+pub fn save_workspace_roots(app: &AppHandle, roots: &[String]) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(WORKSPACE_ROOTS_KEY, serde_json::json!(roots));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {WORKSPACE_ROOTS_KEY} to {path}: {e}"))?;
+    log::info!(
+        "config: persisted {WORKSPACE_ROOTS_KEY} ({} roots) to {path}",
+        roots.len()
+    );
+    Ok(())
+}
+
 /// The retention window in milliseconds; `None` for "forever" (never prune)
 /// AND for out-of-contract values — garbage must never widen deletion.
 pub fn memory_retention_window_ms(retention: &str) -> Option<i64> {
@@ -1856,6 +1969,10 @@ mod tests {
     fn lane_model_key_maps_canonical_lanes_and_rejects_others() {
         assert_eq!(lane_model_key(THIN_LANE), Some("thinModel"));
         assert_eq!(lane_model_key(HEAVY_LANE), Some("heavyModel"));
+        assert_eq!(
+            lane_model_key(crate::llm::router::CODER_LANE),
+            Some("coderModel")
+        );
         assert_eq!(lane_model_key("turbo"), None);
     }
 
@@ -2277,14 +2394,20 @@ mod tests {
         use crate::cloud::keystore::CloudProvider;
         for provider in CloudProvider::ALL {
             let stored = serde_json::json!(provider.account());
-            assert_eq!(stored_cloud_heavy_provider(&stored), Some(provider));
+            assert_eq!(
+                stored_cloud_lane_provider(CLOUD_HEAVY_PROVIDER_KEY, &stored),
+                Some(provider)
+            );
         }
     }
 
     #[test]
     fn stored_null_cloud_heavy_provider_is_unselected() {
         // null is the persisted "no provider selected" decision.
-        assert_eq!(stored_cloud_heavy_provider(&serde_json::Value::Null), None);
+        assert_eq!(
+            stored_cloud_lane_provider(CLOUD_CODER_PROVIDER_KEY, &serde_json::Value::Null),
+            None
+        );
     }
 
     #[test]
@@ -2299,7 +2422,11 @@ mod tests {
             serde_json::json!({"provider": "openai"}),
             serde_json::json!(["openai"]),
         ] {
-            assert_eq!(stored_cloud_heavy_provider(&bad), None, "bad value: {bad}");
+            assert_eq!(
+                stored_cloud_lane_provider(CLOUD_HEAVY_PROVIDER_KEY, &bad),
+                None,
+                "bad value: {bad}"
+            );
         }
     }
 

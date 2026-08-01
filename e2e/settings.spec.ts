@@ -57,7 +57,7 @@ test("sidebar navigation switches pages and ?section= deep-links land directly",
 test("sidebar search filters nav items by label and keywords", async ({ page }) => {
   await page.goto("/?view=settings");
   const nav = page.getByRole("navigation", { name: "Settings sections" });
-  await expect(nav.locator(".settings-nav-item")).toHaveCount(12);
+  await expect(nav.locator(".settings-nav-item")).toHaveCount(13);
 
   // A label match narrows the tree to the one hit and drops emptied groups.
   await page.getByLabel("Search settings").fill("mcp");
@@ -71,7 +71,7 @@ test("sidebar search filters nav items by label and keywords", async ({ page }) 
 
   // Clearing restores the full tree.
   await page.getByLabel("Search settings").fill("");
-  await expect(nav.locator(".settings-nav-item")).toHaveCount(12);
+  await expect(nav.locator(".settings-nav-item")).toHaveCount(13);
 });
 
 test("model section degrades to a named unavailable state, with refresh", async ({ page }) => {

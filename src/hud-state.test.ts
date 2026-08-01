@@ -79,6 +79,17 @@ describe("describeCall", () => {
     expect(malformed).toEqual({ label: "input action", input: true, target: null });
     expect(describeCall("some_new_tool", "{}").label).toBe("some new tool");
   });
+
+  it("labels the workspace file tools by file name", () => {
+    expect(describeCall("read_file", JSON.stringify({ path: "/ws/src/main.rs" })).label).toBe(
+      "read · main.rs",
+    );
+    expect(describeCall("write_file", JSON.stringify({ path: "notes/a.txt", content: "x" })).label).toBe(
+      "write · a.txt",
+    );
+    expect(describeCall("list_dir", "{}").label).toBe("list the workspace");
+    expect(describeCall("list_dir", JSON.stringify({ path: "/ws/src" })).label).toBe("list · src");
+  });
 });
 
 describe("run lifecycle", () => {

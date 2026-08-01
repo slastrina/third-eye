@@ -55,6 +55,12 @@ pub const ERROR_EVENT: &str = "llm://error";
 /// construction: never persisted, cleared per turn UI-side. The string half of
 /// the contract with `src/chat.ts` (pinned by a Rust test and its TS twin).
 pub const REASONING_EVENT: &str = "llm://reasoning";
+/// Live terminal output (coding-agent S4): each chunk of a
+/// `run_in_workspace` command's stdout/stderr as it streams, so the
+/// transcript's terminal block shows a build LIVE instead of only its final
+/// report. Payload: [`TerminalChunkPayload`]. The string half of the
+/// contract with `src/chat.ts` (pinned by a Rust test and its TS twin).
+pub const TERMINAL_CHUNK_EVENT: &str = "llm://terminal-chunk";
 /// Routing-state broadcast (S07): mutation responses only reach the calling
 /// window, so every successful `set_model` / `set_lane_model` also emits the
 /// updated [`ModelInfo`] app-wide — the overlay stays truthful when the
@@ -449,6 +455,13 @@ pub struct LlmState {
     /// through [`Self::mark_running`] / [`Self::request_stop`] /
     /// [`Self::finish_with_phase`] so every transition is one auditable seam.
     run_phase: Mutex<RunPhase>,
+    /// AUTO routing (coding-agent S1): when true (the default), each
+    /// request picks its lane via [`crate::llm::routing::select_lane`];
+    /// the chips switch to manual pinning. Persisted; applied at boot.
+    auto_route: AtomicBool,
+    /// The conversation's sticky escalation: once auto routes heavy/coder,
+    /// follow-ups stay there until ＋New / resume resets it.
+    auto_lock: Mutex<Option<String>>,
 }
 
 impl LlmState {
@@ -460,6 +473,8 @@ impl LlmState {
             next_request_id: AtomicU64::new(1),
             active: Mutex::new(None),
             run_phase: Mutex::new(RunPhase::Idle),
+            auto_route: AtomicBool::new(true),
+            auto_lock: Mutex::new(None),
         }
     }
 
@@ -518,10 +533,12 @@ impl LlmState {
         heavy: Option<String>,
         guard: Arc<GuardState>,
     ) -> Self {
-        Self::new(Arc::new(ModelRouter::thin_heavy(
+        let coder = std::env::var("THIRD_EYE_CODER_MODEL").ok();
+        Self::new(Arc::new(ModelRouter::thin_heavy_coder(
             &env_endpoint(endpoint),
             env_model(thin),
             env_model(heavy),
+            env_model(coder),
             guard,
         )))
     }
@@ -537,10 +554,38 @@ impl LlmState {
     /// `set_model` command. Unknown lane names are rejected with an error
     /// naming the lane and the known set; routing is left unchanged. The
     /// router logs every real switch at info level (old → new).
+    pub fn auto_route(&self) -> bool {
+        self.auto_route.load(Ordering::SeqCst)
+    }
+
+    pub fn set_auto_route(&self, auto: bool) {
+        self.auto_route.store(auto, Ordering::SeqCst);
+        if auto {
+            // Entering auto starts a fresh routing slate.
+            self.auto_lock.lock().unwrap().take();
+        }
+    }
+
+    /// Reset the sticky escalation — ＋New chat / session resume.
+    pub fn reset_auto_lock(&self) {
+        self.auto_lock.lock().unwrap().take();
+    }
+
+    fn auto_locked(&self) -> Option<String> {
+        self.auto_lock.lock().unwrap().clone()
+    }
+
+    fn lock_auto_lane(&self, lane: &str) {
+        *self.auto_lock.lock().unwrap() = Some(lane.to_string());
+    }
+
     pub fn set_model(&self, lane: &str) -> Result<ModelInfo, String> {
-        self.router
+        let mut info = self
+            .router
             .set_active(lane)
-            .inspect_err(|e| log::warn!("llm: set_model rejected: {e}"))
+            .inspect_err(|e| log::warn!("llm: set_model rejected: {e}"))?;
+        info.auto = self.auto_route();
+        Ok(info)
     }
 
     /// Re-pin a lane's model — the validated core of the `set_lane_model`
@@ -576,7 +621,8 @@ impl LlmState {
     /// Routing state snapshot — the core of the `model_info` command
     /// (health-as-value pattern, like `llm_health`).
     pub fn model_info(&self) -> ModelInfo {
-        let info = self.router.info();
+        let mut info = self.router.info();
+        info.auto = self.auto_route();
         log::debug!(
             "llm: model info query active={} lanes={}",
             info.active_lane,
@@ -720,6 +766,60 @@ fn ingest_reply_text(result: &Result<LoopOutcome, LlmError>) -> Option<String> {
     }
 }
 
+/// Per-request routed-lane broadcast (`llm://routed`): the footer shows
+/// the truth of what auto picked (or the manual pin) for THIS request.
+pub const ROUTED_EVENT: &str = "llm://routed";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutedPayload {
+    request_id: u64,
+    lane: String,
+    model: String,
+}
+
+fn broadcast_routed(app: &AppHandle, request_id: u64, lane: &str, model: &str) {
+    let payload = RoutedPayload {
+        request_id,
+        lane: lane.to_string(),
+        model: model.to_string(),
+    };
+    if let Err(e) = app.emit(ROUTED_EVENT, payload) {
+        log::warn!("llm: {ROUTED_EVENT} emit failed: {e}");
+    }
+}
+
+/// The [`TERMINAL_CHUNK_EVENT`] payload: one live chunk of a
+/// `run_in_workspace` command's output, tagged with the request and call it
+/// belongs to (staleness / block matching in `src/chat.ts`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalChunkPayload {
+    pub request_id: u64,
+    pub call_id: String,
+    pub chunk: String,
+}
+
+/// Production [`crate::workspace::exec_tool::TerminalSink`]: broadcasts each
+/// chunk app-wide. Emission failure is logged, never fatal (token policy).
+struct TauriTerminalSink {
+    app: AppHandle,
+    request_id: u64,
+}
+
+impl crate::workspace::exec_tool::TerminalSink for TauriTerminalSink {
+    fn chunk(&self, call_id: &str, text: &str) {
+        let payload = TerminalChunkPayload {
+            request_id: self.request_id,
+            call_id: call_id.to_string(),
+            chunk: text.to_string(),
+        };
+        if let Err(e) = self.app.emit(TERMINAL_CHUNK_EVENT, payload) {
+            log::warn!("llm: {TERMINAL_CHUNK_EVENT} emit failed: {e}");
+        }
+    }
+}
+
 /// Start a streaming chat completion. Returns the request id immediately;
 /// tokens and the terminal outcome arrive as `llm://*` events tagged with it.
 /// Any in-flight request is aborted first (single-flight).
@@ -730,7 +830,38 @@ pub async fn chat(
     messages: Vec<ChatMessage>,
 ) -> Result<u64, String> {
     let id = state.begin();
-    let client: Arc<dyn LlmClient> = state.router.clone();
+    // AUTO routing (coding-agent S1): pick this request's lane from the ask
+    // (sticky once escalated); manual mode keeps the router's pinned active
+    // lane. Either way the REAL routed lane is broadcast — the footer never
+    // guesses.
+    let client: Arc<dyn LlmClient> = if state.auto_route() {
+        let ask = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let locked = state.auto_locked();
+        let lane = crate::llm::routing::select_lane(ask, locked.as_deref());
+        if crate::llm::routing::locks_conversation(lane) {
+            state.lock_auto_lane(lane);
+        }
+        match state.router.lane_client(lane) {
+            Ok((model, client)) => {
+                log::info!("llm: request {id} auto-routed lane={lane} model={model}");
+                broadcast_routed(&app, id, lane, &model);
+                client
+            }
+            Err(e) => {
+                log::warn!("llm: auto route to {lane} failed ({e}); using active lane");
+                state.router.clone()
+            }
+        }
+    } else {
+        let info = state.router.info();
+        broadcast_routed(&app, id, &info.active_lane, "");
+        state.router.clone()
+    };
     log::debug!(
         "llm: request {id} start endpoint={} messages={}",
         client.endpoint(),
@@ -940,6 +1071,56 @@ pub async fn chat(
             screen_state.backend(),
             focused_app,
         )));
+        // Workspace file tools (coding-agent S3): structurally inert until
+        // the user designates roots; writes approval-gated on the shared
+        // plumbing. Same mode snapshot as the other gated tools this run.
+        {
+            let ws = task_app
+                .state::<std::sync::Arc<crate::workspace::WorkspaceState>>()
+                .inner()
+                .clone();
+            executors.push(Box::new(crate::workspace::fs_tools::ReadFileTool::new(
+                ws.clone(),
+            )));
+            executors.push(Box::new(crate::workspace::fs_tools::ListDirTool::new(
+                ws.clone(),
+            )));
+            executors.push(Box::new(crate::workspace::fs_tools::WriteFileTool::new(
+                ws.clone(),
+                mode,
+                approval.whitelist(),
+                approver.clone(),
+            )));
+            // Workspace diff (coding-agent S5): read-only git status+diff,
+            // the model's review mirror before declaring an edit done.
+            executors.push(Box::new(
+                crate::workspace::diff_tool::WorkspaceDiffTool::new(ws.clone()),
+            ));
+            // VS Code debug requests (coding-agent S7): delivered over the
+            // loopback bridge; the user approves inside VS Code.
+            executors.push(Box::new(crate::bridge::debug_tool::VsCodeDebugTool::new(
+                ws.clone(),
+                task_app
+                    .state::<std::sync::Arc<crate::bridge::BridgeState>>()
+                    .inner()
+                    .clone(),
+            )));
+            // Workspace exec (coding-agent S4): cwd locked inside a root,
+            // per-root session grants, live output over llm://terminal-chunk,
+            // and the run's own Stop flag kills the process GROUP mid-build.
+            executors.push(Box::new(
+                crate::workspace::exec_tool::RunInWorkspaceTool::new(
+                    ws,
+                    approval.whitelist(),
+                    approver.clone(),
+                    stop.clone(),
+                    Arc::new(TauriTerminalSink {
+                        app: task_app.clone(),
+                        request_id: id,
+                    }),
+                ),
+            ));
+        }
         // Machine inventory (computer-control I1): read-only cache search, no
         // gate needed — it discloses what the filesystem scan already found.
         executors.push(Box::new(crate::inventory::FindProgramsTool::new(
@@ -1284,9 +1465,31 @@ pub fn set_model(
     state: State<'_, LlmState>,
     lane: String,
 ) -> Result<ModelInfo, String> {
-    let info = state.set_model(&lane)?;
+    // "auto" is a routing MODE, not a lane: requests pick their own lane
+    // (coding-agent S1). Any real lane name pins manual mode to it.
+    let info = if lane == "auto" {
+        state.set_auto_route(true);
+        state.model_info()
+    } else {
+        let info = state.set_model(&lane)?;
+        state.set_auto_route(false);
+        info
+    };
+    if let Err(e) = crate::config::save_router_auto(&app, state.auto_route()) {
+        log::warn!("llm: persisting router mode failed: {e}");
+    }
     broadcast_model_info(&app, &info);
     Ok(info)
+}
+
+/// Apply the persisted routing mode at boot (in-memory only).
+pub fn apply_persisted_router_mode(app: &AppHandle) {
+    let auto = crate::config::load_router_auto(app);
+    app.state::<LlmState>().set_auto_route(auto);
+    log::info!(
+        "llm: routing mode = {}",
+        if auto { "auto" } else { "manual" }
+    );
 }
 
 /// Re-pin a lane's model and persist it to settings.json (S07): the store
@@ -1337,6 +1540,10 @@ pub fn apply_persisted_lane_models(app: &AppHandle) {
     for (lane, key) in [
         (THIN_LANE, crate::config::THIN_MODEL_KEY),
         (HEAVY_LANE, crate::config::HEAVY_MODEL_KEY),
+        (
+            crate::llm::router::CODER_LANE,
+            crate::config::CODER_MODEL_KEY,
+        ),
     ] {
         if let Some(pin) = crate::config::load_lane_model(app, key) {
             match state.set_lane_model(lane, pin.clone()) {
@@ -2397,6 +2604,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_chunk_event_name_and_payload_are_the_ipc_contract() {
+        // src/chat.ts pins the same event string and reads requestId/callId/
+        // chunk — the live terminal-block stream's contract lock (S4).
+        assert_eq!(TERMINAL_CHUNK_EVENT, "llm://terminal-chunk");
+        let v = serde_json::to_value(TerminalChunkPayload {
+            request_id: 7,
+            call_id: "c1".into(),
+            chunk: "Compiling…".into(),
+        })
+        .unwrap();
+        assert_eq!(v["requestId"], 7);
+        assert_eq!(v["callId"], "c1");
+        assert_eq!(v["chunk"], "Compiling…");
+    }
+
+    #[test]
     fn reasoning_event_name_and_payload_are_the_ipc_contract() {
         // src/chat.ts pins the same event string and reads `delta` — the const
         // and payload shape are the contract lock for the Thinking… stream.
@@ -2455,6 +2678,38 @@ mod tests {
         assert_eq!(v["error"]["kind"], "interrupted");
         assert_eq!(v["error"]["endpoint"], "http://192.168.182.224:1234");
         assert_eq!(v["error"]["partialText"], "half");
+    }
+
+    #[test]
+    fn auto_mode_flag_rides_model_info_and_resets_the_lock() {
+        let s = LlmState::from_env(
+            Some("http://127.0.0.1:9".into()),
+            Some("thin-1b".into()),
+            Some("heavy-7b".into()),
+            Arc::new(GuardState::new()),
+        );
+        // Default is AUTO; the flag rides every info snapshot.
+        assert!(s.auto_route());
+        assert!(s.model_info().auto);
+        // Manual pin clears auto; the flag follows.
+        s.set_auto_route(false);
+        assert!(!s.model_info().auto);
+        // Re-entering auto clears any sticky lock.
+        s.lock_auto_lane("coder");
+        s.set_auto_route(true);
+        assert_eq!(s.auto_locked(), None);
+    }
+
+    #[test]
+    fn from_env_builds_the_thin_heavy_coder_trio() {
+        let s = LlmState::from_env(
+            Some("http://127.0.0.1:9".into()),
+            None,
+            None,
+            Arc::new(GuardState::new()),
+        );
+        let lanes: Vec<String> = s.model_info().lanes.into_iter().map(|l| l.name).collect();
+        assert_eq!(lanes, vec!["thin", "heavy", "coder"]);
     }
 
     #[test]

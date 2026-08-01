@@ -70,6 +70,7 @@ rmcp = { version = "2.2", default-features = false, features = ["client", "trans
 # Windows-msvc and Linux cross-checks stay green and Cargo.lock stays free of
 # aws-lc-sys. Only the frontmatter YAML uses it; the `---` split is hand-rolled.
 serde_yml = "0.0.12"
+tokio-tungstenite = "0.24"
 
 [dev-dependencies]
 # net + io-util power the raw TcpListener mock server in llm tests; `process`

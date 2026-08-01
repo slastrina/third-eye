@@ -18,6 +18,7 @@ export type SectionId =
   | "input"
   | "mcp"
   | "tools"
+  | "workspaces"
   | "nudges"
   | "overlay"
   | "programs"
@@ -62,6 +63,7 @@ export const SECTION_GROUPS: SectionGroup[] = [
       { id: "input", label: "Input Control", keywords: "hid mouse keyboard click type" },
       { id: "mcp", label: "MCP Servers", keywords: "tools external stdio http json" },
       { id: "tools", label: "Tools", keywords: "builtin toggle disable screenshot clipboard terminal recall" },
+      { id: "workspaces", label: "Workspaces", keywords: "coding folder root files code agent write" },
       { id: "nudges", label: "Nudges", keywords: "hint suggestion" },
     ],
   },

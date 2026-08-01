@@ -1420,6 +1420,55 @@ body,
   overflow-y: auto;
 }
 
+.chat-diff {
+  margin: 6px 0;
+  border: 1px solid var(--te-line-strong);
+  border-radius: var(--te-r-sm);
+  background: rgba(2, 8, 24, 0.55);
+  overflow: hidden;
+}
+.chat-diff[data-ok="false"] {
+  border-color: var(--te-red-border);
+}
+.chat-diff summary {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 10px;
+  font-family: var(--te-font-mono);
+  font-size: 12px;
+  color: var(--te-text);
+  cursor: pointer;
+  user-select: none;
+}
+.chat-diff[open] summary {
+  border-bottom: 1px solid var(--te-line);
+}
+.chat-diff-out {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--te-font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--te-text-mid);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.chat-diff-line[data-kind="add"] {
+  color: var(--te-green);
+}
+.chat-diff-line[data-kind="del"] {
+  color: var(--te-red-soft);
+}
+.chat-diff-line[data-kind="hunk"] {
+  color: var(--te-amber);
+}
+.chat-diff-line[data-kind="meta"] {
+  color: var(--te-text-dim);
+}
+
 .overlay-new-chat {
   appearance: none;
   border: 1px solid var(--te-line-strong);
@@ -1764,4 +1813,32 @@ body,
 }
 .chat-steps-list li[data-ok="true"] .chat-step-mark {
   color: var(--te-green, #93da49);
+}
+
+
+/* Workspaces pane (coding-agent S2) */
+.settings-workspace-add {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.settings-workspace-add input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.9);
+  font: inherit;
+  font-size: 12px;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.settings-workspace-add button {
+  background: rgba(147, 218, 73, 0.14);
+  border: 1px solid rgba(147, 218, 73, 0.4);
+  color: var(--te-green, #93da49);
+  font: inherit;
+  font-size: 12px;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
 }

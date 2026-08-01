@@ -74,6 +74,24 @@ describe("cloudReducer opt-in transitions", () => {
     expect(s.keys).toEqual(bothKeys);
     expect(s.heavy?.provider).toBe("openai");
   });
+
+  it("tracks the coder-lane selection independently of heavy (S6)", () => {
+    expect(initialCloudViewState.coder).toBeNull();
+    let s = cloudReducer(initialCloudViewState, {
+      type: "heavy",
+      status: { provider: "openai", persistError: null },
+    });
+    s = cloudReducer(s, {
+      type: "coder",
+      status: { provider: "anthropic", persistError: null },
+    });
+    expect(s.heavy?.provider).toBe("openai");
+    expect(s.coder?.provider).toBe("anthropic");
+    // Clearing coder never touches heavy.
+    s = cloudReducer(s, { type: "coder", status: { provider: null, persistError: null } });
+    expect(s.coder?.provider).toBeNull();
+    expect(s.heavy?.provider).toBe("openai");
+  });
 });
 
 describe("cloudReducer key presence + error channel", () => {

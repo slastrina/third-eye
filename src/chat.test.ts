@@ -30,6 +30,10 @@ import {
   MCP_APPROVAL_EVENT,
   TOOL_CALL_EVENT,
   TOOL_RESULT_EVENT,
+  TERMINAL_CHUNK_EVENT,
+  RUN_IN_WORKSPACE_TOOL,
+  WORKSPACE_DIFF_TOOL,
+  diffLineKind,
   type ActionKind,
   type ApprovalVerdict,
   type HidApprovalRequest,
@@ -277,6 +281,7 @@ describe("chatReducer resubmit and retry", () => {
 describe("chatReducer model info", () => {
   const routing: ModelInfo = {
     activeLane: "thin",
+    auto: false,
     endpoint: ENDPOINT,
     lanes: [
       { name: "thin", modelId: "thin-1b" },
@@ -305,6 +310,7 @@ describe("chatReducer model info", () => {
   it("accepts unpinned lanes (single-model fallback shape)", () => {
     const single: ModelInfo = {
       activeLane: "thin",
+      auto: false,
       endpoint: ENDPOINT,
       lanes: [
         { name: "thin", modelId: null },
@@ -463,7 +469,7 @@ describe("chatReducer attach lifecycle (R004/R007)", () => {
   it("streaming and failure actions preserve the staged attachment", () => {
     let s = attached();
     s = chatReducer(s, { type: "capture-permission", permission: { granted: true, supported: true } });
-    s = chatReducer(s, { type: "model-info", info: { activeLane: "thin", endpoint: ENDPOINT, lanes: [] } });
+    s = chatReducer(s, { type: "model-info", info: { activeLane: "thin", auto: false, endpoint: ENDPOINT, lanes: [] } });
     expect(s.attachment).toEqual(frame);
     expect(s.capturePermission).toEqual({ granted: true, supported: true });
   });
@@ -989,6 +995,7 @@ describe("chatReducer nudge lifecycle", () => {
 describe("resume-chat seeding (2026-07-27)", () => {
   const modelInfo: ModelInfo = {
     activeLane: "thin",
+    auto: false,
     endpoint: "http://localhost:1234",
     lanes: [{ name: "thin", modelId: "thin-1b" }],
   };
@@ -1186,6 +1193,100 @@ describe("terminal runs in the transcript (computer-control I2)", () => {
     });
     const terminal = lastAssistant(state).terminal ?? [];
     expect(terminal[0].command).toBe("{not json");
+  });
+
+  it("run_in_workspace gets the same terminal block and streams chunks live (S4)", () => {
+    expect(TERMINAL_CHUNK_EVENT).toBe("llm://terminal-chunk");
+    let state = chatReducer(streamingState(), {
+      type: "tool-call",
+      payload: {
+        requestId: 7,
+        round: 0,
+        call: {
+          id: "w1",
+          name: RUN_IN_WORKSPACE_TOOL,
+          arguments: JSON.stringify({ command: "cargo build" }),
+        },
+      },
+    });
+    state = chatReducer(state, {
+      type: "terminal-chunk",
+      payload: { requestId: 7, callId: "w1", chunk: "   Compiling third-eye\n" },
+    });
+    state = chatReducer(state, {
+      type: "terminal-chunk",
+      payload: { requestId: 7, callId: "w1", chunk: "    Finished dev\n" },
+    });
+    let terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal[0].command).toBe("cargo build");
+    expect(terminal[0].ok).toBeNull();
+    expect(terminal[0].preview).toBe("   Compiling third-eye\n    Finished dev\n");
+    // A stale chunk (wrong request) never lands.
+    const stale = chatReducer(state, {
+      type: "terminal-chunk",
+      payload: { requestId: 6, callId: "w1", chunk: "ghost" },
+    });
+    expect((lastAssistant(stale).terminal ?? [])[0].preview).not.toContain("ghost");
+    // The result's bounded report replaces the stream, and later chunks
+    // cannot reopen a settled block.
+    state = chatReducer(state, {
+      type: "tool-result",
+      payload: {
+        requestId: 7,
+        round: 0,
+        callId: "w1",
+        name: RUN_IN_WORKSPACE_TOOL,
+        ok: true,
+        resultCount: null,
+        mode: null,
+        failure: null,
+        preview: "exit code: 0 (in 4.20s)",
+      },
+    });
+    state = chatReducer(state, {
+      type: "terminal-chunk",
+      payload: { requestId: 7, callId: "w1", chunk: "late" },
+    });
+    terminal = lastAssistant(state).terminal ?? [];
+    expect(terminal[0].ok).toBe(true);
+    expect(terminal[0].preview).toBe("exit code: 0 (in 4.20s)");
+  });
+
+  it("workspace_diff renders a collapsible diff block from the result preview (S5)", () => {
+    let state = chatReducer(streamingState(), {
+      type: "tool-call",
+      payload: {
+        requestId: 7,
+        round: 0,
+        call: { id: "d1", name: WORKSPACE_DIFF_TOOL, arguments: "{}" },
+      },
+    });
+    let diffs = lastAssistant(state).diffs ?? [];
+    expect(diffs).toEqual([{ callId: "d1", ok: null, report: null }]);
+    state = chatReducer(state, {
+      type: "tool-result",
+      payload: {
+        requestId: 7,
+        round: 0,
+        callId: "d1",
+        name: WORKSPACE_DIFF_TOOL,
+        ok: true,
+        resultCount: null,
+        mode: null,
+        failure: null,
+        preview: "status:\n M main.rs\ndiff:\n+fn new() {}\n-fn old() {}",
+      },
+    });
+    diffs = lastAssistant(state).diffs ?? [];
+    expect(diffs[0].ok).toBe(true);
+    expect(diffs[0].report).toContain("+fn new() {}");
+    // The colorizer maps line prefixes, meta before add/del.
+    expect(diffLineKind("+fn new() {}")).toBe("add");
+    expect(diffLineKind("-fn old() {}")).toBe("del");
+    expect(diffLineKind("+++ b/main.rs")).toBe("meta");
+    expect(diffLineKind("--- a/main.rs")).toBe("meta");
+    expect(diffLineKind("@@ -1 +1 @@")).toBe("hunk");
+    expect(diffLineKind(" fn kept() {}")).toBe("context");
   });
 });
 

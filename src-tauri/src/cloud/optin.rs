@@ -281,6 +281,96 @@ pub fn cloud_heavy_provider(state: State<'_, CloudHeavyProvider>) -> CloudHeavyP
     state.status()
 }
 
+/// The coder-lane cloud provider selection (coding-agent S6): the same
+/// pattern as [`CloudHeavyProvider`], for the coder lane — local
+/// qwen3-coder-next by default, Claude/OpenAI when the user opts the lane
+/// into cloud. A separate managed type because Tauri state is keyed by
+/// exact type; the semantics are identical.
+#[derive(Debug, Default)]
+pub struct CloudCoderProvider {
+    provider: Mutex<Option<CloudProvider>>,
+    persist_error: Mutex<Option<String>>,
+}
+
+impl CloudCoderProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn provider(&self) -> Option<CloudProvider> {
+        *self.provider.lock().unwrap()
+    }
+
+    pub fn set_provider(&self, provider: Option<CloudProvider>) -> Option<CloudProvider> {
+        std::mem::replace(&mut self.provider.lock().unwrap(), provider)
+    }
+
+    pub fn record_persist_error(&self, error: Option<String>) {
+        *self.persist_error.lock().unwrap() = error;
+    }
+
+    pub fn status(&self) -> CloudHeavyProviderStatus {
+        CloudHeavyProviderStatus {
+            provider: self.provider(),
+            persist_error: self.persist_error.lock().unwrap().clone(),
+        }
+    }
+}
+
+/// The one shared coder-provider applier — [`apply_cloud_heavy_provider`]'s
+/// twin: persist, roll back on failure, re-evaluate routing, return status.
+pub fn apply_cloud_coder_provider(
+    app: &AppHandle,
+    desired: Option<CloudProvider>,
+    via: &str,
+) -> CloudHeavyProviderStatus {
+    let state = app.state::<CloudCoderProvider>();
+    let previous = state.set_provider(desired);
+    match crate::config::save_cloud_coder_provider(app, desired) {
+        Ok(()) => {
+            state.record_persist_error(None);
+            log::info!(
+                "cloud: coder provider set to {} (via {via})",
+                desired.map(|p| p.account()).unwrap_or("none")
+            );
+        }
+        Err(e) => {
+            state.set_provider(previous);
+            log::error!("cloud: {e}");
+            state.record_persist_error(Some(e));
+        }
+    }
+    super::routing::apply_cloud_routing(app);
+    state.status()
+}
+
+/// Apply the persisted coder-provider selection at startup (in-memory only).
+pub fn apply_persisted_cloud_coder_provider(app: &AppHandle) {
+    if let Some(provider) = crate::config::load_cloud_coder_provider(app) {
+        app.state::<CloudCoderProvider>()
+            .set_provider(Some(provider));
+        log::info!(
+            "cloud: applied persisted coder provider ({})",
+            provider.account()
+        );
+    }
+}
+
+/// Set the coder-lane cloud provider from the UI (`null` clears it).
+#[tauri::command]
+pub fn set_cloud_coder_provider(
+    app: AppHandle,
+    provider: Option<CloudProvider>,
+) -> CloudHeavyProviderStatus {
+    apply_cloud_coder_provider(&app, provider, "ipc")
+}
+
+/// Current coder-lane provider selection — health-as-value, never an error.
+#[tauri::command]
+pub fn cloud_coder_provider(state: State<'_, CloudCoderProvider>) -> CloudHeavyProviderStatus {
+    state.status()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

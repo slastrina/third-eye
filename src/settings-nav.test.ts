@@ -31,6 +31,7 @@ describe("SECTION_GROUPS", () => {
         "status",
         "tools",
         "watcher",
+        "workspaces",
       ].sort(),
     );
   });

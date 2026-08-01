@@ -3,6 +3,8 @@ use tauri::Manager;
 pub mod appfocus;
 #[cfg(desktop)]
 pub mod autostart;
+#[cfg(desktop)]
+pub mod bridge;
 pub mod capture;
 #[cfg(desktop)]
 pub mod clipboard_tool;
@@ -36,6 +38,8 @@ pub mod tool_toggles;
 pub mod tray;
 #[cfg(desktop)]
 pub mod watcher;
+#[cfg(desktop)]
+pub mod workspace;
 
 /// Build identity for the Settings About row (user request 2026-07-31):
 /// version from Cargo, commit + timestamp stamped by build.rs — "which
@@ -140,6 +144,11 @@ pub fn run() {
     let builder = builder.manage(nudge::NudgeState::new());
     // Per-tool switchboard — managed as Arc so chat runs share the live set.
     let builder = builder.manage(std::sync::Arc::new(tool_toggles::ToolToggles::new()));
+    // Workspace roots (coding-agent S2): the only fs surface the coder may touch.
+    #[cfg(desktop)]
+    let builder = builder.manage(std::sync::Arc::new(workspace::WorkspaceState::new()));
+    // VS Code loopback bridge (coding-agent S7): loopback-only, token-authed.
+    let builder = builder.manage(std::sync::Arc::new(bridge::BridgeState::new()));
     // Cloud keystore (M004 S02): key bytes live in the OS credential store;
     // the managed state only ever serializes presence booleans outbound.
     #[cfg(desktop)]
@@ -154,6 +163,8 @@ pub fn run() {
     // the Settings surface can render the choice; live routing lands in S05.
     #[cfg(desktop)]
     let builder = builder.manage(cloud::optin::CloudHeavyProvider::new());
+    // Coder-lane cloud provider selection (coding-agent S6): same pattern.
+    let builder = builder.manage(cloud::optin::CloudCoderProvider::new());
 
     // Persisted overlay presentation (M006 S04): the mode + per-edge extents +
     // modal size the overlay webview applies. Defaults to modal at the default
@@ -290,6 +301,9 @@ pub fn run() {
             build_info,
             llm::commands::approved_action_kinds,
             llm::commands::remove_approved_action_kind,
+            workspace::commands::workspace_roots,
+            workspace::commands::set_workspace_roots,
+            bridge::bridge_status,
             tool_toggles::tool_toggles_status,
             tool_toggles::set_tool_enabled,
             settings_window::show_settings_window,
@@ -303,6 +317,8 @@ pub fn run() {
             cloud::optin::cloud_optin_status,
             cloud::optin::set_cloud_heavy_provider,
             cloud::optin::cloud_heavy_provider,
+            cloud::optin::set_cloud_coder_provider,
+            cloud::optin::cloud_coder_provider,
             // First-run onboarding (M006): the overlay's first-launch explainer
             // requests the OS permissions with context, then marks onboarding
             // done so it never shows again. Requesting Accessibility here does
@@ -384,6 +400,10 @@ pub fn run() {
             tool_toggles::apply_persisted_tool_toggles(app.handle());
             llm::commands::apply_persisted_approvals(app.handle());
             memory::commands::spawn_prune_loop(app.handle());
+            llm::commands::apply_persisted_router_mode(app.handle());
+            workspace::commands::apply_persisted_workspace_roots(app.handle());
+            // VS Code bridge (S7): loopback WS + discovery file, fail-soft.
+            bridge::start_bridge(app.handle());
 
             // Persisted cloud opt-in (M004 S03): a present settings.json key
             // restores the user's choice; absent keeps the safe default (off).
@@ -397,6 +417,7 @@ pub fn run() {
             // listening yet; S05 wires it into the running heavy lane.
             #[cfg(desktop)]
             cloud::optin::apply_persisted_cloud_heavy_provider(app.handle());
+            cloud::optin::apply_persisted_cloud_coder_provider(app.handle());
 
             // Persisted overlay presentation (M006 S04): a present settings.json
             // key restores the overlay shape; absent keeps the safe default

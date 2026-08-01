@@ -323,7 +323,13 @@ pub fn set_memory_retention(app: tauri::AppHandle, retention: String) -> MemoryR
 /// Start a fresh chat session (computer-control I3): the overlay's New-chat
 /// control. Subsequent exchanges append here; resolves with the new id.
 #[tauri::command]
-pub fn chat_new_session(memory: State<'_, MemoryState>) -> Result<i64, MemoryError> {
+pub fn chat_new_session(
+    app: tauri::AppHandle,
+    memory: State<'_, MemoryState>,
+) -> Result<i64, MemoryError> {
+    // A fresh conversation starts a fresh routing slate (coding-agent S1).
+    app.state::<crate::llm::commands::LlmState>()
+        .reset_auto_lock();
     let store = require_store(&memory)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -341,9 +347,12 @@ pub fn chat_new_session(memory: State<'_, MemoryState>) -> Result<i64, MemoryErr
 /// the store's typed not-found — nothing is repointed on failure.
 #[tauri::command]
 pub fn chat_resume_session(
+    app: tauri::AppHandle,
     memory: State<'_, MemoryState>,
     id: i64,
 ) -> Result<Vec<crate::memory::store::ChatSessionMessage>, MemoryError> {
+    app.state::<crate::llm::commands::LlmState>()
+        .reset_auto_lock();
     let store = require_store(&memory)?;
     let messages = store.chat_session_messages(id)?;
     if messages.is_empty() {

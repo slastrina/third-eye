@@ -14,7 +14,9 @@
 
 import type {
   BuildInfo,
-  NudgeHistoryEntry, ToolTogglesStatus } from "./chat";
+  NudgeHistoryEntry, ToolTogglesStatus,
+  WorkspaceStatus,
+  BridgeStatus } from "./chat";
 import { useEffect, useReducer, useState } from "react";
 import {
   bannerDetail,
@@ -46,6 +48,9 @@ import {
   setNudgesEnabled,
   setToolEnabled,
   toolTogglesStatus,
+  setWorkspaceRoots,
+  workspaceRoots,
+  bridgeStatus,
   type CommandsStatus,
   type HidRunMode,
   type InventoryEntry,
@@ -56,6 +61,7 @@ import {
 import {
   CLOUD_PROVIDERS,
   cloudHeavyProvider,
+  cloudCoderProvider,
   cloudKeyStatus,
   cloudOptinStatus,
   cloudReducer,
@@ -67,6 +73,7 @@ import {
   onCloudOptin,
   setCloudApiKey,
   setCloudHeavyProvider,
+  setCloudCoderProvider,
   setCloudOptin,
   type CloudProvider,
 } from "./cloud-state";
@@ -302,6 +309,9 @@ function Settings() {
   const [nudgeLog, setNudgeLog] = useState<NudgeHistoryEntry[] | null>(null);
   const [approvedKinds, setApprovedKinds] = useState<string[] | null>(null);
   const [build, setBuild] = useState<BuildInfo | null>(null);
+  const [workspaces, setWorkspaces] = useState<WorkspaceStatus | null>(null);
+  const [bridge, setBridge] = useState<BridgeStatus | null>(null);
+  const [newRoot, setNewRoot] = useState("");
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
   // or persist failure lands the truthful state, never a lying chip.
@@ -411,6 +421,14 @@ function Settings() {
       (info) => setBuild(info),
       (err) => console.debug("settings: build_info unavailable:", err),
     );
+    bridgeStatus().then(
+      (status) => setBridge(status),
+      (err) => console.debug("settings: bridge_status unavailable:", err),
+    );
+    workspaceRoots().then(
+      (status) => setWorkspaces(status),
+      (err) => console.debug("settings: workspace_roots unavailable:", err),
+    );
     memoryRetention().then(
       (status) => setRetention(status.retention as Retention),
       (err) => console.debug("settings: memory_retention unavailable:", err),
@@ -443,6 +461,10 @@ function Settings() {
     cloudHeavyProvider().then(
       (status) => dispatchCloud({ type: "heavy", status }),
       (err) => console.debug("settings: cloud_heavy_provider unavailable:", err),
+    );
+    cloudCoderProvider().then(
+      (status) => dispatchCloud({ type: "coder", status }),
+      (err) => console.debug("settings: cloud_coder_provider unavailable:", err),
     );
     // MCP host health + server list — health-as-value, safe to poll (R007). The
     // mcp://state subscription is the live path; these are the boot snapshot.
@@ -732,6 +754,12 @@ function Settings() {
     );
   };
 
+  const selectCoderProvider = (provider: CloudProvider | null) => {
+    setCloudCoderProvider(provider).then(
+      (status) => dispatchCloud({ type: "coder", status }),
+      (err) => console.debug("settings: set_cloud_coder_provider unavailable:", err),
+    );
+  };
   const selectHeavyProvider = (provider: CloudProvider | null) => {
     setCloudHeavyProvider(provider).then(
       // Never rejects backend-side; a persist failure rides persistError.
@@ -1648,6 +1676,103 @@ function Settings() {
         </section>
         )}
 
+        {active === "workspaces" && (
+        <section className="settings-section" aria-labelledby="settings-workspaces-heading">
+          <h2 id="settings-workspaces-heading" className="settings-section-title">
+            Workspaces
+          </h2>
+          <p className="settings-hint">
+            The only folders the coding agent may read, write, and run
+            commands in. Nothing outside these is ever touched; with none
+            configured, the coding tools are not offered at all.
+          </p>
+          {workspaces === null && (
+            <p className="settings-unavailable">
+              Workspace state is unavailable outside the app.
+            </p>
+          )}
+          {workspaces?.persistError && (
+            <div className="settings-error" role="alert">
+              <strong>Workspaces couldn't be saved</strong>
+              <span>{workspaces.persistError}</span>
+            </div>
+          )}
+          {workspaces !== null && (
+            <>
+              <ul className="settings-approved-kinds">
+                {workspaces.roots.map((root) => (
+                  <li key={root}>
+                    <span>{root}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove workspace ${root}`}
+                      onClick={() =>
+                        setWorkspaceRoots(workspaces.roots.filter((r) => r !== root)).then(
+                          (status) => setWorkspaces(status),
+                          (err) =>
+                            console.debug("settings: set_workspace_roots failed:", err),
+                        )
+                      }
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <form
+                className="settings-workspace-add"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const root = newRoot.trim();
+                  if (!root) return;
+                  setWorkspaceRoots([...workspaces.roots, root]).then(
+                    (status) => {
+                      setWorkspaces(status);
+                      setNewRoot("");
+                    },
+                    (err) => console.debug("settings: set_workspace_roots failed:", err),
+                  );
+                }}
+              >
+                <input
+                  type="text"
+                  placeholder="/Users/you/code/project (absolute path)"
+                  aria-label="Add workspace folder"
+                  value={newRoot}
+                  onChange={(event) => setNewRoot(event.target.value)}
+                />
+                <button type="submit">Add</button>
+              </form>
+            </>
+          )}
+          {bridge !== null && (
+            <>
+              <h3 className="guard-subheading">VS Code</h3>
+              <div className="settings-row">
+                <span className="settings-row-label">Bridge</span>
+                <span data-bridge-state>
+                  {bridge.running
+                    ? `listening on 127.0.0.1:${bridge.port} · ${bridge.connected} connected`
+                    : "off"}
+                </span>
+              </div>
+              <div className="settings-row">
+                <span className="settings-row-label">VS Code</span>
+                <span data-vscode-detected>
+                  {bridge.vscodeDetected ? "detected" : "not detected"}
+                </span>
+              </div>
+              <p className="settings-hint">
+                The Third Eye extension shows files, diffs, and run status live
+                in VS Code while the agent codes. Build and install it with
+                `make vsix` then `code --install-extension` — it finds this app
+                automatically via the bridge.
+              </p>
+            </>
+          )}
+        </section>
+        )}
+
         {active === "tools" && (
         <section className="settings-section" aria-labelledby="settings-tools-heading">
           <h2 id="settings-tools-heading" className="settings-section-title">
@@ -1795,13 +1920,46 @@ function Settings() {
                 </select>
               </label>
               <p className="settings-hint">
-                Which provider the heavy lane targets. Routing lands in a later
-                update — this only remembers the choice for now.
+                Which provider the heavy lane targets while cloud is on;
+                none keeps it on the local model.
               </p>
               {cloud.heavy?.persistError && (
                 <div className="settings-error" role="alert">
                   <strong>Provider choice couldn't be saved</strong>
                   <span>{cloud.heavy.persistError}</span>
+                </div>
+              )}
+              <label className="settings-row">
+                <span className="settings-row-label">Coder lane provider</span>
+                <select
+                  className="settings-select"
+                  aria-label="Coder lane cloud provider"
+                  data-cloud-coder-provider
+                  value={cloud.coder?.provider ?? DEFAULT_OPTION}
+                  onChange={(event) =>
+                    selectCoderProvider(
+                      event.target.value === DEFAULT_OPTION
+                        ? null
+                        : (event.target.value as CloudProvider),
+                    )
+                  }
+                >
+                  <option value={DEFAULT_OPTION}>none (local only)</option>
+                  {CLOUD_PROVIDERS.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="settings-hint">
+                Which provider the coder lane targets while cloud is on;
+                none keeps coding on the local model.
+              </p>
+              {cloud.coder?.persistError && (
+                <div className="settings-error" role="alert">
+                  <strong>Provider choice couldn't be saved</strong>
+                  <span>{cloud.coder.persistError}</span>
                 </div>
               )}
             </>

@@ -67,12 +67,13 @@ export function describeCall(name: string, rawArguments: string): {
         return { label: "input action", input: true, target: null };
     }
   }
-  if (name === "run_command") {
+  if (name === "run_command" || name === "run_in_workspace") {
     const command = typeof args.command === "string" ? args.command : "";
     const shown = command.length > 40 ? `${command.slice(0, 40)}…` : command;
     // Commands hold the terminal, not the pointer — input:true so the HUD
     // shows while they run (they act on the machine like input does).
-    return { label: shown ? `run · ${shown}` : "run a command", input: true, target: null };
+    const fallback = name === "run_in_workspace" ? "run in workspace" : "run a command";
+    return { label: shown ? `run · ${shown}` : fallback, input: true, target: null };
   }
   if (name === "clipboard") {
     const op = typeof args.op === "string" ? args.op : "";
@@ -107,6 +108,23 @@ export function describeCall(name: string, rawArguments: string): {
       input: false,
       target: null,
     };
+  }
+  if (name === "read_file" || name === "write_file") {
+    const path = typeof args.path === "string" ? args.path : "";
+    const file = path.split("/").filter(Boolean).pop() ?? "";
+    const verb = name === "read_file" ? "read" : "write";
+    return { label: file ? `${verb} · ${file}` : `${verb} a file`, input: false, target: null };
+  }
+  if (name === "workspace_diff") {
+    return { label: "review the diff", input: false, target: null };
+  }
+  if (name === "vscode_debug") {
+    return { label: "ask VS Code to debug", input: false, target: null };
+  }
+  if (name === "list_dir") {
+    const path = typeof args.path === "string" ? args.path : "";
+    const dir = path.split("/").filter(Boolean).pop() ?? "";
+    return { label: dir ? `list · ${dir}` : "list the workspace", input: false, target: null };
   }
   if (name === "focus_app") {
     // The wire argument is `app` (FocusAppTool's schema); `name` kept as a

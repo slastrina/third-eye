@@ -27,11 +27,14 @@ import {
   onLlmToken,
   onLlmToolCall,
   onLlmToolResult,
+  onTerminalChunk,
+  diffLineKind,
   onHidApprovalRequest,
   onHidApprovalResolved,
   onMcpApprovalRequest,
   onMcpApprovalResolved,
   onModelInfoBroadcast,
+  onRouted,
   onNudgeDismiss,
   onNudgeShow,
   onPrivacyChanged,
@@ -329,6 +332,8 @@ function App() {
       // user-visible past them.
       onLlmToolCall((payload) => dispatchChat({ type: "tool-call", payload })),
       onLlmToolResult((payload) => dispatchChat({ type: "tool-result", payload })),
+      // Live build output (coding-agent S4) streams into the terminal block.
+      onTerminalChunk((payload) => dispatchChat({ type: "terminal-chunk", payload })),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -1041,6 +1046,14 @@ function App() {
     dispatchChat({ type: "mcp-approval-answered", approvalId });
   };
 
+  const [routedLane, setRoutedLane] = useState<string | null>(null);
+  useEffect(() => {
+    const un = onRouted((payload) => setRoutedLane(payload.lane));
+    return () => {
+      un.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
   const overrideLane = (lane: string) => {
     setModel(lane).then(
       (info) => dispatchChat({ type: "model-info", info }),
@@ -1207,6 +1220,26 @@ function App() {
                       </div>
                       {run.preview && <pre className="chat-terminal-out">{run.preview}</pre>}
                     </div>
+                  ))}
+                {message.role === "assistant" &&
+                  (message.diffs ?? []).map((block) => (
+                    <details key={block.callId} className="chat-diff" data-ok={block.ok ?? undefined} open>
+                      <summary>
+                        changes
+                        {block.ok === null && <span className="chat-terminal-running">diffing…</span>}
+                        {block.ok === false && <span className="chat-terminal-failed">failed</span>}
+                      </summary>
+                      {block.report && (
+                        <pre className="chat-diff-out">
+                          {block.report.split("\n").map((line, i) => (
+                            <span key={i} className="chat-diff-line" data-kind={diffLineKind(line)}>
+                              {line}
+                              {"\n"}
+                            </span>
+                          ))}
+                        </pre>
+                      )}
+                    </details>
                   ))}
                 {message.role === "assistant" ? (
                   <div className="chat-text chat-markdown">
@@ -1473,12 +1506,21 @@ function App() {
               {activeModelId ?? "endpoint default model"}
             </span>
             <div className="model-lanes" role="group" aria-label="Model lane override">
+              <button
+                type="button"
+                className="model-lane model-lane--auto"
+                aria-pressed={routing.auto}
+                title="Each request picks its lane (chat → thin, computer tasks → heavy, code → coder)"
+                onClick={() => overrideLane("auto")}
+              >
+                {routing.auto && routedLane ? `auto→${routedLane}` : "auto"}
+              </button>
               {routing.lanes.map((lane) => (
                 <button
                   key={lane.name}
                   type="button"
                   className="model-lane"
-                  aria-pressed={lane.name === routing.activeLane}
+                  aria-pressed={!routing.auto && lane.name === routing.activeLane}
                   title={lane.modelId ?? "endpoint default model"}
                   onClick={() => overrideLane(lane.name)}
                 >

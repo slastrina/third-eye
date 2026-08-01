@@ -29,6 +29,7 @@ interface MockState {
   anthropicPresent: boolean;
   heavyProvider: string | null;
   heavyPersistError: string | null;
+  coderProvider?: string | null;
 }
 
 /** Serve a stateful fake Tauri backend for the S04 cloud IPC surface. Every
@@ -45,6 +46,7 @@ async function installCloudIpcMock(page: Page, seed: Partial<MockState> = {}): P
       anthropicPresent: false,
       heavyProvider: null,
       heavyPersistError: null,
+      coderProvider: null,
       ...seed,
     };
 
@@ -70,6 +72,10 @@ async function installCloudIpcMock(page: Page, seed: Partial<MockState> = {}): P
     const heavyStatus = () => ({
       provider: state.heavyProvider,
       persistError: state.heavyPersistError,
+    });
+    const coderStatus = () => ({
+      provider: state.coderProvider ?? null,
+      persistError: null,
     });
     const setPresent = (provider: string, present: boolean) => {
       if (provider === "openai") state.openaiPresent = present;
@@ -131,6 +137,12 @@ async function installCloudIpcMock(page: Page, seed: Partial<MockState> = {}): P
           case "set_cloud_heavy_provider":
             state.heavyProvider = args.provider ?? null;
             return Promise.resolve(heavyStatus());
+          // Coder-lane selection (coding-agent S6): same shape as heavy.
+          case "cloud_coder_provider":
+            return Promise.resolve(coderStatus());
+          case "set_cloud_coder_provider":
+            state.coderProvider = args.provider ?? null;
+            return Promise.resolve(coderStatus());
           default:
             return Promise.reject(`mock: no such command ${cmd}`);
         }
