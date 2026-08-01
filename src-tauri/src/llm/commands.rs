@@ -244,6 +244,12 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
             "llm: HID approval requested id={approval_id} kind={kind:?} (request={})",
             self.request_id
         );
+        // A ghosted (click-through) pill cannot take the Allow/Deny click —
+        // re-enable it for the card, and re-ghost once the verdict lands.
+        let re_ghost = crate::overlay::hid_ghost_active();
+        if re_ghost {
+            let _ = crate::hud::set_pill_interactive(&self.app, true);
+        }
         let payload = ApprovalRequestPayload {
             approval_id,
             kind,
@@ -252,9 +258,12 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
         if let Err(e) = self.app.emit(HID_APPROVAL_EVENT, payload) {
             log::warn!("llm: HID approval-request emit failed id={approval_id}: {e}; denying");
             self.state.cancel(approval_id);
+            if re_ghost && crate::overlay::hid_ghost_active() {
+                let _ = crate::hud::set_pill_interactive(&self.app, false);
+            }
             return ApprovalVerdict::Deny;
         }
-        match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+        let verdict = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
             Ok(Ok(verdict)) => {
                 log::info!("llm: HID approval id={approval_id} verdict={verdict:?}");
                 if verdict == ApprovalVerdict::AllowAlways {
@@ -264,9 +273,10 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
                     // (the persisted kind re-seeds every future session at
                     // boot); run_command becomes allow-once with its first
                     // token added to the persistent command allowlist.
-                    return persist_always_grant(&self.app, kind, &summary);
+                    persist_always_grant(&self.app, kind, &summary)
+                } else {
+                    verdict
                 }
-                verdict
             }
             Ok(Err(_closed)) => {
                 log::warn!("llm: HID approval id={approval_id} channel closed; denying");
@@ -282,7 +292,13 @@ impl ApprovalPrompt for OverlayApprovalPrompt {
                 broadcast_approval_resolved(&self.app, HID_APPROVAL_RESOLVED_EVENT, approval_id);
                 ApprovalVerdict::Deny
             }
+        };
+        // The card is settled — the ghosted run gets its click-through pill
+        // back (a run that never ghosted stays interactive).
+        if re_ghost && crate::overlay::hid_ghost_active() {
+            let _ = crate::hud::set_pill_interactive(&self.app, false);
         }
+        verdict
     }
 }
 
@@ -839,7 +855,14 @@ pub async fn chat(
                 // "what did I ask you about X before" is answerable only
                 // from the actual messages, not the distilled memories.
                 executors.push(Box::new(crate::llm::toolloop::ChatHistorySearchTool::new(
+                    store.clone(),
+                )));
+                // On-demand memory (2026-07-31): "remember that…" stores a
+                // fact the moment the user asks. Same store + embedder as
+                // memory_search.
+                executors.push(Box::new(crate::llm::toolloop::RememberTool::new(
                     store,
+                    memory.embedder(client.endpoint()),
                 )));
             }
             None => {
@@ -1013,6 +1036,14 @@ pub async fn chat(
             })
             .collect();
         let executor = CompositeExecutor::new(executors);
+        {
+            let offered: Vec<String> = executor.definitions().into_iter().map(|d| d.name).collect();
+            log::info!(
+                "llm: request {id} offers {} tool(s): {}",
+                offered.len(),
+                offered.join(", ")
+            );
+        }
         // URL grounding + tab budget (2026-07-27, the one-shot fix made
         // structural): seed the seen-set from the USER's words; tool results
         // feed it as they land inside the wrapper.
@@ -1040,6 +1071,22 @@ pub async fn chat(
         if !messages.iter().any(|m| m.role == Role::System) {
             messages.insert(0, ChatMessage::system(HID_SYSTEM_PROMPT));
             log::debug!("llm: request {id} grounded with HID orchestration system prompt");
+        }
+        // Ground continuation in FACT (2026-08-01): follow-ups like "now
+        // find the PC listing" mean "continue in the app I watched you
+        // use" — tell the model what is actually frontmost right now.
+        // APPENDED to the one system message, never a second system turn:
+        // qwen's chat template renders two system messages into a malformed
+        // prompt and the model answers with an instant EOS — every chat
+        // returned tokens=0 (the broken-build report, 2026-08-01).
+        #[cfg(target_os = "macos")]
+        if let Some(front) = crate::capture::macos::frontmost_app_name() {
+            if let Some(system) = messages.iter_mut().find(|m| m.role == Role::System) {
+                system.content.push_str(&format!(
+                    "\n\nEnvironment: the frontmost app right now is {front}. If this \
+                     conversation was already working in it, follow-up requests continue THERE."
+                ));
+            }
         }
         // Load discovered markdown skill packs (M007 S06) into the system turn so
         // a dropped-in SKILL.md visibly shapes behavior for a matching task. The

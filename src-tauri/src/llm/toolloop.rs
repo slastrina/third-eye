@@ -58,6 +58,8 @@ pub const CHAT_HISTORY_SEARCH_TOOL: &str = "chat_history_search";
 
 pub const READ_PAGE_TOOL: &str = "read_page";
 
+pub const REMEMBER_TOOL: &str = "remember";
+
 /// The HID tool S01 ships (M005). One tool with a tagged `action` argument
 /// (mirroring [`InputAction`]'s serde tag) keeps the composite's
 /// dispatch-by-name simple and the model's tool list short.
@@ -138,7 +140,11 @@ EVALUATE THE GOAL before finishing: after the last action of any on-screen task,
 not just your last action's success. If focus_app reports visibleWindows 0, the app is frontmost \
 but the user sees NOTHING — open a window (key-press \"n\" with modifiers [\"cmd\"]) and verify \
 again, or say plainly that the app has no window open. Only declare the task done when the final \
-look confirms it; otherwise describe what you see and what is still missing. take_screenshot does \
+look confirms it; otherwise describe what you see and what is still missing. Your FINAL ANSWER \
+must summarize WHAT YOU FOUND — the actual content: item names, prices, ratings, key facts read \
+from the page (read_page before answering a find-task) — not a list of the steps you took; the \
+user watched the steps happen. Write answers in plain prose/markdown — never LaTeX math \
+notation ($$…$$); this is a chat overlay, not a paper. take_screenshot does \
 NOT save a file unless you pass save: true (Desktop by default, `directory` for a user-named \
 folder) — when the user asks to save a screenshot pass save: true and quote the exact saved path \
 from the result; never claim a screenshot was saved anywhere else.\n\n\
@@ -152,12 +158,25 @@ You CAN recall the past: memory_search finds distilled memories of the user's ac
 earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. \
 When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
 about?\"), call chat_history_search with a short keyword (e.g. \"recipe\") and answer from the \
-matches — never claim you have no access to past conversations without searching first.\n\n\
+matches — never claim you have no access to past conversations without searching first. When \
+the user asks you to REMEMBER something (\"remember that…\"), call remember with one concise \
+self-contained fact — never claim you cannot store information.\n\n\
 CONTINUITY: follow-up questions usually refer to what you JUST did and what is on screen right \
 now. A page you opened earlier in this conversation is still open — \"this recipe\", \"the \
 ingredients\", \"read it to me\" mean THAT page. Answer by looking: focus_app the browser if \
 needed, then read_page for the page's full text (or screen_query/take_screenshot for layout). \
-Never claim you cannot see a page you opened — read it.\n\n\
+Never claim you cannot see a page you opened — read it. The same goes for the TASK: a \
+follow-up that refines what you just did (\"now the PC version\", \"only ones under $50\", \
+\"sort by price\") means CONTINUE in the same app and page — refine the search there, use the \
+site's filters, read the results, answer. Never ask whether the user wants you to \"actually \
+search\" — they just asked; act.\n\n\
+When the site you need is ALREADY open and shows its own search box, USE that search box — \
+click it, type the query, press return — instead of composing a parameterized URL by hand. \
+Hand-built query URLs are only for opening a NEW search-results page on a search engine.\n\
+When the browser is ALREADY focused with a visible window, navigate IN that window: key-press \
+[\"cmd\"]+\"t\" for a new tab, type-text the URL, key-press \"return\" — never run_command `open` \
+then, it can spawn a second window and split your view of the page. Use `open` only to launch or \
+reach a browser that has no window yet. Typed URLs follow the same grounding rules as opened ones.\n\
 To open a website or run a web search, prefer ONE run_command with `open` and the full URL — \
 e.g. `open \"https://www.google.com/search?q=lasagne+recipes\"` — the browser opens and loads it \
 directly, with no clicking or typing. NEVER invent specific page URLs (a recipe page, an article, \
@@ -782,6 +801,30 @@ impl ToolExecutor for UrlGroundingExecutor {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        // Typed navigation is navigation: a type-text carrying a deep URL
+        // the model never saw is the same one-shot guess as `open`ing it —
+        // the address-bar path must not be a grounding loophole.
+        if call.name == INPUT_ACTION_TOOL {
+            let typed = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .filter(|v| v.get("action").and_then(|a| a.as_str()) == Some("type-text"))
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from));
+            if let Some(text) = typed {
+                for url in extract_urls(&text) {
+                    if !url_is_open_by_default(&url) && !self.seen.contains(&url) {
+                        log::warn!("llm: type-text refused — ungrounded url {url:?}");
+                        return ToolOutcome::failure(
+                            UNGROUNDED_URL_KIND,
+                            format!(
+                                "{url} was never given by the user or read from a page — typing \
+                                 a guessed URL is the same as opening one. Search first, then \
+                                 CLICK the result you want (or type a search-results URL)."
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         if call.name == crate::command_runner::RUN_COMMAND_TOOL {
             let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
@@ -827,6 +870,136 @@ impl ToolExecutor for UrlGroundingExecutor {
         // Everything the model just read is now legitimately navigable.
         self.seen.harvest(&outcome.content);
         outcome
+    }
+}
+
+/// On-demand memory (user request 2026-07-31): "remember that my name is
+/// Alex" becomes a stored memory the moment the user asks — deterministic,
+/// unlike hoping the passive chat distiller keeps the detail. Stored with
+/// `Told` provenance (the user chose these words), embedded best-effort so
+/// semantic recall works, visible and deletable in the memory window like
+/// every other memory.
+pub struct RememberTool {
+    store: Arc<MemoryStore>,
+    embedder: Arc<dyn Embedder>,
+}
+
+/// Longest fact the tool stores — memories are one-liners, not documents.
+const REMEMBER_MAX_CHARS: usize = 500;
+
+impl RememberTool {
+    pub fn new(store: Arc<MemoryStore>, embedder: Arc<dyn Embedder>) -> Self {
+        Self { store, embedder }
+    }
+
+    pub fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: REMEMBER_TOOL.into(),
+            description: "Store one fact in persistent memory, exactly when the user asks you \
+                          to remember something (\"remember that…\", \"save this\", \"don't \
+                          forget…\"). Write the fact as ONE concise self-contained sentence \
+                          (\"The user's name is Alex\"), never a whole conversation. It survives \
+                          restarts and is found later by memory_search. Do not store secrets \
+                          (passwords, keys) — tell the user you won't keep those."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "The one-sentence fact to keep, self-contained."
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["development", "browsing", "communication", "writing", "media",
+                                 "shopping", "reference", "personal", "system", "other"],
+                        "description": "Where this fact belongs; default personal."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Up to 5 short lowercase keywords (optional)."
+                    }
+                },
+                "required": ["fact"]
+            }),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RememberArgs {
+    fact: String,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl ToolExecutor for RememberTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name != REMEMBER_TOOL {
+            return ToolOutcome::failure(
+                "unknown-tool",
+                format!("unknown tool: {} (available: {REMEMBER_TOOL})", call.name),
+            );
+        }
+        let args: RememberArgs = match serde_json::from_str(&call.arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return ToolOutcome::failure(
+                    "invalid-arguments",
+                    format!("invalid {REMEMBER_TOOL} arguments: {e}"),
+                )
+            }
+        };
+        let fact = args.fact.trim();
+        if fact.is_empty() {
+            return ToolOutcome::failure(
+                "invalid-arguments",
+                "fact must not be empty — one concise sentence to keep",
+            );
+        }
+        let fact: String = fact.chars().take(REMEMBER_MAX_CHARS).collect();
+        // Best-effort embedding: a down embedder means keyword-only recall
+        // for this row, never a failed save.
+        let embedding = match self.embedder.embed(std::slice::from_ref(&fact)).await {
+            Ok(mut vectors) if !vectors.is_empty() => Some(vectors.remove(0)),
+            Ok(_) => None,
+            Err(e) => {
+                log::debug!("remember: embedding unavailable ({e}); keyword recall only");
+                None
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match self.store.insert(crate::memory::store::NewMemory {
+            summary: fact.clone(),
+            apps: Vec::new(),
+            span_start_ms: now_ms,
+            span_end_ms: now_ms,
+            embedding,
+            source: crate::memory::store::MemorySource::Told,
+            category: args.category.unwrap_or_else(|| "personal".into()),
+            tags: args.tags.unwrap_or_default(),
+            // A fact the user asked to keep must not silently expire.
+            pinned: true,
+            expires_at_ms: None,
+        }) {
+            Ok(record) => ToolOutcome::success(format!(
+                "remembered (memory #{}): {fact} — recall it later with memory_search; the user \
+                 can see and delete it in the memory window",
+                record.id
+            )),
+            Err(e) => ToolOutcome::failure(e.kind(), format!("saving the memory failed: {e}")),
+        }
     }
 }
 
@@ -2427,6 +2600,10 @@ mod tests {
                 span_end_ms: 2_000,
                 embedding: None,
                 source: crate::memory::store::MemorySource::Watcher,
+                category: "other".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
             })
             .unwrap();
         MemorySearchTool::new(Arc::new(store), Arc::new(DownEmbedder))

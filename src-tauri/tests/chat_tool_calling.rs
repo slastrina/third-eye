@@ -236,6 +236,10 @@ fn seeded_store(scratch: &ScratchDb) -> Arc<MemoryStore> {
             span_end_ms: 2_000,
             embedding: None,
             source: MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: None,
         })
         .expect("insert seed memory");
     store
@@ -246,6 +250,10 @@ fn seeded_store(scratch: &ScratchDb) -> Arc<MemoryStore> {
             span_end_ms: 4_000,
             embedding: None,
             source: MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: None,
         })
         .expect("insert second seed memory");
     store
@@ -636,6 +644,10 @@ async fn live_tool_calling_against_lm_studio() {
                 span_end_ms: 2_000 + i as i64,
                 embedding,
                 source: MemorySource::Watcher,
+                category: "other".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
             })
             .expect("insert seeded memory");
     }

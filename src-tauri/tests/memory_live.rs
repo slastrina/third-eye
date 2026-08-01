@@ -74,6 +74,10 @@ fn memory_db_file_is_text_only() {
                 span_end_ms: 2_000 + i,
                 embedding: Some(vec![0.25, -0.5, 1.0]),
                 source: MemorySource::Watcher,
+                category: "other".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
             })
             .expect("insert");
     }

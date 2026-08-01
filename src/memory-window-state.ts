@@ -23,14 +23,40 @@ export function filterRecords(records: readonly MemoryRecord[], filter: string):
   const needle = filter.trim().toLowerCase();
   if (needle.length === 0) return [...records];
   return records.filter((record) =>
-    `${record.summary} ${record.apps.join(" ")}`.toLowerCase().includes(needle),
+    `${record.summary} ${record.apps.join(" ")} ${(record.tags ?? []).join(" ")} ${record.category ?? ""}`
+      .toLowerCase()
+      .includes(needle),
   );
+}
+
+/** Category facet chips: distinct categories present, biggest first, with
+ *  counts — the browse row above the timeline (memory v2). */
+export function categoryFacets(
+  records: readonly MemoryRecord[],
+): { category: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const record of records) {
+    const category = record.category ?? "other";
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([category, count]) => ({ category, count }))
+    .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
+}
+
+/** Apply the selected category facet (null = all). */
+export function byCategory(
+  records: readonly MemoryRecord[],
+  category: string | null,
+): MemoryRecord[] {
+  if (category === null) return [...records];
+  return records.filter((record) => (record.category ?? "other") === category);
 }
 
 /** The Learned subset: chat-distilled memories (source vocabulary is
  *  lenient-lowercase on the wire; anything not "chat" is watcher-class). */
 export function learnedRecords(records: readonly MemoryRecord[]): MemoryRecord[] {
-  return records.filter((record) => record.source === "chat");
+  return records.filter((record) => record.source === "chat" || record.source === "told");
 }
 
 /** "3:12 PM"-style label for a record's span end (when it was observed). */

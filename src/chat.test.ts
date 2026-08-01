@@ -1224,3 +1224,51 @@ describe("approval prompt queues (the stuck-run fix)", () => {
     expect(s.mcpApprovals).toHaveLength(0);
   });
 });
+
+describe("transcript steps block (2026-08-01)", () => {
+  const call = (id: string, name: string, args: string): ToolCallPayload => ({
+    requestId: 1,
+    round: 0,
+    call: { id, name, arguments: args },
+  });
+  const result = (id: string, name: string, ok: boolean): ToolResultPayload => ({
+    requestId: 1,
+    round: 0,
+    callId: id,
+    name,
+    ok,
+    resultCount: null,
+    mode: null,
+    failure: ok ? null : "off-target",
+  });
+
+  it("folds every tool call into steps and settles them from results", () => {
+    let s = chatReducer(initialChatState, { type: "submit", question: "find hl2" });
+    s = chatReducer(s, { type: "request-started", requestId: 1 });
+    s = chatReducer(s, { type: "tool-call", payload: call("c1", "focus_app", '{"app":"Chrome"}') });
+    s = chatReducer(s, {
+      type: "tool-call",
+      payload: call("c2", "input_action", '{"action":"mouse-click","x":10,"y":20}'),
+    });
+    s = chatReducer(s, { type: "tool-result", payload: result("c1", "focus_app", true) });
+    s = chatReducer(s, { type: "tool-result", payload: result("c2", "input_action", false) });
+    const assistant = s.messages[s.messages.length - 1];
+    expect(assistant.steps).toEqual([
+      { callId: "c1", label: "focus · Chrome", ok: true },
+      { callId: "c2", label: "click · 10, 20", ok: false },
+    ]);
+    // Replayed calls fold once.
+    s = chatReducer(s, { type: "tool-call", payload: call("c1", "focus_app", "{}") });
+    expect(s.messages[s.messages.length - 1].steps).toHaveLength(2);
+  });
+});
+
+describe("markdown math-delimiter stripping", () => {
+  it("unwraps $$..$$, \\[..\\] and \\(..\\) to plain text", async () => {
+    const { stripMathDelimiters } = await import("./ui/Markdown");
+    expect(stripMathDelimiters("$$2 + 2 = 4$$")).toBe("2 + 2 = 4");
+    expect(stripMathDelimiters("so \\(x=1\\) and \\[y=2\\] hold")).toBe("so x=1 and y=2 hold");
+    // Ordinary dollars survive: prices are not math.
+    expect(stripMathDelimiters("costs $50 or $11.50 used")).toBe("costs $50 or $11.50 used");
+  });
+});

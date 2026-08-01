@@ -201,12 +201,27 @@ fn dispatch(app: &AppHandle, event: OverlayEvent) -> Result<OverlayState, String
 /// again; an idle one stays click-through) — ghost never leaks a clickable
 /// frame into a state that must not accept clicks.
 pub fn set_hid_ghost(app: &AppHandle, on: bool) -> Result<(), String> {
+    HID_GHOST_ACTIVE.store(on, std::sync::atomic::Ordering::SeqCst);
     platform::set_ghost(app, on)?;
+    // The hud-pill goes click-through with the overlay: it sits where page
+    // chrome (search bars) lives and the model cannot see it (capture
+    // excludes our own windows) — a covered target must receive the click.
+    if let Err(e) = crate::hud::set_pill_interactive(app, !on) {
+        log::warn!("overlay: pill ghost toggle failed: {e}");
+    }
     if !on {
         let state = app.state::<OverlayManager>().current();
         platform::set_click_through(app, click_through(state))?;
     }
     Ok(())
+}
+
+/// Whether an input run currently holds ghost mode — the approval prompt
+/// consults this to re-enable the pill for its cards and re-ghost after.
+static HID_GHOST_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn hid_ghost_active() -> bool {
+    HID_GHOST_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[tauri::command]

@@ -11,6 +11,16 @@ export interface MarkdownProps {
  *  cannot script the overlay. Links open nowhere by default (a navigation
  *  would tear down the overlay webview mid-chat); they render as styled text
  *  with the href in the tooltip so the user can read the destination. */
+/** Strip LaTeX math delimiters to plain text: the renderer has no KaTeX,
+ *  so `$$2 + 2 = 4$$` showed its raw dollars in the transcript (qwen loves
+ *  math notation). The inner expression reads fine as ordinary text. */
+export function stripMathDelimiters(text: string): string {
+  return text
+    .replace(/\$\$([^$]+)\$\$/g, "$1")
+    .replace(/\\\[([\s\S]+?)\\\]/g, "$1")
+    .replace(/\\\(([\s\S]+?)\\\)/g, "$1");
+}
+
 export function Markdown({ text }: MarkdownProps) {
   return (
     <ReactMarkdown
@@ -28,7 +38,7 @@ export function Markdown({ text }: MarkdownProps) {
         ),
       }}
     >
-      {text}
+      {stripMathDelimiters(text)}
     </ReactMarkdown>
   );
 }

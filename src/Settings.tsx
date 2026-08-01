@@ -13,6 +13,7 @@
 // a plain browser, never crash.
 
 import type {
+  BuildInfo,
   NudgeHistoryEntry, ToolTogglesStatus } from "./chat";
 import { useEffect, useReducer, useState } from "react";
 import {
@@ -37,6 +38,7 @@ import {
   setHidRunMode,
   setMemoryRetention,
   approvedActionKinds,
+  buildInfo,
   removeApprovedActionKind,
   setNudgeAutoDismiss,
   setNudgeCooldown,
@@ -299,6 +301,7 @@ function Settings() {
   const [toolToggles, setToolToggles] = useState<ToolTogglesStatus | null>(null);
   const [nudgeLog, setNudgeLog] = useState<NudgeHistoryEntry[] | null>(null);
   const [approvedKinds, setApprovedKinds] = useState<string[] | null>(null);
+  const [build, setBuild] = useState<BuildInfo | null>(null);
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
   // or persist failure lands the truthful state, never a lying chip.
@@ -403,6 +406,10 @@ function Settings() {
     approvedActionKinds().then(
       (kinds) => setApprovedKinds(kinds),
       (err) => console.debug("settings: approved_action_kinds unavailable:", err),
+    );
+    buildInfo().then(
+      (info) => setBuild(info),
+      (err) => console.debug("settings: build_info unavailable:", err),
     );
     memoryRetention().then(
       (status) => setRetention(status.retention as Retention),
@@ -2142,8 +2149,9 @@ function Settings() {
             />
           </div>
           <p className="settings-hint">
-            Saved now; automatic pruning that enforces the window ships in a
-            later update.
+            Enforced daily: un-pinned memories older than this window are
+            pruned. Pinned memories and per-memory expiries (set in the
+            memory window) are unaffected.
           </p>
           {retentionError && (
             <div className="settings-error" role="alert">
@@ -2479,6 +2487,15 @@ function Settings() {
           <h2 id="settings-status-heading" className="settings-section-title">
             Status
           </h2>
+          {build !== null && (
+            <div className="settings-status-row">
+              <span className="settings-row-label">Build</span>
+              <span className="settings-status-value">
+                v{build.version} · {build.gitHash} ·{" "}
+                {new Date(build.builtAtMs).toLocaleString()}
+              </span>
+            </div>
+          )}
           <div className="settings-status-row">
             <span className="settings-row-label">Hotkey</span>
             <span className="settings-status-value">

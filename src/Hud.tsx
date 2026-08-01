@@ -155,7 +155,10 @@ export function HudPillView() {
     );
   };
   return (
-    <div className="hud-pill-root">
+    <div
+      className="hud-pill-root"
+      data-translucent={(live && !hudApprovalsPending(hud)) || undefined}
+    >
       <HudPill
         tone={hud.phase === "live" ? "acting" : hud.phase === "stopped" ? "stopped" : "done"}
         headline={hudHeadline(hud)}

@@ -477,3 +477,95 @@
   padding: 0;
   min-width: 0;
 }
+
+
+/* Told memories (the remember tool) read distinctly in the graph. */
+.memory-graph-dot[data-source="told"] {
+  fill: #7cc4ff;
+}
+
+
+/* ── Memory v2 browse chrome ─────────────────────────────────────────── */
+.memwin-facets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 4px 10px;
+}
+.memwin-facet {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.65);
+  font: inherit;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.memwin-facet:hover {
+  color: rgba(255, 255, 255, 0.9);
+}
+.memwin-facet[data-active] {
+  color: var(--te-green, #93da49);
+  border-color: rgba(147, 218, 73, 0.5);
+  background: rgba(147, 218, 73, 0.1);
+}
+.memwin-row--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.memwin-row-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.memwin-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding-left: 26px;
+}
+.memwin-chip {
+  background: rgba(255, 255, 255, 0.07);
+  border: none;
+  color: rgba(255, 255, 255, 0.6);
+  font: inherit;
+  font-size: 10.5px;
+  border-radius: 6px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.memwin-chip:hover {
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.12);
+}
+.memwin-chip--category {
+  cursor: default;
+  color: var(--te-amber, #e9a23b);
+  background: rgba(233, 162, 59, 0.12);
+}
+.memwin-row-pin {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.45);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.memwin-row-pin:hover,
+.memwin-row-pin[data-pinned] {
+  color: var(--te-amber, #e9a23b);
+}
+.memwin-expiry {
+  margin-left: auto;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.6);
+  font: inherit;
+  font-size: 10.5px;
+  border-radius: 6px;
+  padding: 2px 6px;
+}

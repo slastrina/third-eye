@@ -31,6 +31,14 @@ export interface MemoryRecord {
   spanStartMs: number;
   spanEndMs: number;
   createdAtMs: number;
+  /** Browse facet — one of the fixed backend taxonomy ("browsing", …). */
+  category?: string;
+  /** ≤5 lowercase keywords (mechanical, or explicit from remember). */
+  tags?: string[];
+  /** Permanent — pruning never touches it. */
+  pinned?: boolean;
+  /** Explicit expiry; absent follows the global retention window. */
+  expiresAtMs?: number | null;
   updatedAtMs: number;
 }
 
@@ -110,7 +118,7 @@ export interface MemoryGraphNode {
   id: number;
   summary: string;
   apps: string[];
-  source: "watcher" | "chat";
+  source: "watcher" | "chat" | "told";
   atMs: number;
 }
 
@@ -128,6 +136,15 @@ export interface MemoryGraphPayload {
 
 export function memoryGraph(limit?: number): Promise<MemoryGraphPayload> {
   return invoke<MemoryGraphPayload>("memory_graph", { limit });
+}
+
+export function memorySetPinned(id: number, pinned: boolean): Promise<MemoryRecord> {
+  return invoke<MemoryRecord>("memory_set_pinned", { id, pinned });
+}
+
+/** preset: "standard" | "7d" | "30d" | "60d" (from now). */
+export function memorySetExpiry(id: number, preset: string): Promise<MemoryRecord> {
+  return invoke<MemoryRecord>("memory_set_expiry", { id, preset });
 }
 
 export function memoryStatus(): Promise<MemoryStatus> {

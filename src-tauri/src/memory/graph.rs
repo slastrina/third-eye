@@ -258,6 +258,10 @@ mod tests {
                 created_at_ms: id * 1_000,
                 updated_at_ms: id * 1_000,
                 source: MemorySource::Watcher,
+                category: "other".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
             },
             None,
         )

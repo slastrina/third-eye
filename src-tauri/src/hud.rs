@@ -307,6 +307,30 @@ pub fn fit_hud_canvas(app: AppHandle, x: f64, y: f64) -> Result<HudCanvasFit, St
     })
 }
 
+/// Make the hud-pill window click-through (or interactive again). The
+/// pill sits top-center — exactly where a page's search bar often is —
+/// and capture EXCLUDES Third Eye's own windows, so during an input run
+/// the model can aim at a target the pill physically covers and can never
+/// see it (the eBay beeping-search-bar bug, 2026-08-01: clicks hit the
+/// never-key panel, keystrokes bounced off with NSBeep, and the model
+/// could not understand why). While ghosted the pill is display-only —
+/// approvals re-enable it, and Esc remains the kill switch.
+pub fn set_pill_interactive(app: &AppHandle, interactive: bool) -> Result<(), String> {
+    app.get_webview_window(HUD_PILL_LABEL)
+        .ok_or_else(|| format!("hud window '{HUD_PILL_LABEL}' not found"))?
+        .set_ignore_cursor_events(!interactive)
+        .map_err(|e| format!("pill set_ignore_cursor_events failed: {e}"))?;
+    log::debug!(
+        "hud: pill {}",
+        if interactive {
+            "interactive"
+        } else {
+            "click-through"
+        }
+    );
+    Ok(())
+}
+
 /// Show both HUD windows (canvas first so the pill stacks above it on
 /// platforms that order by front time). Driven by the pill webview when the
 /// folded hud-state first shows input activity. Never steals focus: the
@@ -350,7 +374,17 @@ pub fn sync_esc_guard(app: &AppHandle, run_live: bool) {
             .on_shortcut(shortcut, |app, _shortcut, event| {
                 if event.state() == ShortcutState::Pressed {
                     log::info!("hud: Escape kill-switch pressed — stopping the run");
-                    crate::llm::commands::stop_run_from_esc(app);
+                    // DEFERRED, never inline: this handler runs WITH the
+                    // global-shortcut manager's mutex held, and the stop
+                    // path re-enters the plugin (broadcast_run_state →
+                    // sync_esc_guard → is_registered/unregister) — calling
+                    // it synchronously deadlocked the main thread the
+                    // moment Esc was pressed mid-run (the frozen-on-Esc
+                    // report; the process sample shows the recursive lock).
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::llm::commands::stop_run_from_esc(&app);
+                    });
                 }
             });
         match result {

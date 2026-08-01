@@ -158,8 +158,10 @@ pub fn distill_messages(exchange: &Exchange) -> Vec<ChatMessage> {
              saying what the user asked and what verifiably happened, \
              naming the concrete search terms, apps, or content involved. \
              If the exchange is trivial (a greeting, small talk, nothing \
-             was done), reply with exactly the single word NOTHING. \
-             No preamble, no numbering, no formatting.",
+             was done), reply with exactly the single word NOTHING. If the \
+             exchange revealed a DURABLE fact about the user (identity, a \
+             stable preference), start the line with ! so it is kept \
+             permanently. No preamble, no numbering, no formatting.",
         ),
         ChatMessage::user(body),
     ]
@@ -170,6 +172,15 @@ pub fn distill_messages(exchange: &Exchange) -> Vec<ChatMessage> {
 /// parseable — both are successes that store nothing, never retries
 /// (retrying an empty parse loops forever; mirrors the watcher ingest's
 /// drop policy).
+/// Whether a distilled line carries the durable-fact pin marker; returns
+/// the marker-stripped line alongside.
+pub fn split_pin_marker(line: &str) -> (bool, String) {
+    match line.trim().strip_prefix('!') {
+        Some(rest) => (true, rest.trim().to_string()),
+        None => (false, line.trim().to_string()),
+    }
+}
+
 pub fn parse_distilled(text: &str) -> Option<String> {
     let first = super::ingest::parse_summaries(text).into_iter().next()?;
     if first
@@ -435,6 +446,7 @@ pub async fn ingest_exchange(
         log::info!("memory: chat distillation start via lane={THIN_LANE} model={model}");
         match distill_one(&client, &next).await {
             Ok(Some(summary)) => {
+                let (pinned, summary) = split_pin_marker(&summary);
                 let stored = match store.insert(NewMemory {
                     summary,
                     apps: Vec::new(),
@@ -442,6 +454,10 @@ pub async fn ingest_exchange(
                     span_end_ms: next.captured_at_ms,
                     embedding: None,
                     source: MemorySource::Chat,
+                    category: "communication".into(),
+                    tags: Vec::new(),
+                    pinned,
+                    expires_at_ms: None,
                 }) {
                     Ok(record) => {
                         log::info!("memory: chat memory stored (id={})", record.id);
@@ -516,6 +532,7 @@ async fn maybe_session_summary(state: &ChatIngestState, router: &ModelRouter, st
     match client.stream_chat(&request, &|_| {}).await {
         Ok(outcome) => match parse_distilled(&outcome.text) {
             Some(summary) => {
+                let (pinned, summary) = split_pin_marker(&summary);
                 let span_start_ms = exchanges
                     .first()
                     .map(|e| e.captured_at_ms)
@@ -531,6 +548,10 @@ async fn maybe_session_summary(state: &ChatIngestState, router: &ModelRouter, st
                     span_end_ms,
                     embedding: None,
                     source: MemorySource::Chat,
+                    category: "communication".into(),
+                    tags: Vec::new(),
+                    pinned,
+                    expires_at_ms: None,
                 }) {
                     Ok(record) => {
                         log::info!("memory: chat session summary stored (id={})", record.id);
@@ -608,6 +629,18 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_marker_splits_and_plain_lines_stay_unpinned() {
+        assert_eq!(
+            split_pin_marker("! The user's name is Alex"),
+            (true, "The user's name is Alex".to_string())
+        );
+        assert_eq!(
+            split_pin_marker("Searched eBay for Half-Life 2"),
+            (false, "Searched eBay for Half-Life 2".to_string())
+        );
+    }
     use std::sync::atomic::AtomicUsize;
 
     use async_trait::async_trait;

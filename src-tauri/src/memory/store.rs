@@ -29,6 +29,10 @@ use super::MemoryError;
 pub enum MemorySource {
     Watcher,
     Chat,
+    /// Explicitly stored on the user's request (the `remember` tool,
+    /// 2026-07-31) — "remember that my name is Alex". The strongest
+    /// provenance: the user chose these words.
+    Told,
 }
 
 impl MemorySource {
@@ -37,6 +41,7 @@ impl MemorySource {
         match self {
             MemorySource::Watcher => "watcher",
             MemorySource::Chat => "chat",
+            MemorySource::Told => "told",
         }
     }
 
@@ -46,6 +51,7 @@ impl MemorySource {
         match value {
             "watcher" => MemorySource::Watcher,
             "chat" => MemorySource::Chat,
+            "told" => MemorySource::Told,
             other => {
                 log::warn!("memory: unknown source {other:?}, defaulting to watcher");
                 MemorySource::Watcher
@@ -68,8 +74,17 @@ pub struct MemoryRecord {
     pub span_end_ms: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// Where this memory came from ("watcher" / "chat" on the wire).
+    /// Where this memory came from ("watcher" / "chat" / "told" on the wire).
     pub source: MemorySource,
+    /// One of [`CATEGORIES`] — the browse facet (memory v2, 2026-08-01).
+    pub category: String,
+    /// ≤5 lowercase keywords: derived mechanically from the summary at
+    /// insert, or supplied explicitly by `remember`.
+    pub tags: Vec<String>,
+    /// Permanent — pruning never touches a pinned memory.
+    pub pinned: bool,
+    /// Explicit expiry; `None` follows the global retention window.
+    pub expires_at_ms: Option<i64>,
 }
 
 /// One cached machine-inventory entry (computer-control I1): a GUI app
@@ -138,6 +153,122 @@ pub struct NewMemory {
     pub span_end_ms: i64,
     pub embedding: Option<Vec<f32>>,
     pub source: MemorySource,
+    /// Normalized against [`CATEGORIES`] at insert (unknown → "other").
+    pub category: String,
+    /// Empty means "derive from the summary" ([`derive_tags`]).
+    pub tags: Vec<String>,
+    pub pinned: bool,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// The fixed category taxonomy (memory v2): a CLOSED set so browse chips
+/// stay renderable and search predictable. The distiller and `remember`
+/// both normalize into it; anything else lands in "other".
+pub const CATEGORIES: &[&str] = &[
+    "development",
+    "browsing",
+    "communication",
+    "writing",
+    "media",
+    "shopping",
+    "reference",
+    "personal",
+    "system",
+    "other",
+];
+
+/// Lenient category normalization: trims/lowercases; unknown → "other".
+pub fn normalize_category(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    if CATEGORIES.contains(&lower.as_str()) {
+        lower
+    } else {
+        "other".into()
+    }
+}
+
+/// Words too common to be tags — shared with the knowledge graph's edge
+/// scoring (the graph imports THIS list).
+pub const TAG_STOPWORDS: &[&str] = &[
+    "about",
+    "after",
+    "again",
+    "along",
+    "around",
+    "back",
+    "been",
+    "before",
+    "being",
+    "between",
+    "browsing",
+    "changes",
+    "chat",
+    "checked",
+    "code",
+    "computer",
+    "conversation",
+    "discussed",
+    "doing",
+    "file",
+    "files",
+    "from",
+    "have",
+    "info",
+    "information",
+    "into",
+    "just",
+    "looked",
+    "looking",
+    "more",
+    "new",
+    "online",
+    "opened",
+    "over",
+    "page",
+    "pages",
+    "read",
+    "reading",
+    "reviewed",
+    "screen",
+    "searched",
+    "searching",
+    "session",
+    "some",
+    "that",
+    "their",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "time",
+    "used",
+    "user",
+    "users",
+    "using",
+    "viewed",
+    "view",
+    "were",
+    "window",
+    "with",
+    "work",
+    "worked",
+    "working",
+];
+
+/// Mechanical tag derivation: the summary's distinctive lowercase words
+/// (≥4 chars, stopworded, deduped, first-appearance order), capped at 5.
+/// Deterministic — no model in the loop, works for every source.
+pub fn derive_tags(summary: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    summary
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 4 && !TAG_STOPWORDS.contains(w))
+        .filter(|w| seen.insert(w.to_string()))
+        .take(5)
+        .map(str::to_string)
+        .collect()
 }
 
 /// The storage seam: exactly one SQLite file (WAL), text/metadata columns
@@ -164,24 +295,32 @@ CREATE TABLE IF NOT EXISTS memories (
     embedding     TEXT,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
-    source        TEXT NOT NULL DEFAULT 'watcher'
+    source        TEXT NOT NULL DEFAULT 'watcher',
+    category      TEXT NOT NULL DEFAULT 'other',
+    tags          TEXT NOT NULL DEFAULT '[]',
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    expires_at_ms INTEGER
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     summary,
+    tags,
+    category,
     content='memories',
     content_rowid='id'
 );
 CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, summary) VALUES (new.id, new.summary);
+    INSERT INTO memories_fts(rowid, summary, tags, category)
+    VALUES (new.id, new.summary, new.tags, new.category);
 END;
 CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, summary)
-        VALUES ('delete', old.id, old.summary);
+    INSERT INTO memories_fts(memories_fts, rowid, summary, tags, category)
+    VALUES ('delete', old.id, old.summary, old.tags, old.category);
 END;
-CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF summary ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, summary)
-        VALUES ('delete', old.id, old.summary);
-    INSERT INTO memories_fts(rowid, summary) VALUES (new.id, new.summary);
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF summary, tags, category ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, summary, tags, category)
+    VALUES ('delete', old.id, old.summary, old.tags, old.category);
+    INSERT INTO memories_fts(rowid, summary, tags, category)
+    VALUES (new.id, new.summary, new.tags, new.category);
 END;
 CREATE TABLE IF NOT EXISTS inventory (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,8 +346,8 @@ CREATE TABLE IF NOT EXISTS chat_session_messages (
 /// One graph-builder input row: the record plus its private embedding.
 pub type GraphSourceRow = (MemoryRecord, Option<Vec<f32>>);
 
-const RECORD_COLUMNS: &str =
-    "id, summary, apps, span_start_ms, span_end_ms, created_at_ms, updated_at_ms, source";
+const RECORD_COLUMNS: &str = "id, summary, apps, span_start_ms, span_end_ms, created_at_ms, \
+                              updated_at_ms, source, category, tags, pinned, expires_at_ms";
 
 /// Additive migration for pre-M008 databases created before the `source`
 /// column existed: `CREATE TABLE IF NOT EXISTS` skips their existing table,
@@ -232,12 +371,79 @@ fn migrate_source_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Memory v2 migration (2026-08-01): add category/tags/pinned/expires
+/// columns, backfill mechanical tags, and rebuild the FTS index to cover
+/// tags + category. Ordering is load-bearing: SQLite compiles trigger
+/// bodies LAZILY, so the new triggers (created by SCHEMA before the
+/// columns existed) must be dropped BEFORE the backfill touches `tags`,
+/// or their 'delete' rows corrupt an index that never held those docs
+/// ("database disk image is malformed"). The rebuild uses FTS5's own
+/// 'rebuild' command — the canonical external-content resync, which also
+/// heals pre-M008 rows that were never indexed at all.
+fn migrate_memory_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(memories)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let needs_columns = !columns.iter().any(|c| c == "category");
+    let fts_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(memories_fts)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let needs_fts = !fts_columns.iter().any(|c| c == "tags");
+    if !needs_columns && !needs_fts {
+        return Ok(());
+    }
+    // Triggers and index go first — nothing may fire mid-upgrade.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memories_fts_ai;
+         DROP TRIGGER IF EXISTS memories_fts_ad;
+         DROP TRIGGER IF EXISTS memories_fts_au;
+         DROP TABLE IF EXISTS memories_fts;",
+    )?;
+    if needs_columns {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN category TEXT NOT NULL DEFAULT 'other';
+             ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+             ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE memories ADD COLUMN expires_at_ms INTEGER;",
+        )?;
+        log::info!("memory: migrated db — added category/tags/pinned/expires columns");
+    }
+    // Backfill mechanical tags for rows that predate v2 (trigger-free zone).
+    let pending: Vec<(i64, String)> = conn
+        .prepare("SELECT id, summary FROM memories WHERE tags = '[]'")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (id, summary) in &pending {
+        let tags = serde_json::to_string(&derive_tags(summary)).unwrap_or_else(|_| "[]".into());
+        if tags != "[]" {
+            conn.execute(
+                "UPDATE memories SET tags = ?1 WHERE id = ?2",
+                params![tags, id],
+            )?;
+        }
+    }
+    if !pending.is_empty() {
+        log::info!("memory: backfilled tags for {} row(s)", pending.len());
+    }
+    // Recreate the index + triggers, then resync from the content table.
+    conn.execute_batch(SCHEMA)?;
+    conn.execute(
+        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+        [],
+    )?;
+    log::info!("memory: rebuilt FTS index over summary + tags + category");
+    Ok(())
+}
+
 /// Shared connection init for both open paths: pragmas, idempotent schema,
 /// then the additive `source` migration for pre-M008 files.
 fn init_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)?;
-    migrate_source_column(conn)
+    migrate_source_column(conn)?;
+    migrate_memory_v2(conn)
 }
 
 impl MemoryStore {
@@ -305,12 +511,26 @@ impl MemoryStore {
                 detail: format!("embedding: {e}"),
             })?;
         let now = now_ms();
+        let category = normalize_category(&new.category);
+        let tags = if new.tags.is_empty() {
+            derive_tags(&new.summary)
+        } else {
+            new.tags
+                .iter()
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .take(5)
+                .collect()
+        };
+        let tags_json = serde_json::to_string(&tags).map_err(|e| MemoryError::InvalidInput {
+            detail: format!("tags: {e}"),
+        })?;
         let conn = self.lock();
         conn.execute(
             "INSERT INTO memories
                 (summary, apps, span_start_ms, span_end_ms, embedding,
-                 created_at_ms, updated_at_ms, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+                 created_at_ms, updated_at_ms, source, category, tags, pinned, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 new.summary,
                 apps_json,
@@ -318,7 +538,11 @@ impl MemoryStore {
                 new.span_end_ms,
                 embedding_json,
                 now,
-                new.source.as_str()
+                new.source.as_str(),
+                category,
+                tags_json,
+                new.pinned as i64,
+                new.expires_at_ms
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -366,6 +590,61 @@ impl MemoryStore {
             .collect())
     }
 
+    /// Enforce retention (memory v2 — the previously-unenforced window):
+    /// delete un-pinned rows whose explicit expiry has passed, or, when a
+    /// global window is set, whose creation fell outside it. Pinned rows
+    /// are untouchable. Returns how many rows went.
+    pub fn prune_expired(
+        &self,
+        now_ms: i64,
+        global_window_ms: Option<i64>,
+    ) -> Result<usize, MemoryError> {
+        let conn = self.lock();
+        let mut deleted = conn.execute(
+            "DELETE FROM memories
+             WHERE pinned = 0 AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+            params![now_ms],
+        )?;
+        if let Some(window) = global_window_ms {
+            deleted += conn.execute(
+                "DELETE FROM memories
+                 WHERE pinned = 0 AND expires_at_ms IS NULL AND created_at_ms < ?1",
+                params![now_ms.saturating_sub(window)],
+            )?;
+        }
+        Ok(deleted)
+    }
+
+    /// Pin (permanent) or unpin one memory.
+    pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<MemoryRecord, MemoryError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE memories SET pinned = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![pinned as i64, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Err(MemoryError::NotFound { id });
+        }
+        Self::get_on(&conn, id)
+    }
+
+    /// Set (or clear, back to the global window) one memory's explicit expiry.
+    pub fn set_expiry(
+        &self,
+        id: i64,
+        expires_at_ms: Option<i64>,
+    ) -> Result<MemoryRecord, MemoryError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE memories SET expires_at_ms = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![expires_at_ms, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Err(MemoryError::NotFound { id });
+        }
+        Self::get_on(&conn, id)
+    }
+
     pub fn get(&self, id: i64) -> Result<MemoryRecord, MemoryError> {
         Self::get_on(&self.lock(), id)
     }
@@ -386,11 +665,15 @@ impl MemoryStore {
         validate_summary(summary)?;
         let now = now_ms();
         let conn = self.lock();
+        // Derived metadata goes stale with the text it came from: the
+        // embedding clears (re-embedded lazily) and mechanical tags
+        // re-derive from the NEW summary.
+        let tags = serde_json::to_string(&derive_tags(summary)).unwrap_or_else(|_| "[]".into());
         let changed = conn.execute(
             "UPDATE memories
-             SET summary = ?1, embedding = NULL, updated_at_ms = ?2
-             WHERE id = ?3",
-            params![summary, now, id],
+             SET summary = ?1, embedding = NULL, tags = ?2, updated_at_ms = ?3
+             WHERE id = ?4",
+            params![summary, tags, now, id],
         )?;
         if changed == 0 {
             return Err(MemoryError::NotFound { id });
@@ -888,6 +1171,14 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
         created_at_ms: row.get(5)?,
         updated_at_ms: row.get(6)?,
         source: MemorySource::from_str_lenient(&row.get::<_, String>(7)?),
+        category: row.get::<_, String>(8).unwrap_or_else(|_| "other".into()),
+        tags: row
+            .get::<_, String>(9)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
+        pinned: row.get::<_, i64>(10).unwrap_or(0) != 0,
+        expires_at_ms: row.get::<_, Option<i64>>(11).unwrap_or(None),
     })
 }
 
@@ -903,6 +1194,10 @@ mod tests {
             span_end_ms: 2_000,
             embedding: None,
             source: MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: None,
         }
     }
 
@@ -1183,6 +1478,111 @@ mod tests {
     }
 
     #[test]
+    fn v2_fields_round_trip_and_tags_derive_mechanically() {
+        let s = store();
+        let rec = s
+            .insert(NewMemory {
+                summary: "Compared lasagna ragu recipes on RecipeTin Eats".into(),
+                apps: vec!["Chrome".into()],
+                span_start_ms: 1,
+                span_end_ms: 2,
+                embedding: None,
+                source: MemorySource::Watcher,
+                category: "Browsing".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
+            })
+            .unwrap();
+        assert_eq!(rec.category, "browsing", "category normalizes");
+        assert!(rec.tags.contains(&"lasagna".to_string()), "{:?}", rec.tags);
+        assert!(rec.tags.len() <= 5);
+        // Explicit tags win; unknown category degrades to other.
+        let told = s
+            .insert(NewMemory {
+                summary: "The user's name is Alex".into(),
+                apps: Vec::new(),
+                span_start_ms: 1,
+                span_end_ms: 2,
+                embedding: None,
+                source: MemorySource::Told,
+                category: "identity".into(),
+                tags: vec!["Name".into(), "  ".into()],
+                pinned: true,
+                expires_at_ms: None,
+            })
+            .unwrap();
+        assert_eq!(told.category, "other");
+        assert_eq!(told.tags, vec!["name".to_string()]);
+        assert!(told.pinned);
+    }
+
+    #[test]
+    fn prune_expired_honors_pins_explicit_expiries_and_the_global_window() {
+        let s = store();
+        let base = NewMemory {
+            summary: "expiring soon note".into(),
+            apps: Vec::new(),
+            span_start_ms: 1,
+            span_end_ms: 2,
+            embedding: None,
+            source: MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: Some(1_000),
+        };
+        let expired = s.insert(base.clone()).unwrap();
+        let pinned = s
+            .insert(NewMemory {
+                summary: "pinned forever note".into(),
+                pinned: true,
+                ..base.clone()
+            })
+            .unwrap();
+        let standard = s
+            .insert(NewMemory {
+                summary: "standard window note".into(),
+                expires_at_ms: None,
+                ..base.clone()
+            })
+            .unwrap();
+        // Explicit expiry passed → gone; pinned with the same expiry → kept.
+        let deleted = s.prune_expired(2_000, None).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(s.get(expired.id).is_err());
+        assert!(s.get(pinned.id).is_ok());
+        assert!(s.get(standard.id).is_ok());
+        // Global window: standard rows older than the window go; pinned stays.
+        let far_future = standard.created_at_ms + 10_000;
+        let deleted = s.prune_expired(far_future, Some(1)).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(s.get(standard.id).is_err());
+        assert!(s.get(pinned.id).is_ok());
+    }
+
+    #[test]
+    fn keyword_search_matches_explicit_tags_and_category() {
+        let s = store();
+        s.insert(NewMemory {
+            summary: "The user's name is Alex".into(),
+            apps: Vec::new(),
+            span_start_ms: 1,
+            span_end_ms: 2,
+            embedding: None,
+            source: MemorySource::Told,
+            category: "personal".into(),
+            tags: vec!["identity".into()],
+            pinned: true,
+            expires_at_ms: None,
+        })
+        .unwrap();
+        // "identity" appears ONLY as a tag; "personal" only as the category.
+        assert_eq!(s.search_keyword("identity", 10).unwrap().len(), 1);
+        assert_eq!(s.search_keyword("personal", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn keyword_search_ranks_topical_row_first() {
         let s = store();
         s.insert(mem(
@@ -1272,7 +1672,11 @@ mod tests {
                 "embedding",
                 "created_at_ms",
                 "updated_at_ms",
-                "source"
+                "source",
+                "category",
+                "tags",
+                "pinned",
+                "expires_at_ms"
             ]
         );
         for (name, ty) in &cols {
@@ -1328,12 +1732,16 @@ mod tests {
             keys,
             vec![
                 "apps",
+                "category",
                 "createdAtMs",
+                "expiresAtMs",
                 "id",
+                "pinned",
                 "source",
                 "spanEndMs",
                 "spanStartMs",
                 "summary",
+                "tags",
                 "updatedAtMs"
             ]
         );

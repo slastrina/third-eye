@@ -386,6 +386,73 @@ pub fn chat_session_messages(
     store.chat_session_messages(id)
 }
 
+/// Pin (permanent) or unpin one memory — pruning never touches pinned.
+#[tauri::command]
+pub fn memory_set_pinned(
+    memory: State<'_, MemoryState>,
+    id: i64,
+    pinned: bool,
+) -> Result<crate::memory::store::MemoryRecord, MemoryError> {
+    let store = require_store(&memory)?;
+    store.set_pinned(id, pinned)
+}
+
+/// Set one memory's retention: "standard" (follow the global window) or an
+/// explicit "7d"/"30d"/"60d" from now. Unknown presets are typed errors.
+#[tauri::command]
+pub fn memory_set_expiry(
+    memory: State<'_, MemoryState>,
+    id: i64,
+    preset: String,
+) -> Result<crate::memory::store::MemoryRecord, MemoryError> {
+    let store = require_store(&memory)?;
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let expires = match preset.as_str() {
+        "standard" => None,
+        "7d" => Some(now + 7 * DAY_MS),
+        "30d" => Some(now + 30 * DAY_MS),
+        "60d" => Some(now + 60 * DAY_MS),
+        other => {
+            return Err(MemoryError::InvalidInput {
+                detail: format!("unknown expiry preset {other:?} (standard/7d/30d/60d)"),
+            })
+        }
+    };
+    store.set_expiry(id, expires)
+}
+
+/// The retention enforcement loop (memory v2 — the window was persisted
+/// but never enforced): prune at boot and daily, honoring per-memory
+/// pins/expiries and the live global setting each tick.
+pub fn spawn_prune_loop(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(store) = app.state::<MemoryState>().store() else {
+                continue;
+            };
+            let retention = crate::config::load_memory_retention(&app).unwrap_or("30d");
+            let window = crate::config::memory_retention_window_ms(retention);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            match store.prune_expired(now, window) {
+                Ok(0) => log::debug!("memory: prune tick — nothing expired"),
+                Ok(n) => log::info!("memory: pruned {n} expired memorie(s)"),
+                Err(e) => log::warn!("memory: prune failed: {e:?}"),
+            }
+        }
+    });
+}
+
 /// Delete one stored chat session and its transcript (purge, 2026-07-27).
 /// If it was the live session, the next exchange starts a fresh one.
 #[tauri::command]
@@ -483,6 +550,10 @@ mod tests {
                 span_end_ms: 2_000,
                 embedding: None,
                 source: crate::memory::store::MemorySource::Watcher,
+                category: "other".into(),
+                tags: Vec::new(),
+                pinned: false,
+                expires_at_ms: None,
             })
             .unwrap();
         Arc::new(store)

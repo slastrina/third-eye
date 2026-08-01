@@ -1173,6 +1173,27 @@ function App() {
                     <span className="chat-reasoning-text">{message.reasoning}</span>
                   </div>
                 )}
+                {message.role === "assistant" && (message.steps ?? []).length > 0 && (
+                  <details className="chat-steps">
+                    <summary>
+                      {(message.steps ?? []).length} step
+                      {(message.steps ?? []).length === 1 ? "" : "s"}
+                      {(message.steps ?? []).some((s) => s.ok === false)
+                        ? ` · ${(message.steps ?? []).filter((s) => s.ok === false).length} failed`
+                        : ""}
+                    </summary>
+                    <ol className="chat-steps-list">
+                      {(message.steps ?? []).map((step) => (
+                        <li key={step.callId} data-ok={step.ok === null ? "pending" : step.ok}>
+                          <span className="chat-step-mark" aria-hidden="true">
+                            {step.ok === null ? "●" : step.ok ? "✓" : "✗"}
+                          </span>
+                          {step.label}
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                )}
                 {message.role === "assistant" &&
                   (message.terminal ?? []).map((run) => (
                     <div key={run.callId} className="chat-terminal" data-ok={run.ok ?? undefined}>

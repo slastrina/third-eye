@@ -64,6 +64,10 @@ fn memory_store_schema_has_no_coordinate_column() {
             "created_at_ms",
             "updated_at_ms",
             "source",
+            "category",
+            "tags",
+            "pinned",
+            "expires_at_ms",
         ],
         "the pinned column set must never grow a coordinate column",
     );
@@ -99,6 +103,10 @@ fn inserting_screen_derived_text_persists_no_coordinates() {
             span_end_ms: 2_000,
             embedding: None,
             source: MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: None,
         })
         .expect("insert screen-derived memory");
 

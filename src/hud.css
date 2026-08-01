@@ -122,3 +122,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+
+/* Translucent while working (user request 2026-08-01): the mini UI must
+   not hide what Third Eye is doing underneath. Solid again on hover and
+   whenever an approval needs reading. */
+.hud-pill-root[data-translucent] {
+  opacity: 0.62;
+  transition: opacity 0.18s ease;
+}
+.hud-pill-root[data-translucent]:hover {
+  opacity: 1;
+}

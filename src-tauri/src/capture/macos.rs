@@ -233,6 +233,88 @@ pub enum DisplaySelect {
     FrontmostWindow,
 }
 
+/// Localized name of the app owning the frontmost on-screen layer-0
+/// window (non-own-process) — the "which app is the user actually in"
+/// answer for run-context grounding (2026-08-01). CGWindowList order is
+/// front-to-back; needs no permission; `None` on any failure.
+pub fn frontmost_app_name() -> Option<String> {
+    let pid = frontmost_window_owner_pid()?;
+    let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+    app.localizedName().map(|n| n.to_string())
+}
+
+/// Owner pid of the frontmost on-screen layer-0 non-own window.
+fn frontmost_window_owner_pid() -> Option<i32> {
+    #[repr(C)]
+    struct __CFArray(std::ffi::c_void);
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> *const __CFArray;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const __CFArray) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const __CFArray, idx: isize) -> *const std::ffi::c_void;
+        fn CFDictionaryGetValue(
+            dict: *const std::ffi::c_void,
+            key: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFNumberGetValue(
+            number: *const std::ffi::c_void,
+            the_type: i32,
+            value_ptr: *mut std::ffi::c_void,
+        ) -> bool;
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+    const OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    const NULL_WINDOW_ID: u32 = 0;
+    const K_CF_NUMBER_SINT32: i32 = 3;
+    use objc2_core_foundation::CFString;
+    let own_pid = std::process::id() as i32;
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(
+            OPTION_ON_SCREEN_ONLY | EXCLUDE_DESKTOP_ELEMENTS,
+            NULL_WINDOW_ID,
+        );
+        if list.is_null() {
+            return None;
+        }
+        let owner_key = CFString::from_str("kCGWindowOwnerPID");
+        let layer_key = CFString::from_str("kCGWindowLayer");
+        let mut found = None;
+        for i in 0..CFArrayGetCount(list) {
+            let dict = CFArrayGetValueAtIndex(list, i);
+            let read_i32 = |key: &CFString| -> Option<i32> {
+                let value =
+                    CFDictionaryGetValue(dict, key as *const CFString as *const std::ffi::c_void);
+                if value.is_null() {
+                    return None;
+                }
+                let mut out: i32 = 0;
+                CFNumberGetValue(
+                    value,
+                    K_CF_NUMBER_SINT32,
+                    &mut out as *mut i32 as *mut std::ffi::c_void,
+                )
+                .then_some(out)
+            };
+            if read_i32(&layer_key) != Some(0) {
+                continue;
+            }
+            match read_i32(&owner_key) {
+                Some(pid) if pid != own_pid => {
+                    found = Some(pid);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        CFRelease(list as *mut std::ffi::c_void);
+        found
+    }
+}
+
 /// Center of the frontmost on-screen, layer-0, non-own-process window in
 /// global logical points. CGWindowListCopyWindowInfo with OnScreenOnly
 /// returns windows front-to-back, so the first qualifying entry IS the
@@ -613,5 +695,23 @@ mod tests {
                 assert!(!permission_status().granted);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod frontmost_probe_tests {
+    /// Off-main probe: the chat task calls this on a tokio worker — it must
+    /// return (not panic, not hang) from a non-main thread.
+    #[test]
+    fn frontmost_app_name_is_safe_off_main() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let name = super::frontmost_app_name();
+            let _ = tx.send(name);
+        });
+        let name = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("frontmost_app_name hung off-main");
+        eprintln!("frontmost: {name:?}");
     }
 }

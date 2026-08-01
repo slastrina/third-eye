@@ -37,6 +37,29 @@ pub mod tray;
 #[cfg(desktop)]
 pub mod watcher;
 
+/// Build identity for the Settings About row (user request 2026-07-31):
+/// version from Cargo, commit + timestamp stamped by build.rs — "which
+/// build am I actually running" answered from inside the app.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildInfo {
+    pub version: &'static str,
+    pub git_hash: &'static str,
+    pub built_at_ms: i64,
+}
+
+#[tauri::command]
+fn build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        git_hash: env!("THIRD_EYE_GIT_HASH"),
+        built_at_ms: env!("THIRD_EYE_BUILD_EPOCH")
+            .parse::<i64>()
+            .map(|s| s * 1000)
+            .unwrap_or(0),
+    }
+}
+
 /// Label of the pre-existing overlay window declared in tauri.conf.json.
 /// The window is created hidden at launch so summoning it later (T02/T03)
 /// never pays window-creation cost on the hotkey path.
@@ -240,6 +263,8 @@ pub fn run() {
             memory::commands::chat_new_session,
             memory::commands::chat_resume_session,
             memory::commands::memory_graph,
+            memory::commands::memory_set_pinned,
+            memory::commands::memory_set_expiry,
             memory::commands::chat_session_delete,
             memory::commands::chat_sessions_wipe,
             memory::commands::chat_sessions,
@@ -262,6 +287,7 @@ pub fn run() {
             nudge::commands::set_nudge_cooldown,
             nudge::commands::set_nudge_auto_dismiss,
             nudge::commands::nudge_history,
+            build_info,
             llm::commands::approved_action_kinds,
             llm::commands::remove_approved_action_kind,
             tool_toggles::tool_toggles_status,
@@ -357,6 +383,7 @@ pub fn run() {
             nudge::commands::apply_persisted_nudges_enabled(app.handle());
             tool_toggles::apply_persisted_tool_toggles(app.handle());
             llm::commands::apply_persisted_approvals(app.handle());
+            memory::commands::spawn_prune_loop(app.handle());
 
             // Persisted cloud opt-in (M004 S03): a present settings.json key
             // restores the user's choice; absent keeps the safe default (off).

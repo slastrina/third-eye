@@ -49,6 +49,11 @@ pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
         "Read the focused window's full text (recipes, articles)",
     ),
     (
+        crate::llm::toolloop::REMEMBER_TOOL,
+        "Remember",
+        "Store a fact when you ask it to remember something",
+    ),
+    (
         crate::llm::toolloop::MEMORY_SEARCH_TOOL,
         "Memory search",
         "Search stored activity and conversation memories",

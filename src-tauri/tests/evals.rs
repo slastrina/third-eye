@@ -687,6 +687,100 @@ async fn eval_url_grounding_blocks_invented_pages_and_tab_floods() {
     );
 }
 
+/// TYPED NAVIGATION: typing a guessed deep URL into the address bar is
+/// the same one-shot as opening it — refused typed through the full loop;
+/// typing ordinary text is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_typed_urls_follow_the_same_grounding() {
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool("c1", "focus_app", r#"{"app":"Google Chrome"}"#),
+        scripted::round_tool("c2", SCREEN_QUERY_TOOL, "{}"),
+        scripted::round_tool(
+            "c3",
+            INPUT_ACTION_TOOL,
+            r#"{"action":"type-text","text":"https://recipetineats.com/carbonara"}"#,
+        ),
+        scripted::round_tool(
+            "c4",
+            INPUT_ACTION_TOOL,
+            r#"{"action":"type-text","text":"lasagne recipe"}"#,
+        ),
+        scripted::round_text("Searched instead."),
+    ])
+    .await;
+
+    let input = Arc::new(ScriptedInput::new(Vec::new()));
+    let screen_seen = Arc::new(ScreenSeen::new());
+    let focused_app = Arc::new(FocusedAppGate::new());
+    let (gate, screen) = hid_gate(input.clone(), screen_seen, focused_app);
+    let composite = CompositeExecutor::new(vec![Box::new(gate), Box::new(screen)]);
+    let executor = CompositeExecutor::new(vec![Box::new(UrlGroundingExecutor::new(
+        composite,
+        Arc::new(UrlSeen::new()),
+    ))]);
+
+    let (_text, events) = run_scenario(&endpoint, &executor, "find me a carbonara recipe").await;
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(results[0].1 && results[1].1);
+    // The guessed URL never reaches the keyboard…
+    assert_eq!(
+        (results[2].1, results[2].2.as_deref()),
+        (false, Some(UNGROUNDED_URL_KIND))
+    );
+    // …while plain text types fine.
+    assert!(results[3].1, "ordinary typing must pass: {:?}", results[3]);
+    let actions = input.actions.lock().unwrap().clone();
+    assert_eq!(
+        actions.len(),
+        1,
+        "only the search text was typed: {actions:?}"
+    );
+}
+
+/// ON-DEMAND MEMORY: "remember that my name is Alex" stores a Told-sourced
+/// memory the moment the user asks, and memory_search finds it — the exact
+/// conversation that used to end in "I don't have the ability to save".
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_remember_stores_and_recall_finds() {
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool("c1", "remember", r#"{"fact":"The user's name is Alex"}"#),
+        scripted::round_tool("c2", MEMORY_SEARCH_TOOL, r#"{"query":"name"}"#),
+        scripted::round_text("Saved — your name is Sam."),
+    ])
+    .await;
+
+    let scratch = ScratchDb::new("remember");
+    let store = Arc::new(MemoryStore::open(&scratch.path).unwrap());
+    let dead_embedder = Arc::new(third_eye_lib::memory::OpenAiEmbedder::new(
+        "http://127.0.0.1:1".to_string(),
+    ));
+    let executor = CompositeExecutor::new(vec![
+        Box::new(third_eye_lib::llm::toolloop::RememberTool::new(
+            store.clone(),
+            dead_embedder.clone(),
+        )),
+        Box::new(MemorySearchTool::new(store.clone(), dead_embedder)),
+    ]);
+
+    let (text, events) = run_scenario(
+        &endpoint,
+        &executor,
+        "can you save my name in your memory? It's Sam",
+    )
+    .await;
+    assert_eq!(text, "Saved — your name is Sam.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].1, "remember must succeed: {:?}", results[0]);
+    assert!(results[1].1, "search must succeed");
+    // The fact is durably in the store with Told provenance…
+    let records = store.list(10, 0).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].summary, "The user's name is Alex");
+    assert_eq!(records[0].source, third_eye_lib::memory::MemorySource::Told);
+}
+
 /// PROMPT CONTRACT: the load-bearing behavioural clauses exist. Each assert
 /// names the behaviour it protects — deleting the clause flips this red
 /// (spec success criterion 5).
@@ -733,6 +827,36 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
     assert!(
         HID_SYSTEM_PROMPT.contains("Never claim you cannot see a page you opened"),
         "read-the-page rule missing"
+    );
+    // On-demand memory: remember-on-request, never "I cannot store".
+    assert!(
+        HID_SYSTEM_PROMPT.contains("never claim you cannot store information"),
+        "remember clause missing"
+    );
+    // Task follow-ups continue in the same app — never re-clarify.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("CONTINUE in the same app and page"),
+        "task-continuation clause missing"
+    );
+    // Answers summarize FINDINGS, not process.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("must summarize WHAT YOU FOUND"),
+        "findings-first answer clause missing"
+    );
+    // On-page search boxes beat hand-built query URLs.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("USE that search box"),
+        "on-page search clause missing"
+    );
+    // Navigation reuses the open browser window (new tab), never a second
+    // window from `open`.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("navigate IN that window"),
+        "reuse-the-window clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("Typed URLs follow the same grounding rules"),
+        "typed-URL grounding clause missing"
     );
     // Web navigation: search-then-choose, never invented deep URLs.
     assert!(

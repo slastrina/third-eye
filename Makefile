@@ -13,7 +13,7 @@ TAURI := npm run tauri --
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg preview \
+.PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg install-app preview \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
         clean-web clean-rust
@@ -67,6 +67,28 @@ run-app: build-tauri
 ## build-dmg: Build the release bundle and open the installer DMG (does NOT launch the app)
 build-dmg: build-tauri
 	open src-tauri/target/release/bundle/dmg/*.dmg
+
+# Build FIRST (the old app keeps running through the slow part), then quit,
+# swap the /Applications copy, and relaunch. Quit is graceful (AppleScript)
+# with a pkill fallback; the signed bundle keeps its TCC grants across the
+# swap (Developer ID signingIdentity in tauri.conf.json).
+## install-app: Rebuild, quit the running Third Eye, replace /Applications/Third Eye.app, relaunch it
+install-app: build-tauri
+	@# Graceful quit, then WAIT for the process to actually exit before the
+	@# bundle is touched — swapping under a still-terminating instance made
+	@# the final `open` race the dying app and relaunch nothing. Escalate to
+	@# pkill after 5s; hard-fail (no swap) if it will not die.
+	-osascript -e 'tell application "Third Eye" to quit' >/dev/null 2>&1 || true
+	@i=0; while pgrep -x third-eye >/dev/null 2>&1; do \
+	  i=$$((i+1)); \
+	  if [ $$i -eq 5 ]; then echo "install-app: still running, pkill"; pkill -x third-eye || true; fi; \
+	  if [ $$i -gt 10 ]; then echo "install-app: Third Eye won't quit; aborting swap" >&2; exit 1; fi; \
+	  sleep 1; \
+	done; echo "install-app: Third Eye is stopped"
+	rm -rf "/Applications/Third Eye.app"
+	cp -R "$(APP_BUNDLE)" "/Applications/Third Eye.app"
+	open "/Applications/Third Eye.app"
+	@echo "install-app: relaunched — check Settings → Status → Build"
 
 ## build-web: Type-check and build the frontend (tsc && vite build)
 build-web:

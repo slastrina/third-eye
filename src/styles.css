@@ -1725,3 +1725,43 @@ body,
 .approval-forever {
   border-color: rgba(147, 218, 73, 0.5);
 }
+
+
+/* Transcript steps block (2026-08-01): the HUD trail's durable twin. */
+.chat-steps {
+  margin: 2px 0 6px;
+  font-size: 11.5px;
+}
+.chat-steps summary {
+  cursor: pointer;
+  opacity: 0.55;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.chat-steps summary:hover {
+  opacity: 0.85;
+}
+.chat-steps-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-left: 2px solid rgba(255, 255, 255, 0.12);
+}
+.chat-steps-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  opacity: 0.8;
+}
+.chat-steps-list li[data-ok="false"] {
+  color: var(--te-red-soft, #ff9d9d);
+}
+.chat-step-mark {
+  font-size: 10px;
+}
+.chat-steps-list li[data-ok="true"] .chat-step-mark {
+  color: var(--te-green, #93da49);
+}

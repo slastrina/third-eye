@@ -34,6 +34,11 @@ use super::{MemoryState, DB_FILE_NAME};
 /// cadence a batch spans roughly 40s of active screen time.
 pub const BATCH_SIZE: usize = 8;
 
+/// A partial batch distills anyway once its oldest observation is this old
+/// — memories should land within minutes of activity, not wait for a
+/// screen varied enough to fill a whole batch.
+pub const STALE_FLUSH_SECS: u64 = 300;
+
 /// Buffer bound (drop-oldest). While distillation keeps failing, at most
 /// this many observations are retained for retry — memory stays flat no
 /// matter how long LM Studio is down.
@@ -197,6 +202,17 @@ impl IngestBuffer {
         self.items.is_empty()
     }
 
+    /// Whether the buffered observations are old enough to distill even
+    /// short of a full batch. Without this, a quiet screen (dedupe skips
+    /// near-duplicates) could hold 1–7 observations FOREVER and "Last
+    /// distill: never" looked broken while nothing was wrong (2026-07-31
+    /// report). Compares the OLDEST buffered capture time against `now`.
+    pub fn stale_ready(&self, now_secs: u64) -> bool {
+        self.items
+            .front()
+            .is_some_and(|oldest| now_secs.saturating_sub(oldest.captured_at) >= STALE_FLUSH_SECS)
+    }
+
     pub fn batch_ready(&self) -> bool {
         self.items.len() >= BATCH_SIZE
     }
@@ -242,10 +258,17 @@ pub fn distill_messages(batch: &[TextObservation]) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
             "You distill screen-activity observations into memory notes. \
-             Reply with 1 to 3 lines. Each line is one standalone factual \
-             sentence summarizing something the user was working on, \
-             naming the concrete topic, project, or content. No preamble, \
-             no numbering, no formatting — one summary per line.",
+             Reply with 1 to 3 lines. Each line: a category, a colon, then \
+             one standalone factual sentence summarizing something the user \
+             was working on, naming the concrete topic, project, or \
+             content. Category is exactly one of: development, browsing, \
+             communication, writing, media, shopping, reference, personal, \
+             system, other. If (and only if) a line records a DURABLE \
+             fact about the user — identity, stable preferences, long-term \
+             projects — append ! to the category so it is kept permanently: \
+             'personal!: The user prefers metric units.' Day-to-day \
+             activity gets no !. No preamble, no numbering — e.g. \
+             'development: Debugged the tokio deadlock in the watcher loop.'",
         ),
         ChatMessage::user(body),
     ]
@@ -260,6 +283,51 @@ pub fn parse_summaries(text: &str) -> Vec<String> {
         .take(MAX_SUMMARIES_PER_BATCH)
         .map(String::from)
         .collect()
+}
+
+/// Model reply → (category, summary) pairs (memory v2). LENIENT: a line
+/// with a known `category:` prefix splits; anything else keeps the whole
+/// line as the summary with category "other" — a format miss never loses
+/// the memory itself.
+pub fn parse_categorized_summaries(text: &str) -> Vec<CategorizedSummary> {
+    parse_summaries(text)
+        .into_iter()
+        .map(|line| {
+            if let Some((head, rest)) = line.split_once(':') {
+                // A trailing '!' on the category marks a DURABLE fact the
+                // model wants pinned (memory v2 follow-up, 2026-08-01).
+                let (head, pinned) = match head.trim().strip_suffix('!') {
+                    Some(stripped) => (stripped, true),
+                    None => (head.trim(), false),
+                };
+                let category = crate::memory::store::normalize_category(head);
+                let rest = rest.trim();
+                if category != "other" && !rest.is_empty() {
+                    return CategorizedSummary {
+                        category,
+                        summary: rest.to_string(),
+                        pinned,
+                    };
+                }
+                // An unknown prefix might BE part of the summary ("Note:
+                // …") — keep the whole line rather than truncate it.
+            }
+            CategorizedSummary {
+                category: "other".to_string(),
+                summary: line,
+                pinned: false,
+            }
+        })
+        .collect()
+}
+
+/// One distilled line: what it says, where it browses, whether the model
+/// judged it durable enough to pin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CategorizedSummary {
+    pub category: String,
+    pub summary: String,
+    pub pinned: bool,
 }
 
 /// Tolerate models that number or bullet their lines despite instructions:
@@ -281,7 +349,10 @@ fn strip_list_marker(line: &str) -> &str {
 /// Summaries → insertable rows: every summary of a batch shares the batch's
 /// observed time span and its deduped, order-preserving app set. Embeddings
 /// stay `None` — T02's search backfills them lazily.
-pub fn batch_memories(batch: &[TextObservation], summaries: &[String]) -> Vec<NewMemory> {
+pub fn batch_memories(
+    batch: &[TextObservation],
+    summaries: &[CategorizedSummary],
+) -> Vec<NewMemory> {
     let span_start_ms = batch.iter().map(|o| o.captured_at).min().unwrap_or(0) as i64;
     let span_end_ms = batch.iter().map(|o| o.captured_at).max().unwrap_or(0) as i64;
     let mut apps: Vec<String> = Vec::new();
@@ -294,13 +365,17 @@ pub fn batch_memories(batch: &[TextObservation], summaries: &[String]) -> Vec<Ne
     }
     summaries
         .iter()
-        .map(|summary| NewMemory {
-            summary: summary.clone(),
+        .map(|line| NewMemory {
+            summary: line.summary.clone(),
             apps: apps.clone(),
             span_start_ms,
             span_end_ms,
             embedding: None,
             source: MemorySource::Watcher,
+            category: line.category.clone(),
+            tags: Vec::new(),
+            pinned: line.pinned,
+            expires_at_ms: None,
         })
         .collect()
 }
@@ -367,8 +442,28 @@ pub async fn run_loop(
     router: Arc<ModelRouter>,
 ) {
     let mut buffer = IngestBuffer::new();
+    // The stale-flush heartbeat: a partial batch whose oldest observation
+    // has aged past STALE_FLUSH_SECS distills without waiting for more.
+    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match rx.recv().await {
+        tokio::select! {
+            _ = flush_tick.tick() => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if buffer.stale_ready(now_secs) {
+                    log::debug!(
+                        "memory: stale flush — distilling a partial batch of {}",
+                        buffer.len()
+                    );
+                    distill_and_store(&mut buffer, &store, &ingest, &router).await;
+                    ingest.set_buffered(buffer.len());
+                }
+                continue;
+            }
+            received = rx.recv() => match received {
             Ok(obs) => {
                 match buffer.push(obs) {
                     PushOutcome::Accepted => {}
@@ -394,6 +489,7 @@ pub async fn run_loop(
                 log::info!("memory: observation channel closed; ingest loop exiting");
                 break;
             }
+        }
         }
     }
 }
@@ -428,7 +524,7 @@ async fn distill_and_store(
         .await
     {
         Ok(outcome) => {
-            let summaries = parse_summaries(&outcome.text);
+            let summaries = parse_categorized_summaries(&outcome.text);
             if summaries.is_empty() {
                 // An empty-but-successful reply is a model quality issue,
                 // not an LlmError; retrying the same batch would loop
@@ -689,6 +785,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_flush_readies_a_partial_batch_by_age() {
+        let mut buf = IngestBuffer::new();
+        assert!(!buf.stale_ready(1_000_000), "empty never flushes");
+        buf.push(obs("first observation text", None, 1_000));
+        buf.push(obs("second distinct observation", None, 1_100));
+        // Younger than the window → wait.
+        assert!(!buf.stale_ready(1_000 + STALE_FLUSH_SECS - 1));
+        // The OLDEST observation ages the batch, not the newest.
+        assert!(buf.stale_ready(1_000 + STALE_FLUSH_SECS));
+        buf.clear();
+        assert!(!buf.stale_ready(u64::MAX), "cleared buffer never flushes");
+    }
+
+    #[test]
+    fn categorized_parse_reads_the_pin_marker_leniently() {
+        let parsed = parse_categorized_summaries(
+            "personal!: The user prefers metric units.\n\
+             development: Fixed the ingest loop.\n\
+             Note: this line has no known category",
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            (parsed[0].category.as_str(), parsed[0].pinned),
+            ("personal", true)
+        );
+        assert_eq!(parsed[0].summary, "The user prefers metric units.");
+        assert_eq!(
+            (parsed[1].category.as_str(), parsed[1].pinned),
+            ("development", false)
+        );
+        // Unknown prefix: whole line kept, never pinned by accident.
+        assert_eq!(parsed[2].category, "other");
+        assert!(!parsed[2].pinned);
+        assert!(parsed[2].summary.contains("no known category"));
+    }
+
+    #[test]
     fn batch_ready_at_batch_size() {
         let mut buf = IngestBuffer::new();
         for i in 0..BATCH_SIZE - 1 {
@@ -761,7 +894,18 @@ mod tests {
             obs("c", Some("Zed"), 200),
             obs("d", None, 250),
         ];
-        let summaries = vec!["One.".to_string(), "Two.".to_string()];
+        let summaries = vec![
+            CategorizedSummary {
+                category: "other".into(),
+                summary: "One.".into(),
+                pinned: false,
+            },
+            CategorizedSummary {
+                category: "other".into(),
+                summary: "Two.".into(),
+                pinned: false,
+            },
+        ];
         let rows = batch_memories(&batch, &summaries);
         assert_eq!(rows.len(), 2);
         for row in &rows {

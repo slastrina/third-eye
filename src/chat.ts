@@ -7,6 +7,7 @@
 // without a Tauri runtime (src/chat.test.ts). App.tsx is only glue.
 
 import { invoke } from "@tauri-apps/api/core";
+import { describeCall } from "./action-labels";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export const TOKEN_EVENT = "llm://token";
@@ -153,6 +154,17 @@ export interface ModelInfo {
  *  events to accept. The backend aborts any prior in-flight request. */
 export function sendChat(messages: ChatMessage[]): Promise<number> {
   return invoke<number>("chat", { messages });
+}
+
+/** Which build is running (Settings About row): version, commit, built-at. */
+export interface BuildInfo {
+  version: string;
+  gitHash: string;
+  builtAtMs: number;
+}
+
+export function buildInfo(): Promise<BuildInfo> {
+  return invoke<BuildInfo>("build_info");
 }
 
 export function llmHealth(): Promise<LlmHealth> {
@@ -920,6 +932,13 @@ export type MemoryPhase = "searching" | "consulted";
 /** One terminal command executed during an assistant turn (computer-control
  *  I2): rendered as the transcript's monospace terminal block. `ok: null`
  *  while running; `preview` is the bounded output from the result event. */
+/** One tool step in the transcript's collapsible process block. */
+export interface ChatStep {
+  callId: string;
+  label: string;
+  ok: boolean | null;
+}
+
 export interface TerminalRun {
   callId: string;
   command: string;
@@ -936,6 +955,10 @@ export interface UiMessage {
   attached?: boolean;
   /** Assistant only: terminal commands run during this turn (I2). */
   terminal?: TerminalRun[];
+  /** Assistant only: EVERY tool step of this turn (the HUD trail's
+   *  transcript twin, 2026-08-01) — the process record survives after the
+   *  pill dismisses. `ok: null` = still running. */
+  steps?: ChatStep[];
   /** Assistant only: memory_search tool phase (renders the indicator). */
   memory?: MemoryPhase;
   /** Assistant only: accumulated chain-of-thought from a thinking model,
@@ -1309,6 +1332,21 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       // phase from an aborted predecessor must not touch the active answer.
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state; // stale
+      // Every call lands in the steps block — the durable process record
+      // (the HUD trail dies with the pill; this survives in the transcript).
+      const described = describeCall(action.payload.call.name, action.payload.call.arguments);
+      const withStep = {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({
+          ...m,
+          steps: (m.steps ?? []).some((s) => s.callId === action.payload.call.id)
+            ? m.steps
+            : [
+                ...(m.steps ?? []),
+                { callId: action.payload.call.id, label: described.label, ok: null },
+              ],
+        })),
+      };
       if (action.payload.call.name === RUN_COMMAND_TOOL) {
         // The exact command line, straight from the call's own arguments —
         // the transcript block shows what actually runs (I2 visibility).
@@ -1328,27 +1366,36 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           preview: null,
         };
         return {
-          ...state,
-          messages: withLastAssistant(state.messages, (m) => ({
+          ...withStep,
+          messages: withLastAssistant(withStep.messages, (m) => ({
             ...m,
             terminal: [...(m.terminal ?? []), run],
           })),
         };
       }
-      if (action.payload.call.name !== MEMORY_SEARCH_TOOL) return state;
+      if (action.payload.call.name !== MEMORY_SEARCH_TOOL) return withStep;
       return {
-        ...state,
-        messages: withLastAssistant(state.messages, (m) => ({ ...m, memory: "searching" })),
+        ...withStep,
+        messages: withLastAssistant(withStep.messages, (m) => ({ ...m, memory: "searching" })),
       };
     }
     case "tool-result": {
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state; // stale
+      const settled = {
+        ...state,
+        messages: withLastAssistant(state.messages, (m) => ({
+          ...m,
+          steps: (m.steps ?? []).map((s) =>
+            s.callId === action.payload.callId ? { ...s, ok: action.payload.ok } : s,
+          ),
+        })),
+      };
       if (action.payload.name === RUN_COMMAND_TOOL) {
         const { callId, ok, preview, failure } = action.payload;
         return {
-          ...state,
-          messages: withLastAssistant(state.messages, (m) => ({
+          ...settled,
+          messages: withLastAssistant(settled.messages, (m) => ({
             ...m,
             terminal: (m.terminal ?? []).map((run) =>
               run.callId === callId
@@ -1358,10 +1405,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           })),
         };
       }
-      if (action.payload.name !== MEMORY_SEARCH_TOOL) return state;
+      if (action.payload.name !== MEMORY_SEARCH_TOOL) return settled;
       return {
-        ...state,
-        messages: withLastAssistant(state.messages, (m) => ({
+        ...settled,
+        messages: withLastAssistant(settled.messages, (m) => ({
           ...m,
           // A failed search clears "searching" without claiming consultation
           // (the model still answers, ungrounded). It never downgrades a

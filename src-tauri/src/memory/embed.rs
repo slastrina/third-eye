@@ -345,6 +345,10 @@ mod tests {
             span_end_ms: 2_000,
             embedding,
             source: crate::memory::store::MemorySource::Watcher,
+            category: "other".into(),
+            tags: Vec::new(),
+            pinned: false,
+            expires_at_ms: None,
         }
     }
 

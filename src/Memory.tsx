@@ -16,6 +16,8 @@ import {
 import {
   memoryDelete,
   memoryList,
+  memorySetExpiry,
+  memorySetPinned,
   memorySearch,
   type MemoryRecord,
   type SearchOutcome,
@@ -23,6 +25,8 @@ import {
 import {
   MEMORY_TABS,
   appLabel,
+  byCategory,
+  categoryFacets,
   durationLabel,
   filterRecords,
   learnedRecords,
@@ -51,6 +55,28 @@ export function MemoryWindow() {
   const [transcript, setTranscript] = useState<ChatSessionMessage[] | null>(null);
   // Two-step arm for the bulk purge — one stray click must not erase history.
   const [wipeArmed, setWipeArmed] = useState(false);
+  // Category facet (memory v2): null = all categories.
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+
+  // Fold one updated record back into the list (pin/expiry toggles).
+  const foldRecord = (updated: MemoryRecord) =>
+    setRecords((current) =>
+      current?.map((r) => (r.id === updated.id ? updated : r)) ?? null,
+    );
+
+  const togglePin = (record: MemoryRecord) => {
+    memorySetPinned(record.id, !(record.pinned ?? false)).then(
+      foldRecord,
+      (err) => console.debug("memory-window: memory_set_pinned failed:", err),
+    );
+  };
+
+  const setExpiry = (record: MemoryRecord, preset: string) => {
+    memorySetExpiry(record.id, preset).then(
+      foldRecord,
+      (err) => console.debug("memory-window: memory_set_expiry failed:", err),
+    );
+  };
 
   const deleteSession = (id: number) => {
     chatSessionDelete(id).then(
@@ -153,8 +179,10 @@ export function MemoryWindow() {
     );
   };
 
-  const visible = records === null ? null : filterRecords(records, filter);
+  const filtered = records === null ? null : filterRecords(records, filter);
+  const visible = filtered === null ? null : byCategory(filtered, categoryFilter);
   const learned = visible === null ? null : learnedRecords(visible);
+  const facets = filtered === null ? [] : categoryFacets(filtered);
 
   return (
     <div className="memwin-root">
@@ -202,22 +230,114 @@ export function MemoryWindow() {
               </p>
             ) : (
               <div className="memwin-timeline">
-                {visible.map((record) => (
-                  <div key={record.id} className="memwin-row">
-                    <span className="memwin-row-time">{timeLabel(record)}</span>
-                    <span className="memwin-row-dot" aria-hidden="true" />
-                    <span className="memwin-row-app">{appLabel(record)}</span>
-                    <span className="memwin-row-text">{record.summary}</span>
-                    <span className="memwin-row-dur">{durationLabel(record)}</span>
+                {facets.length > 1 && (
+                  <div className="memwin-facets" role="group" aria-label="Filter by category">
                     <button
                       type="button"
-                      className="memwin-row-forget"
-                      title="Forget this moment"
-                      aria-label={`Forget: ${record.summary}`}
-                      onClick={() => forget(record.id)}
+                      className="memwin-facet"
+                      data-active={categoryFilter === null || undefined}
+                      onClick={() => setCategoryFilter(null)}
                     >
-                      ✕
+                      all
                     </button>
+                    {facets.map(({ category, count }) => (
+                      <button
+                        key={category}
+                        type="button"
+                        className="memwin-facet"
+                        data-active={categoryFilter === category || undefined}
+                        onClick={() =>
+                          setCategoryFilter(categoryFilter === category ? null : category)
+                        }
+                      >
+                        {category} · {count}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {visible.map((record) => (
+                  <div key={record.id} className="memwin-row memwin-row--stack">
+                    <div className="memwin-row-main">
+                      <span className="memwin-row-time">{timeLabel(record)}</span>
+                      <span className="memwin-row-dot" aria-hidden="true" />
+                      <span className="memwin-row-app">{appLabel(record)}</span>
+                      <span className="memwin-row-text">{record.summary}</span>
+                      <span className="memwin-row-dur">{durationLabel(record)}</span>
+                      <button
+                        type="button"
+                        className="memwin-row-pin"
+                        data-pinned={record.pinned || undefined}
+                        title={record.pinned ? "Pinned — never expires" : "Pin (keep forever)"}
+                        aria-label={`${record.pinned ? "Unpin" : "Pin"}: ${record.summary}`}
+                        onClick={() => togglePin(record)}
+                      >
+                        {record.pinned ? "★" : "☆"}
+                      </button>
+                      <button
+                        type="button"
+                        className="memwin-row-forget"
+                        title="Forget this moment"
+                        aria-label={`Forget: ${record.summary}`}
+                        onClick={() => forget(record.id)}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="memwin-row-meta">
+                      {record.category && record.category !== "other" && (
+                        <span className="memwin-chip memwin-chip--category">
+                          {record.category}
+                        </span>
+                      )}
+                      {(record.tags ?? []).map((tag) => (
+                        <button
+                          key={tag}
+                          type="button"
+                          className="memwin-chip"
+                          title={`Filter by “${tag}”`}
+                          onClick={() => setFilter(tag)}
+                        >
+                          #{tag}
+                        </button>
+                      ))}
+                      <select
+                        className="memwin-expiry"
+                        aria-label={`Retention for: ${record.summary}`}
+                        value=""
+                        onChange={(event) => {
+                          const choice = event.target.value;
+                          if (!choice) return;
+                          if (choice === "forever") {
+                            memorySetPinned(record.id, true).then(foldRecord, (err) =>
+                              console.debug("memory-window: pin failed:", err),
+                            );
+                            return;
+                          }
+                          // Leaving forever: unpin first, then apply the tier.
+                          const apply = () => setExpiry(record, choice);
+                          if (record.pinned) {
+                            memorySetPinned(record.id, false).then(apply, (err) =>
+                              console.debug("memory-window: unpin failed:", err),
+                            );
+                          } else {
+                            apply();
+                          }
+                        }}
+                      >
+                        <option value="" disabled>
+                          {record.pinned
+                            ? "kept forever"
+                            : record.expiresAtMs
+                              ? `expires ${new Date(record.expiresAtMs).toLocaleDateString()}`
+                              : "standard retention"}
+                        </option>
+                        <option value="forever">keep forever</option>
+                        <option value="7d">expire in 7 days</option>
+                        <option value="30d">expire in 30 days</option>
+                        <option value="60d">expire in 60 days</option>
+                        <option value="standard">standard retention</option>
+                      </select>
+                    </div>
                   </div>
                 ))}
               </div>

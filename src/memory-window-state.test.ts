@@ -3,6 +3,8 @@ import type { MemoryRecord } from "./memory-state";
 import {
   MEMORY_TABS,
   appLabel,
+  byCategory,
+  categoryFacets,
   durationLabel,
   filterRecords,
   learnedRecords,
@@ -61,5 +63,49 @@ describe("memory window helpers", () => {
   it("app column shows the primary app or an honest dash", () => {
     expect(appLabel(record({ apps: ["Zed", "Terminal"] }))).toBe("Zed");
     expect(appLabel(record({ apps: [] }))).toBe("—");
+  });
+});
+
+describe("memory v2 browse helpers", () => {
+  const rec = (id: number, summary: string, category?: string, tags?: string[]) => ({
+    id,
+    summary,
+    source: "watcher",
+    apps: [],
+    spanStartMs: 0,
+    spanEndMs: 0,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    category,
+    tags,
+  });
+
+  it("filter matches tags and category, not just summary and apps", () => {
+    const records = [
+      rec(1, "compared ragu techniques", "browsing", ["lasagna", "ragu"]),
+      rec(2, "debugged the watcher loop", "development", ["tokio"]),
+    ];
+    expect(filterRecords(records, "lasagna").map((r) => r.id)).toEqual([1]);
+    expect(filterRecords(records, "development").map((r) => r.id)).toEqual([2]);
+    // Records without v2 fields (older mocks) never crash the filter.
+    expect(filterRecords([rec(3, "bare row")], "anything")).toEqual([]);
+  });
+
+  it("facets count biggest-first and byCategory applies the chip", () => {
+    const records = [
+      rec(1, "a", "browsing"),
+      rec(2, "b", "browsing"),
+      rec(3, "c", "development"),
+      rec(4, "d"),
+    ];
+    expect(categoryFacets(records)).toEqual([
+      { category: "browsing", count: 2 },
+      { category: "development", count: 1 },
+      { category: "other", count: 1 },
+    ]);
+    expect(byCategory(records, "browsing").map((r) => r.id)).toEqual([1, 2]);
+    expect(byCategory(records, null)).toHaveLength(4);
+    // Absent category rows live under "other".
+    expect(byCategory(records, "other").map((r) => r.id)).toEqual([4]);
   });
 });
