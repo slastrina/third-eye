@@ -105,7 +105,8 @@ export type LlmError =
   | { kind: "no-model"; endpoint: string; detail: string }
   | { kind: "tools-unsupported"; endpoint: string; detail: string }
   | { kind: "interrupted"; endpoint: string; partialText: string; detail: string }
-  | { kind: "guard-blocked"; endpoint: string; reason: string };
+  | { kind: "guard-blocked"; endpoint: string; reason: string }
+  | { kind: "empty-completion"; endpoint: string; detail: string };
 
 export interface ErrorPayload {
   requestId: number;
@@ -262,6 +263,77 @@ export interface BridgeStatus {
 
 export function bridgeStatus(): Promise<BridgeStatus> {
   return invoke<BridgeStatus>("bridge_status");
+}
+
+/** Background-phase status (2026-08-02): what the run is waiting on when
+ *  nothing is streaming. Keep in sync with PHASE_EVENT in Rust. */
+export const PHASE_EVENT = "llm://phase";
+
+/** The llm://phase payload — serde camelCase of Rust's PhasePayload. */
+export interface PhasePayload {
+  requestId: number;
+  /** "loading-model" | "processing-prompt" */
+  phase: string;
+  model: string | null;
+  waitedMs: number;
+  detail: string | null;
+}
+
+export function onLlmPhase(cb: (payload: PhasePayload) => void): Promise<UnlistenFn> {
+  return listen<PhasePayload>(PHASE_EVENT, (e) => cb(e.payload));
+}
+
+/** Verbose status-line mode: broadcast so the overlay applies a Settings
+ *  toggle live. Keep in sync with VERBOSE_STATUS_EVENT in Rust. */
+export const VERBOSE_STATUS_EVENT = "settings://verbose-status";
+
+export interface VerboseStatus {
+  enabled: boolean;
+  error: string | null;
+}
+
+export function verboseStatus(): Promise<VerboseStatus> {
+  return invoke<VerboseStatus>("verbose_status");
+}
+
+export function setVerboseStatus(enable: boolean): Promise<VerboseStatus> {
+  return invoke<VerboseStatus>("set_verbose_status", { enable });
+}
+
+export function onVerboseStatus(cb: (status: VerboseStatus) => void): Promise<UnlistenFn> {
+  return listen<VerboseStatus>(VERBOSE_STATUS_EVENT, (e) => cb(e.payload));
+}
+
+/** One served model with LM Studio's native detail — serde camelCase of
+ *  Rust's LmModelRow (empty list when the endpoint is not LM Studio). */
+export interface LmModelRow {
+  id: string;
+  state: string;
+  toolUse: boolean;
+  quantization: string | null;
+  maxContextLength: number | null;
+}
+
+export function listModelsDetailed(): Promise<LmModelRow[]> {
+  return invoke<LmModelRow[]>("list_models_detailed");
+}
+
+/** Human copy for one wait phase. Basic mode: plain words; verbose adds
+ *  the model, wait timer, and raw detail. Pure (unit-tested). */
+export function phaseStatusLine(phase: PhasePayload, verbose: boolean): string {
+  const seconds = Math.max(1, Math.round(phase.waitedMs / 1000));
+  const basic =
+    phase.phase === "loading-model"
+      ? "Loading the model…"
+      : "Reading your request…";
+  if (!verbose) return basic;
+  const parts = [
+    basic,
+    phase.model ?? "default model",
+    `waiting ${seconds}s`,
+  ];
+  if (phase.detail) parts.push(phase.detail);
+  return parts.join(" · ");
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1151,9 @@ export interface ChatState {
   banner: Banner | null;
   /** Last submitted question, backing the Retry affordance. */
   lastQuestion: string | null;
+  /** Live background-wait status (loading model / reading prompt); null
+   *  whenever anything is actually streaming. */
+  phase: PhasePayload | null;
   /** Routing state behind the model indicator; null until the first
    *  `model_info` query resolves (or forever, outside a Tauri runtime). */
   modelInfo: ModelInfo | null;
@@ -1123,6 +1198,7 @@ export const initialChatState: ChatState = {
   buffered: [],
   banner: null,
   lastQuestion: null,
+  phase: null,
   modelInfo: null,
   attachment: null,
   attachPending: false,
@@ -1143,7 +1219,8 @@ export type LlmEvent =
   | { type: "error"; payload: ErrorPayload }
   | { type: "tool-call"; payload: ToolCallPayload }
   | { type: "tool-result"; payload: ToolResultPayload }
-  | { type: "terminal-chunk"; payload: TerminalChunkPayload };
+  | { type: "terminal-chunk"; payload: TerminalChunkPayload }
+  | { type: "phase"; payload: PhasePayload };
 
 export type ChatAction =
   | { type: "submit"; question: string; retry?: boolean }
@@ -1293,6 +1370,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         buffered: [],
         banner: null,
         lastQuestion: action.question,
+        phase: null,
         modelInfo: state.modelInfo,
         attachment: null,
         // Dropping the pending flag makes a capture that settles after this
@@ -1348,6 +1426,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (action.payload.requestId !== state.requestId) return state; // stale
       return {
         ...state,
+        phase: null,
         messages: withLastAssistant(state.messages, (m) => ({
           ...m,
           text: m.text + action.payload.token,
@@ -1362,6 +1441,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (action.payload.requestId !== state.requestId) return state; // stale
       return {
         ...state,
+        phase: null,
         messages: withLastAssistant(state.messages, (m) => ({
           ...m,
           reasoning: (m.reasoning ?? "") + action.payload.delta,
@@ -1423,6 +1503,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       // phase from an aborted predecessor must not touch the active answer.
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state; // stale
+      state = { ...state, phase: null };
       // Every call lands in the steps block — the durable process record
       // (the HUD trail dies with the pill; this survives in the transcript).
       const described = describeCall(action.payload.call.name, action.payload.call.arguments);
@@ -1538,6 +1619,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         })),
       };
     }
+    case "phase": {
+      // A wait ping only means anything for the CURRENT request, and only
+      // while nothing is streaming (activity clears it below).
+      if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
+      if (action.payload.requestId !== state.requestId) return state; // stale
+      return { ...state, phase: action.payload };
+    }
     case "terminal-chunk": {
       // Live build output (coding-agent S4): append to the RUNNING block's
       // preview, keeping the tail (a build's latest lines matter most). The
@@ -1562,6 +1650,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (action.payload.requestId !== state.requestId) return state;
       return {
         ...state,
+        phase: null,
         requestId: null,
         messages: withLastAssistant(state.messages, (m) => ({
           ...m,
@@ -1587,7 +1676,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
               memory: settleMemoryPhase(m.memory),
             }))
           : settleStreamingTail(state.messages);
-      return { ...state, requestId: null, messages, banner: { error, online: false } };
+      return { ...state, requestId: null, phase: null, messages, banner: { error, online: false } };
     }
     case "health": {
       if (!state.banner || state.banner.online === action.online) return state;
@@ -1663,11 +1752,13 @@ export function bannerTitle(error: BannerError): string {
     case "no-model":
       return "No model loaded";
     case "tools-unsupported":
-      return "This model can't search memory";
+      return "This model can't use tools";
     case "interrupted":
       return "Answer interrupted";
     case "guard-blocked":
       return "Blocked by privacy guard";
+    case "empty-completion":
+      return "The model returned nothing";
     case "ipc":
       return "Chat unavailable";
   }

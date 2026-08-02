@@ -12,6 +12,7 @@
 
 pub mod commands;
 pub mod guard;
+pub mod lmstudio;
 pub mod mcp;
 pub mod mcp_keystore;
 pub mod mcp_spawn;
@@ -274,6 +275,12 @@ pub enum LlmError {
         endpoint: String,
         reason: guard::GuardBlockReason,
     },
+    /// The request completed but the model produced NO visible answer —
+    /// zero or whitespace-only text (a misloaded/broken model's signature:
+    /// qwen3.5-27b-heretic streamed bare newlines). Surfaced as an error so
+    /// the user sees "this model returned nothing", never a silent empty
+    /// bubble (R006 honesty).
+    EmptyCompletion { endpoint: String, detail: String },
 }
 
 impl LlmError {
@@ -286,6 +293,7 @@ impl LlmError {
             LlmError::ToolsUnsupported { .. } => "tools-unsupported",
             LlmError::Interrupted { .. } => "interrupted",
             LlmError::GuardBlocked { .. } => "guard-blocked",
+            LlmError::EmptyCompletion { .. } => "empty-completion",
         }
     }
 
@@ -296,7 +304,8 @@ impl LlmError {
             | LlmError::NoModel { endpoint, .. }
             | LlmError::ToolsUnsupported { endpoint, .. }
             | LlmError::Interrupted { endpoint, .. }
-            | LlmError::GuardBlocked { endpoint, .. } => endpoint,
+            | LlmError::GuardBlocked { endpoint, .. }
+            | LlmError::EmptyCompletion { endpoint, .. } => endpoint,
         }
     }
 
@@ -338,6 +347,9 @@ impl std::fmt::Display for LlmError {
                     f,
                     "blocked by privacy guard: request to {endpoint} not sent ({reason})"
                 )
+            }
+            LlmError::EmptyCompletion { endpoint, detail } => {
+                write!(f, "model at {endpoint} returned an empty reply ({detail})")
             }
         }
     }
@@ -389,6 +401,12 @@ pub type ReasoningSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
 pub trait LlmClient: Send + Sync {
     /// The endpoint this client targets, for logs and error surfaces.
     fn endpoint(&self) -> &str;
+
+    /// The model id requests carry, when pinned (phase telemetry uses it to
+    /// ask LM Studio's native API about load state). Default: unknown.
+    fn model_id(&self) -> Option<&str> {
+        None
+    }
 
     /// Stream one chat completion. `on_token` fires for every content delta
     /// in arrival order; the returned outcome holds the accumulated text and

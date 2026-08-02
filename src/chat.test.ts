@@ -31,6 +31,7 @@ import {
   TOOL_CALL_EVENT,
   TOOL_RESULT_EVENT,
   TERMINAL_CHUNK_EVENT,
+  phaseStatusLine,
   RUN_IN_WORKSPACE_TOOL,
   WORKSPACE_DIFF_TOOL,
   diffLineKind,
@@ -851,6 +852,48 @@ describe("chatReducer tool events (S03)", () => {
     expect(bannerTitle(guardBlocked)).not.toBe(bannerTitle(offline));
     // Detail names the blocked endpoint (R006) and the kebab-case reason.
     expect(bannerDetail(guardBlocked)).toBe("http://192.0.2.1:9 — low-confidence");
+  });
+
+  it("phase pings show while waiting and clear the moment anything streams", () => {
+    const ping = {
+      requestId: 1,
+      phase: "loading-model",
+      model: "qwen3-coder",
+      waitedMs: 4200,
+      detail: "model state: loading",
+    };
+    let s = started("write a script", 1);
+    s = chatReducer(s, { type: "phase", payload: ping });
+    expect(s.phase).toEqual(ping);
+    // Stale request ids never land.
+    const stale = chatReducer(s, { type: "phase", payload: { ...ping, requestId: 9 } });
+    expect(stale.phase).toEqual(ping);
+    // A token clears it (activity beats status).
+    s = chatReducer(s, { type: "token", payload: { requestId: 1, token: "H" } });
+    expect(s.phase).toBeNull();
+    // Copy: basic is plain words; verbose carries model + timer + detail.
+    expect(phaseStatusLine(ping, false)).toBe("Loading the model…");
+    expect(phaseStatusLine(ping, true)).toBe(
+      "Loading the model… · qwen3-coder · waiting 4s · model state: loading",
+    );
+    expect(
+      phaseStatusLine({ ...ping, phase: "processing-prompt", detail: null }, false),
+    ).toBe("Reading your request…");
+  });
+
+  it("an empty-completion surfaces as a named banner, never a silent bubble", () => {
+    // A broken model that streams only newlines used to leave an empty
+    // assistant message with no explanation (qwen3.5-27b-heretic incident).
+    const empty: LlmError = {
+      kind: "empty-completion",
+      endpoint: "http://localhost:1234",
+      detail: "3 token(s) streamed, none visible",
+    };
+    let s = started("write a python script", 1);
+    s = chatReducer(s, { type: "error", payload: { requestId: 1, error: empty } });
+    expect(s.banner?.error).toEqual(empty);
+    expect(bannerTitle(empty)).toBe("The model returned nothing");
+    expect(bannerDetail(empty)).toContain("localhost:1234");
   });
 });
 

@@ -5,6 +5,7 @@
 // hud-state; only the pill drives show_hud/hide_hud (single driver — the
 // canvas is passive, hud.rs contract).
 import { useEffect, useReducer, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import {
   onHidApprovalRequest,
@@ -163,6 +164,16 @@ export function HudPillView() {
         tone={hud.phase === "live" ? "acting" : hud.phase === "stopped" ? "stopped" : "done"}
         headline={hudHeadline(hud)}
         progress={live ? hudProgress(hud) : ""}
+        onGrab={(event) => {
+          // Drag handle (user request 2026-08-02): the pill moves the whole
+          // HUD stack when it covers something (an OS permission dialog, a
+          // form). Primary button only; buttons inside keep their clicks.
+          if (event.button !== 0) return;
+          if ((event.target as HTMLElement).closest("button")) return;
+          getCurrentWindow()
+            .startDragging()
+            .catch((err) => console.debug("hud: startDragging no-op:", err));
+        }}
         onStop={
           live
             ? () => {

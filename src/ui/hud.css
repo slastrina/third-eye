@@ -4,6 +4,8 @@
   display: inline-flex;
   align-items: center;
   gap: 12px;
+  /* The pill is the HUD stack's drag handle (2026-08-02). */
+  cursor: grab;
   font-family: var(--te-font);
   background: var(--te-glass-heavy);
   border: 1px solid var(--te-amber-border);

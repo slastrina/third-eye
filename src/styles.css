@@ -1420,6 +1420,18 @@ body,
   overflow-y: auto;
 }
 
+.chat-phase {
+  margin: 4px 0 2px;
+  font-size: 11px;
+  color: var(--te-text-dim);
+  font-style: italic;
+  animation: chat-phase-pulse 1.6s ease-in-out infinite;
+}
+@keyframes chat-phase-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
 .chat-diff {
   margin: 6px 0;
   border: 1px solid var(--te-line-strong);

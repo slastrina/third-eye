@@ -1590,6 +1590,36 @@ pub const COMMANDS_ENABLED_KEY: &str = "commandsEnabled";
 
 /// Read the persisted commands toggle. `None` = nothing usable persisted:
 /// the caller keeps the default (OFF).
+/// Store key for the verbose status-line mode (2026-08-02): when true the
+/// overlay shows detailed phase telemetry (model id, wait timers, raw LM
+/// Studio load state); when false (default) it shows plain-language status.
+pub const VERBOSE_STATUS_KEY: &str = "verboseStatus";
+
+/// Read the persisted verbose-status toggle; absent/garbage → off.
+pub fn load_verbose_status(app: &AppHandle) -> bool {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        return false;
+    };
+    matches!(
+        store.get(VERBOSE_STATUS_KEY),
+        Some(serde_json::Value::Bool(true))
+    )
+}
+
+/// Persist the verbose-status toggle. The error names the failed path.
+pub fn save_verbose_status(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(VERBOSE_STATUS_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {VERBOSE_STATUS_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {VERBOSE_STATUS_KEY}={enabled} to {path}");
+    Ok(())
+}
+
 pub fn load_commands_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,

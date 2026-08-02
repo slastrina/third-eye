@@ -61,6 +61,14 @@ pub const REASONING_EVENT: &str = "llm://reasoning";
 /// report. Payload: [`TerminalChunkPayload`]. The string half of the
 /// contract with `src/chat.ts` (pinned by a Rust test and its TS twin).
 pub const TERMINAL_CHUNK_EVENT: &str = "llm://terminal-chunk";
+/// Background-phase status (2026-08-02): what the run is waiting on when
+/// nothing is streaming — "loading-model" (LM Studio is JIT-loading the
+/// lane's model; polled from the native /api/v0/models state) or
+/// "processing-prompt" (the model is reading the prompt / prefilling).
+/// Emitted only while the wait is ongoing; any activity (token, reasoning,
+/// tool event) clears it UI-side. Payload: [`PhasePayload`]. The string
+/// half of the contract with `src/chat.ts`.
+pub const PHASE_EVENT: &str = "llm://phase";
 /// Routing-state broadcast (S07): mutation responses only reach the calling
 /// window, so every successful `set_model` / `set_lane_model` also emits the
 /// updated [`ModelInfo`] app-wide — the overlay stays truthful when the
@@ -800,6 +808,21 @@ pub struct TerminalChunkPayload {
     pub chunk: String,
 }
 
+/// The [`PHASE_EVENT`] payload: one background-wait status ping.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhasePayload {
+    pub request_id: u64,
+    /// "loading-model" | "processing-prompt".
+    pub phase: String,
+    /// The lane's pinned model id, when known.
+    pub model: Option<String>,
+    /// How long the run has been waiting with no activity, in ms.
+    pub waited_ms: u64,
+    /// Verbose-mode extra (e.g. the raw LM Studio load state).
+    pub detail: Option<String>,
+}
+
 /// Production [`crate::workspace::exec_tool::TerminalSink`]: broadcasts each
 /// chunk app-wide. Emission failure is logged, never fatal (token policy).
 struct TauriTerminalSink {
@@ -891,6 +914,10 @@ pub async fn chat(
         }
         let started = Instant::now();
         let first_token_at: Mutex<Option<Instant>> = Mutex::new(None);
+        // Phase telemetry (2026-08-02): the poller below reports what the
+        // run is waiting on whenever nothing has streamed for a beat —
+        // every activity callback stamps this.
+        let last_activity: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
         // Chat-ingest capture (M008 S01): every tool event is accumulated so
         // the post-DONE exchange capture can pair each call with its verified
         // outcome. Accumulation must never panic or slow the reply path — a
@@ -898,6 +925,9 @@ pub async fn chat(
         let tool_events: Mutex<Vec<ToolEvent>> = Mutex::new(Vec::new());
 
         let on_token = |token: &str| {
+            if let Ok(mut last) = last_activity.lock() {
+                *last = Instant::now();
+            }
             {
                 let mut first = first_token_at.lock().unwrap();
                 if first.is_none() {
@@ -922,6 +952,9 @@ pub async fn chat(
         // what used to fill with blank newlines. Emission failure is logged, never
         // fatal, same policy as tokens.
         let on_reasoning = |delta: &str| {
+            if let Ok(mut last) = last_activity.lock() {
+                *last = Instant::now();
+            }
             let payload = ReasoningEvent {
                 request_id: id,
                 delta: delta.into(),
@@ -943,6 +976,9 @@ pub async fn chat(
         // key-yielded; the run's end restores it (below, both exits).
         let hid_ghosted = std::sync::atomic::AtomicBool::new(false);
         let on_event = |event: &ToolEvent| {
+            if let Ok(mut last) = last_activity.lock() {
+                *last = Instant::now();
+            }
             if let ToolEvent::Call(e) = event {
                 let drives_input = e.call.name == crate::llm::toolloop::INPUT_ACTION_TOOL
                     || e.call.name == crate::llm::toolloop::FOCUS_APP_TOOL;
@@ -1288,6 +1324,49 @@ pub async fn chat(
                 skills_dir.display()
             );
         }
+        // Phase poller (2026-08-02): while the run waits on the model —
+        // no token/reasoning/tool activity for over a second — report WHY:
+        // the model is still loading (LM Studio native state) or it is
+        // reading the prompt. Loopback-only probes; cloud lanes just get
+        // "processing-prompt". Aborted the moment the run settles.
+        let phase_task = {
+            let app = task_app.clone();
+            let endpoint = client.endpoint().to_string();
+            let model = client.model_id().map(String::from);
+            let last = last_activity.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(900));
+                tick.tick().await; // the first tick fires immediately; skip it
+                loop {
+                    tick.tick().await;
+                    let waited = last.lock().map(|l| l.elapsed()).unwrap_or_default();
+                    if waited < std::time::Duration::from_millis(1100) {
+                        continue;
+                    }
+                    let state = match &model {
+                        Some(m) => crate::llm::lmstudio::model_state(&endpoint, m).await,
+                        None => None,
+                    };
+                    let (phase, detail) = match state {
+                        Some(s) if s != "loaded" => {
+                            ("loading-model", Some(format!("model state: {s}")))
+                        }
+                        Some(_) => ("processing-prompt", None),
+                        None => ("processing-prompt", None),
+                    };
+                    let payload = PhasePayload {
+                        request_id: id,
+                        phase: phase.to_string(),
+                        model: model.clone(),
+                        waited_ms: waited.as_millis() as u64,
+                        detail,
+                    };
+                    if let Err(e) = app.emit(PHASE_EVENT, payload) {
+                        log::debug!("llm: request {id} phase emit failed: {e}");
+                    }
+                }
+            })
+        };
         // The loop observes the cooperative Stop flag between rounds/actions and
         // terminates with a typed stopped outcome (S04 T04).
         let should_stop = move || stop.load(Ordering::SeqCst);
@@ -1302,6 +1381,7 @@ pub async fn chat(
             &should_stop,
         )
         .await;
+        phase_task.abort();
         // Ghost restore: the run is over — whatever it produced, the overlay
         // becomes solid and interactive again per its state-machine policy.
         if hid_ghosted.load(Ordering::SeqCst) {
@@ -1342,19 +1422,44 @@ pub async fn chat(
                     outcome.text.chars().count(),
                     loop_outcome.stopped
                 );
-                // A stopped run still emits DONE with whatever text streamed, so
-                // the assistant message settles visibly (never silent, R006); the
-                // Stopped run-state broadcast below is what tells the UI it was cut
-                // short.
-                let payload = DoneEvent {
-                    request_id: id,
-                    text: outcome.text,
-                    token_count: outcome.token_count,
-                    first_token_ms,
-                    total_ms,
-                };
-                if let Err(e) = task_app.emit(DONE_EVENT, payload) {
-                    log::warn!("llm: request {id} done emit failed: {e}");
+                // A model that finishes "successfully" with NO visible text —
+                // zero tokens or bare whitespace/newlines (a broken model's
+                // signature) — must surface as an ERROR, not an empty bubble
+                // the user stares at (R006 honesty). A user-stopped run is
+                // exempt: cutting a run short legitimately yields no text.
+                if !loop_outcome.stopped && outcome.text.trim().is_empty() {
+                    let error = crate::llm::LlmError::EmptyCompletion {
+                        endpoint: client.endpoint().to_string(),
+                        detail: format!(
+                            "{} token(s) streamed, none visible — the loaded model may be \
+                             broken or misconfigured; try a different model in Settings → \
+                             Models",
+                            outcome.token_count
+                        ),
+                    };
+                    log::error!("llm error: kind=empty-completion (request={id}): {error}");
+                    let payload = ErrorEvent {
+                        request_id: id,
+                        error,
+                    };
+                    if let Err(e) = task_app.emit(ERROR_EVENT, payload) {
+                        log::warn!("llm: request {id} error emit failed: {e}");
+                    }
+                } else {
+                    // A stopped run still emits DONE with whatever text
+                    // streamed, so the assistant message settles visibly
+                    // (never silent, R006); the Stopped run-state broadcast
+                    // below is what tells the UI it was cut short.
+                    let payload = DoneEvent {
+                        request_id: id,
+                        text: outcome.text,
+                        token_count: outcome.token_count,
+                        first_token_ms,
+                        total_ms,
+                    };
+                    if let Err(e) = task_app.emit(DONE_EVENT, payload) {
+                        log::warn!("llm: request {id} done emit failed: {e}");
+                    }
                 }
             }
             Err(err) => {
@@ -1670,6 +1775,65 @@ fn normalized_endpoint(raw: &str) -> Result<String, String> {
         )),
         Err(e) => Err(format!("\"{trimmed}\" is not a valid URL: {e}")),
     }
+}
+
+/// Verbose-status broadcast (2026-08-02): toggling in Settings applies to
+/// the overlay live. Payload: [`VerboseStatus`].
+pub const VERBOSE_STATUS_EVENT: &str = "settings://verbose-status";
+
+/// The `verbose_status` / `set_verbose_status` wire shape (health-as-value).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerboseStatus {
+    pub enabled: bool,
+    pub error: Option<String>,
+}
+
+/// Read the persisted verbose-status toggle.
+#[tauri::command]
+pub fn verbose_status(app: AppHandle) -> VerboseStatus {
+    VerboseStatus {
+        enabled: crate::config::load_verbose_status(&app),
+        error: None,
+    }
+}
+
+/// Flip the verbose-status toggle: persist + broadcast so every window
+/// (overlay, settings) applies it live. A persist failure returns as data
+/// with the effective (unchanged) value.
+#[tauri::command]
+pub fn set_verbose_status(app: AppHandle, enable: bool) -> VerboseStatus {
+    let status = match crate::config::save_verbose_status(&app, enable) {
+        Ok(()) => VerboseStatus {
+            enabled: enable,
+            error: None,
+        },
+        Err(e) => {
+            log::error!("llm: {e}");
+            VerboseStatus {
+                enabled: crate::config::load_verbose_status(&app),
+                error: Some(e),
+            }
+        }
+    };
+    if let Err(e) = app.emit(VERBOSE_STATUS_EVENT, status.clone()) {
+        log::warn!("llm: {VERBOSE_STATUS_EVENT} emit failed: {e}");
+    }
+    status
+}
+
+/// The served models with LM Studio's native detail — load state, tool_use
+/// capability, quantization, context length (2026-08-02). Empty when the
+/// endpoint is not LM Studio / not local / down: the Settings pane then
+/// falls back to the plain id list from `list_models`.
+#[tauri::command]
+pub async fn list_models_detailed(
+    state: State<'_, LlmState>,
+) -> Result<Vec<crate::llm::lmstudio::LmModelRow>, ()> {
+    let endpoint = state.router.endpoint().to_string();
+    Ok(crate::llm::lmstudio::model_rows(&endpoint)
+        .await
+        .unwrap_or_default())
 }
 
 /// Current endpoint configuration (mount-time query for the Settings Models

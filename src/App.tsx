@@ -29,6 +29,10 @@ import {
   onLlmToolResult,
   onTerminalChunk,
   diffLineKind,
+  onLlmPhase,
+  onVerboseStatus,
+  verboseStatus,
+  phaseStatusLine,
   onHidApprovalRequest,
   onHidApprovalResolved,
   onMcpApprovalRequest,
@@ -334,6 +338,10 @@ function App() {
       onLlmToolResult((payload) => dispatchChat({ type: "tool-result", payload })),
       // Live build output (coding-agent S4) streams into the terminal block.
       onTerminalChunk((payload) => dispatchChat({ type: "terminal-chunk", payload })),
+      // Background-wait status pings (loading model / reading prompt).
+      onLlmPhase((payload) => dispatchChat({ type: "phase", payload })),
+      // Verbose-mode toggle applies live from the Settings window.
+      onVerboseStatus((status) => setVerbose(status.enabled)),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -1047,7 +1055,12 @@ function App() {
   };
 
   const [routedLane, setRoutedLane] = useState<string | null>(null);
+  const [verbose, setVerbose] = useState(false);
   useEffect(() => {
+    verboseStatus().then(
+      (status) => setVerbose(status.enabled),
+      () => undefined,
+    );
     const un = onRouted((payload) => setRoutedLane(payload.lane));
     return () => {
       un.then((f) => f()).catch(() => {});
@@ -1266,6 +1279,13 @@ function App() {
                     {message.memory === "searching" ? "searching memory…" : "memory consulted"}
                   </span>
                 )}
+                {message.role === "assistant" &&
+                  message.status === "streaming" &&
+                  chat.phase !== null && (
+                    <div className="chat-phase" data-phase={chat.phase.phase}>
+                      {phaseStatusLine(chat.phase, verbose)}
+                    </div>
+                  )}
                 {message.role === "assistant" && message.status === "streaming" && (
                   <span className="chat-caret" aria-label="Answer streaming" />
                 )}

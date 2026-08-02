@@ -16,7 +16,8 @@ import type {
   BuildInfo,
   NudgeHistoryEntry, ToolTogglesStatus,
   WorkspaceStatus,
-  BridgeStatus } from "./chat";
+  BridgeStatus,
+  LmModelRow } from "./chat";
 import { useEffect, useReducer, useState } from "react";
 import {
   bannerDetail,
@@ -51,6 +52,9 @@ import {
   setWorkspaceRoots,
   workspaceRoots,
   bridgeStatus,
+  listModelsDetailed,
+  verboseStatus,
+  setVerboseStatus,
   type CommandsStatus,
   type HidRunMode,
   type InventoryEntry,
@@ -311,6 +315,8 @@ function Settings() {
   const [build, setBuild] = useState<BuildInfo | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceStatus | null>(null);
   const [bridge, setBridge] = useState<BridgeStatus | null>(null);
+  const [modelRows, setModelRows] = useState<LmModelRow[]>([]);
+  const [verbose, setVerbose] = useState<boolean | null>(null);
   const [newRoot, setNewRoot] = useState("");
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
@@ -424,6 +430,14 @@ function Settings() {
     bridgeStatus().then(
       (status) => setBridge(status),
       (err) => console.debug("settings: bridge_status unavailable:", err),
+    );
+    listModelsDetailed().then(
+      (rows) => setModelRows(rows),
+      (err) => console.debug("settings: list_models_detailed unavailable:", err),
+    );
+    verboseStatus().then(
+      (status) => setVerbose(status.enabled),
+      (err) => console.debug("settings: verbose_status unavailable:", err),
     );
     workspaceRoots().then(
       (status) => setWorkspaces(status),
@@ -1183,6 +1197,59 @@ function Settings() {
               <strong>Model change rejected</strong>
               <span>{state.laneError}</span>
             </div>
+          )}
+          {modelRows.length > 0 && (
+            <>
+              <h3 className="guard-subheading">Served models</h3>
+              <ul className="settings-approved-kinds" data-model-rows>
+                {modelRows.map((row) => (
+                  <li key={row.id}>
+                    <span>
+                      {row.id}
+                      <span className="settings-model-badges">
+                        {" "}
+                        [{row.state || "unknown"}]
+                        {row.toolUse ? " [tools ✓]" : " [⚠ no tool support]"}
+                        {row.quantization ? ` ${row.quantization}` : ""}
+                        {row.maxContextLength
+                          ? ` · ${Math.round(row.maxContextLength / 1024)}k ctx`
+                          : ""}
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="settings-hint">
+                From LM Studio's native API. A model without tool support cannot
+                drive Third Eye's tools — every chat with it will fail.
+              </p>
+            </>
+          )}
+          {verbose !== null && (
+            <>
+              <label className="settings-row">
+                <span className="settings-row-label">Verbose status</span>
+                <input
+                  type="checkbox"
+                  data-verbose-toggle
+                  checked={verbose}
+                  onChange={(event) => {
+                    const enable = event.target.checked;
+                    setVerbose(enable);
+                    setVerboseStatus(enable).then(
+                      (status) => setVerbose(status.enabled),
+                      (err) =>
+                        console.debug("settings: set_verbose_status unavailable:", err),
+                    );
+                  }}
+                />
+              </label>
+              <p className="settings-hint">
+                Off: plain feedback while the model works ("Loading the model…",
+                "Reading your request…"). On: detailed telemetry — model id, wait
+                timers, and LM Studio's raw load state.
+              </p>
+            </>
           )}
         </section>
         )}

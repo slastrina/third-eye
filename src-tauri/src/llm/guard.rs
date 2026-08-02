@@ -345,6 +345,10 @@ impl LlmClient for GuardedClient {
         self.inner.endpoint()
     }
 
+    fn model_id(&self) -> Option<&str> {
+        self.inner.model_id()
+    }
+
     async fn stream_chat(
         &self,
         request: &ChatRequest,

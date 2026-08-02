@@ -200,10 +200,18 @@ impl OpenAiClient {
             let body_text = resp.text().await.unwrap_or_default();
             let detail = format!("HTTP {status}: {}", snippet(&body_text));
             return Err(if status.is_client_error() {
-                // A 4xx on a tools-carrying request whose body names tools is
-                // the model rejecting tool calling — a distinct typed state,
-                // not the misleading "no model loaded".
-                if !request.tools.is_empty() && body_text.to_ascii_lowercase().contains("tool") {
+                // A 4xx on a tools-carrying request whose body names tools —
+                // or whose chat TEMPLATE failed to render (gemma builds throw
+                // "Error rendering prompt with jinja template" the moment a
+                // tools array is present) — is the model rejecting tool
+                // calling: a distinct typed state, not the misleading "no
+                // model loaded".
+                let body_lower = body_text.to_ascii_lowercase();
+                if !request.tools.is_empty()
+                    && (body_lower.contains("tool")
+                        || body_lower.contains("jinja")
+                        || body_lower.contains("template"))
+                {
                     log::error!(
                         "llm: tools-unsupported endpoint={} model={}: {detail}",
                         self.endpoint,
@@ -352,6 +360,10 @@ impl OpenAiClient {
 impl LlmClient for OpenAiClient {
     fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     async fn stream_chat(
@@ -1068,6 +1080,17 @@ mod tests {
         assert!(
             matches!(&err, LlmError::ToolsUnsupported { detail, .. } if detail.contains("tool use"))
         );
+    }
+
+    #[tokio::test]
+    async fn http_400_template_error_on_tools_request_maps_to_tools_unsupported() {
+        // The gemma signature: the chat template itself fails to render the
+        // tools array. The user must see "this model can't use tools", not
+        // "no model loaded" (a model IS loaded — it just can't do this).
+        let body = r#"{"error":"Error rendering prompt with jinja template: \"Unknown test: sequence\"."}"#;
+        let endpoint = spawn_raw_server(plain_response("400 Bad Request", body)).await;
+        let err = run_chat_with_tools(&endpoint).await.unwrap_err();
+        assert_eq!(err.kind(), "tools-unsupported");
     }
 
     #[tokio::test]

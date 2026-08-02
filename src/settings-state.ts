@@ -279,13 +279,17 @@ export function modelsErrorTitle(error: ModelsError): string {
     // A model-list fetch never carries tools, so this kind can't arise here;
     // the case exists because ModelsError shares the full LlmError taxonomy.
     case "tools-unsupported":
-      return "This model can't search memory";
+      return "This model can't use tools";
     case "interrupted":
       return "Model list fetch interrupted";
     // The model-list probe is GET-only with no user content, so the privacy
     // guard never blocks it; the case exists for the shared taxonomy.
     case "guard-blocked":
       return "Blocked by privacy guard";
+    // A model list is data, not a completion; the case exists because
+    // ModelsError shares the full LlmError taxonomy.
+    case "empty-completion":
+      return "The model returned nothing";
     case "ipc":
       return "Model list unavailable";
   }
