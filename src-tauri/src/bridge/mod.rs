@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -46,6 +46,10 @@ pub struct BridgeState {
     port: Mutex<Option<u16>>,
     token: String,
     outbound: broadcast::Sender<String>,
+    /// Chat-stream frames (protocol v2): tokens/done/error for clients
+    /// that sent `ask` — VS Code and other non-asking clients never
+    /// subscribe, so chat text never reaches them.
+    chat_stream: broadcast::Sender<String>,
     connected: AtomicUsize,
 }
 
@@ -55,6 +59,7 @@ impl BridgeState {
             port: Mutex::new(None),
             token: random_token(),
             outbound: broadcast::channel(BROADCAST_CAPACITY).0,
+            chat_stream: broadcast::channel(BROADCAST_CAPACITY).0,
             connected: AtomicUsize::new(0),
         }
     }
@@ -111,6 +116,65 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// What an authenticated client's v2 commands do — a seam so
+/// [`serve_client`] is testable without a Tauri runtime.
+#[async_trait::async_trait]
+pub trait BridgeHandler: Send + Sync {
+    fn add_workspace(&self, path: &str) -> Result<String, String>;
+    fn show_overlay(&self, prefill: Option<&str>) -> Result<String, String>;
+    async fn ask(&self, text: &str) -> Result<String, String>;
+}
+
+/// Production handler: workspace add rides the SAME canonical/persist path
+/// as Settings; `ask` submits through the overlay frontend so the run is
+/// visible there exactly like a typed question.
+struct TauriBridgeHandler {
+    app: AppHandle,
+}
+
+#[async_trait::async_trait]
+impl BridgeHandler for TauriBridgeHandler {
+    fn add_workspace(&self, path: &str) -> Result<String, String> {
+        crate::workspace::commands::add_workspace_root(&self.app, path)
+    }
+
+    fn show_overlay(&self, prefill: Option<&str>) -> Result<String, String> {
+        // An already-visible overlay refuses the Show transition — that IS
+        // the goal state, not a failure.
+        if let Err(e) = crate::overlay::show_overlay(self.app.clone()) {
+            log::debug!("bridge: show-overlay no-op: {e}");
+        }
+        if let Some(text) = prefill {
+            let _ = self
+                .app
+                .emit("bridge://prefill", serde_json::json!({ "text": text }));
+        }
+        Ok("overlay shown".into())
+    }
+
+    async fn ask(&self, text: &str) -> Result<String, String> {
+        // Best-effort overlay show (already-visible refuses the transition —
+        // that IS the goal state). The run itself goes STRAIGHT through the
+        // backend chat pipeline: no webview hop, so `thirdeye ask` works
+        // even with the overlay closed. The overlay's own transcript is
+        // frontend state, so a CLI-initiated exchange shows there as run
+        // activity (HUD/status), not as chat bubbles — the terminal is the
+        // conversation surface.
+        if let Err(e) = crate::overlay::show_overlay(self.app.clone()) {
+            log::debug!("bridge: ask show-overlay no-op: {e}");
+        }
+        log::info!("bridge: ask received ({} chars)", text.len());
+        let state = self.app.state::<crate::llm::commands::LlmState>();
+        let id = crate::llm::commands::chat(
+            self.app.clone(),
+            state,
+            vec![crate::llm::ChatMessage::user(text)],
+        )
+        .await?;
+        Ok(format!("request {id} started"))
+    }
+}
+
 /// Where the discovery file lives: `<app-data>/bridge.json`.
 pub fn discovery_path(app: &AppHandle) -> Option<std::path::PathBuf> {
     app.path()
@@ -131,6 +195,16 @@ pub fn start_bridge(app: &AppHandle) {
         app.listen(*event, move |e| {
             if let Some(message) = protocol::forward(event, e.payload()) {
                 let _ = tap.outbound.send(message);
+            }
+        });
+    }
+    // Chat-stream taps (protocol v2): only ask-subscribed clients receive
+    // these — the channel has zero receivers otherwise.
+    for event in ["llm://token", "llm://done", "llm://error"] {
+        let tap = state.clone();
+        app.listen(event, move |e| {
+            if let Some(message) = protocol::forward_chat(event, e.payload()) {
+                let _ = tap.chat_stream.send(message);
             }
         });
     }
@@ -162,8 +236,9 @@ pub fn start_bridge(app: &AppHandle) {
                 return;
             };
             let state = state.clone();
+            let handler: Arc<dyn BridgeHandler> = Arc::new(TauriBridgeHandler { app: app.clone() });
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = serve_client(socket, &state).await {
+                if let Err(e) = serve_client(socket, &state, handler).await {
                     log::debug!("bridge: client {peer} ended: {e}");
                 }
             });
@@ -193,12 +268,25 @@ fn write_discovery(app: &AppHandle, port: u16, token: &str) -> Result<(), String
     Ok(())
 }
 
+/// Await the next chat frame from an optional subscription; pends forever
+/// when unsubscribed (the select arm is guarded on `is_some`).
+async fn recv_chat(
+    rx: &mut Option<broadcast::Receiver<String>>,
+) -> Result<String, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// One client: WS handshake → auth-first (deadline) → hello → forward the
-/// broadcast until either side closes. Inbound frames after auth are
-/// ignored (v1 has no client→app control surface).
+/// broadcast until either side closes. Authenticated clients may send v2
+/// commands ([`protocol::parse_command`]); an `ask` additionally
+/// subscribes the client to the chat stream. Unknown frames are ignored.
 async fn serve_client(
     socket: tokio::net::TcpStream,
     state: &Arc<BridgeState>,
+    handler: Arc<dyn BridgeHandler>,
 ) -> Result<(), String> {
     let ws = tokio_tungstenite::accept_async(socket)
         .await
@@ -229,6 +317,9 @@ async fn serve_client(
     state.connected.fetch_add(1, Ordering::SeqCst);
     log::info!("bridge: client connected ({} total)", state.connected());
     let mut rx = state.outbound.subscribe();
+    // The chat stream is subscribed lazily on the first `ask` — non-asking
+    // clients (VS Code) never receive chat frames.
+    let mut chat_rx: Option<broadcast::Receiver<String>> = None;
     let result = loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
@@ -245,11 +336,51 @@ async fn serve_client(
                 }
                 Err(broadcast::error::RecvError::Closed) => break Ok(()),
             },
+            chat = recv_chat(&mut chat_rx), if chat_rx.is_some() => match chat {
+                Ok(message) => {
+                    if let Err(e) = sink
+                        .send(tokio_tungstenite::tungstenite::Message::Text(message))
+                        .await
+                    {
+                        break Err(format!("send: {e}"));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("bridge: chat client lagged, {n} frames dropped");
+                }
+                Err(broadcast::error::RecvError::Closed) => break Ok(()),
+            },
             inbound = stream.next() => match inbound {
                 None => break Ok(()),
                 Some(Err(e)) => break Err(format!("recv: {e}")),
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break Ok(()),
-                // v1: no client→app control; other frames are ignored.
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    if let Some(command) = protocol::parse_command(&text) {
+                        let (cmd, result) = match &command {
+                            protocol::ClientCommand::AddWorkspace { path } => {
+                                ("add-workspace", handler.add_workspace(path))
+                            }
+                            protocol::ClientCommand::ShowOverlay { prefill } => {
+                                ("show-overlay", handler.show_overlay(prefill.as_deref()))
+                            }
+                            protocol::ClientCommand::Ask { text } => {
+                                // Subscribe BEFORE submitting so the first
+                                // tokens can never race past the receiver.
+                                if chat_rx.is_none() {
+                                    chat_rx = Some(state.chat_stream.subscribe());
+                                }
+                                ("ask", handler.ask(text).await)
+                            }
+                        };
+                        let ack = protocol::command_ack(cmd, &result);
+                        if let Err(e) = sink
+                            .send(tokio_tungstenite::tungstenite::Message::Text(ack))
+                            .await
+                        {
+                            break Err(format!("ack send: {e}"));
+                        }
+                    }
+                }
                 Some(Ok(_)) => {}
             },
         }
@@ -313,6 +444,25 @@ mod tests {
         assert!(state.send("x".into()));
     }
 
+    struct ScriptedHandler;
+
+    #[async_trait::async_trait]
+    impl BridgeHandler for ScriptedHandler {
+        fn add_workspace(&self, path: &str) -> Result<String, String> {
+            if path.starts_with('/') {
+                Ok(path.to_string())
+            } else {
+                Err("not absolute".into())
+            }
+        }
+        fn show_overlay(&self, _prefill: Option<&str>) -> Result<String, String> {
+            Ok("overlay shown".into())
+        }
+        async fn ask(&self, _text: &str) -> Result<String, String> {
+            Ok("submitted".into())
+        }
+    }
+
     #[tokio::test]
     async fn end_to_end_auth_gate_and_forwarding() {
         use futures_util::{SinkExt, StreamExt};
@@ -330,7 +480,7 @@ mod tests {
                 };
                 let state = serve_state.clone();
                 tokio::spawn(async move {
-                    let _ = serve_client(socket, &state).await;
+                    let _ = serve_client(socket, &state, Arc::new(ScriptedHandler)).await;
                 });
             }
         });
@@ -375,5 +525,35 @@ mod tests {
         assert!(state.send(r#"{"type":"diff","report":"+x"}"#.into()));
         let forwarded = ws.next().await.unwrap().unwrap().to_string();
         assert!(forwarded.contains("diff"), "{forwarded}");
+
+        // v2 commands: add-workspace acks with the handler's result…
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"add-workspace","path":"/tmp/proj"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack = ws.next().await.unwrap().unwrap().to_string();
+        assert!(ack.contains("\"ok\"") && ack.contains("/tmp/proj"), "{ack}");
+        // …a failing command acks err, connection stays alive…
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"add-workspace","path":"relative"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack = ws.next().await.unwrap().unwrap().to_string();
+        assert!(ack.contains("\"err\""), "{ack}");
+        // …and ask subscribes THIS client to the chat stream.
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"ask","text":"2+2?"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack = ws.next().await.unwrap().unwrap().to_string();
+        assert!(ack.contains("submitted"), "{ack}");
+        let _ = state
+            .chat_stream
+            .send(r#"{"type":"chat-token","token":"4"}"#.into());
+        let frame = ws.next().await.unwrap().unwrap().to_string();
+        assert!(frame.contains("chat-token"), "{frame}");
     }
 }

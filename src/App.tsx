@@ -13,6 +13,7 @@ import {
   chatReducer,
   completeFirstRun,
   composeMessages,
+  frameFromImageFile,
   freshNudgePreload,
   nudgeContextFrame,
   firstRunStatus,
@@ -104,6 +105,7 @@ import {
   type PresentationStatus,
 } from "./overlay-presentation-state";
 import { onTrayNotice, type TrayNotice } from "./tray-notice";
+import { listen } from "@tauri-apps/api/event";
 import {
   availableMonitors,
   currentMonitor,
@@ -342,6 +344,12 @@ function App() {
       onLlmPhase((payload) => dispatchChat({ type: "phase", payload })),
       // Verbose-mode toggle applies live from the Settings window.
       onVerboseStatus((status) => setVerbose(status.enabled)),
+      // Bridge v2 (spec 2026-08-02 N3): a CLI/Finder show-overlay may
+      // carry a prefill for the input. (CLI `ask` runs backend-side.)
+      listen<{ text: string }>("bridge://prefill", (e) => {
+        setDraft(e.payload.text);
+        inputRef.current?.focus();
+      }),
     ];
     unlistens.forEach((u) => {
       u.catch((err) => console.error("overlay: event subscription failed:", err));
@@ -1469,6 +1477,27 @@ function App() {
               aria-label="Overlay input"
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
+              onPaste={(event) => {
+                // Image paste (N1, spec 2026-08-02): a pasted screenshot
+                // rides the SAME attachment pipeline as the screenshot
+                // button. Text pastes fall through untouched.
+                const item = Array.from(event.clipboardData.items).find((i) =>
+                  i.type.startsWith("image/"),
+                );
+                const file = item?.getAsFile();
+                if (!file) return;
+                event.preventDefault();
+                if (chat.attachPending) return;
+                dispatchChat({ type: "attach-start" });
+                frameFromImageFile(file).then(
+                  (frame) => dispatchChat({ type: "attach-done", frame }),
+                  (err) =>
+                    dispatchChat({
+                      type: "attach-error",
+                      error: { kind: "capture-failed", detail: String(err) },
+                    }),
+                );
+              }}
             />
             {chat.messages.length > 0 && (
               <button

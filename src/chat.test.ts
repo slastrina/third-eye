@@ -6,6 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bannerDetail,
+  base64FromDataUrl,
+  pasteScaledSize,
   bannerTitle,
   captureErrorTitle,
   chatReducer,
@@ -54,6 +56,25 @@ import {
   type PrivacyStatus,
   isLocalEndpoint,
 } from "./chat";
+
+describe("image paste helpers (N1)", () => {
+  it("extracts base64 only from real base64 image data URLs", () => {
+    expect(base64FromDataUrl("data:image/png;base64,iVBORw0K")).toBe("iVBORw0K");
+    expect(base64FromDataUrl("data:image/jpeg;base64,/9j/4AAQ")).toBe("/9j/4AAQ");
+    // Text SVG, plain text, and file paths must never masquerade as PNG bytes.
+    expect(base64FromDataUrl("data:image/svg+xml,<svg/>")).toBeNull();
+    expect(base64FromDataUrl("data:text/plain;base64,aGk=")).toBeNull();
+    expect(base64FromDataUrl("/tmp/shot.png")).toBeNull();
+  });
+
+  it("downscales past the paste cap, preserving aspect; small stays exact", () => {
+    expect(pasteScaledSize(800, 600)).toEqual({ width: 800, height: 600 });
+    expect(pasteScaledSize(4096, 2048)).toEqual({ width: 2048, height: 1024 });
+    const tall = pasteScaledSize(1000, 5000);
+    expect(tall.height).toBe(2048);
+    expect(tall.width).toBe(410);
+  });
+});
 
 describe("isLocalEndpoint", () => {
   it("claims on-device only for loopback hosts; unparseable never claims", () => {

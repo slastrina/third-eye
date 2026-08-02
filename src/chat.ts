@@ -356,6 +356,66 @@ export interface CapturedFrame {
   base64Png: string;
 }
 
+/** Strip a `data:image/...;base64,` prefix down to the raw base64 payload
+ *  (what CapturedFrame carries). Pure; null when the URL is not a base64
+ *  data URL (a pasted SVG-as-text, a file:// path — refuse, never send
+ *  garbage bytes as a "PNG"). */
+export function base64FromDataUrl(dataUrl: string): string | null {
+  const match = /^data:image\/[a-z+.-]+;base64,(.+)$/i.exec(dataUrl);
+  return match ? match[1] : null;
+}
+
+/** Longest edge a pasted image may keep — larger pastes are downscaled
+ *  (vision models cap resolution anyway; a 5K screenshot as base64 would
+ *  bloat the request for nothing). */
+export const PASTE_MAX_DIMENSION = 2048;
+
+/** Scale (w,h) to fit PASTE_MAX_DIMENSION, preserving aspect. Pure. */
+export function pasteScaledSize(width: number, height: number): { width: number; height: number } {
+  const longest = Math.max(width, height);
+  if (longest <= PASTE_MAX_DIMENSION) return { width, height };
+  const factor = PASTE_MAX_DIMENSION / longest;
+  return {
+    width: Math.max(1, Math.round(width * factor)),
+    height: Math.max(1, Math.round(height * factor)),
+  };
+}
+
+/** Decode a pasted image file into a CapturedFrame (N1, spec 2026-08-02):
+ *  re-encoded to PNG via canvas (normalizes JPEG/WebP/TIFF pastes),
+ *  downscaled past PASTE_MAX_DIMENSION. Rides the SAME attachment pipeline
+ *  as the screenshot button — transient, never persisted (R011). */
+export function frameFromImageFile(file: File): Promise<CapturedFrame> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      const { width, height } = pasteScaledSize(image.naturalWidth, image.naturalHeight);
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("canvas 2d context unavailable"));
+        return;
+      }
+      context.drawImage(image, 0, 0, width, height);
+      const base64Png = base64FromDataUrl(canvas.toDataURL("image/png"));
+      if (!base64Png) {
+        reject(new Error("pasted image could not be encoded as PNG"));
+        return;
+      }
+      resolve({ width, height, base64Png });
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("pasted data is not a decodable image"));
+    };
+    image.src = url;
+  });
+}
+
 /** Screen Recording permission snapshot — health-as-value, never an error.
  *  `supported: false` means this platform has no capture backend at all. */
 export interface CapturePermission {

@@ -1,5 +1,6 @@
 [package]
 name = "third-eye"
+default-run = "third-eye"
 version = "0.1.0"
 description = "Third Eye — instant AI overlay"
 authors = ["slastrina"]
@@ -71,6 +72,9 @@ rmcp = { version = "2.2", default-features = false, features = ["client", "trans
 # aws-lc-sys. Only the frontmatter YAML uses it; the `---` split is hand-rolled.
 serde_yml = "0.0.12"
 tokio-tungstenite = "0.24"
+tungstenite = "0.24"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 # net + io-util power the raw TcpListener mock server in llm tests; `process`

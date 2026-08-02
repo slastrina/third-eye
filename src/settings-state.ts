@@ -80,6 +80,55 @@ export function hotkeyStatus(): Promise<HotkeyStatus> {
   return invoke<HotkeyStatus>("hotkey_status");
 }
 
+/** Rebind the global shortcut (N2, spec 2026-08-02). Health-as-value: on a
+ *  conflict/parse failure the old binding stays and `error` says why. */
+export function setHotkey(shortcut: string): Promise<HotkeyStatus> {
+  return invoke<HotkeyStatus>("set_hotkey", { shortcut });
+}
+
+/** The preset shortcuts the tray menu offers — mirrored from Rust's
+ *  HOTKEY_PRESETS (default first). */
+export const HOTKEY_PRESETS = [
+  "super+shift+space",
+  "alt+space",
+  "ctrl+shift+space",
+  "super+shift+k",
+] as const;
+
+/** Toggle launch-at-login (N2). Health-as-value like the hotkey. */
+export function setAutostart(enable: boolean): Promise<AutostartStatus> {
+  return invoke<AutostartStatus>("set_autostart", { enable });
+}
+
+/** OS integrations snapshot (N5) — serde camelCase of Rust's
+ *  IntegrationsStatus. */
+export interface IntegrationsStatus {
+  cliBundled: string | null;
+  cliInstalled: string | null;
+  finderInstalled: string | null;
+  error: string | null;
+}
+
+export function integrationsStatus(): Promise<IntegrationsStatus> {
+  return invoke<IntegrationsStatus>("integrations_status");
+}
+
+export function installCli(): Promise<IntegrationsStatus> {
+  return invoke<IntegrationsStatus>("install_cli");
+}
+
+export function removeCli(): Promise<IntegrationsStatus> {
+  return invoke<IntegrationsStatus>("remove_cli");
+}
+
+export function installFinderAction(): Promise<IntegrationsStatus> {
+  return invoke<IntegrationsStatus>("install_finder_action");
+}
+
+export function removeFinderAction(): Promise<IntegrationsStatus> {
+  return invoke<IntegrationsStatus>("remove_finder_action");
+}
+
 /** Read-only launch-at-login health for the status section. */
 export function autostartStatus(): Promise<AutostartStatus> {
   return invoke<AutostartStatus>("autostart_status");

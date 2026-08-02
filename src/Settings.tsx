@@ -174,11 +174,20 @@ import {
 } from "./privacy-state";
 import {
   autostartStatus,
+  integrationsStatus,
+  installCli,
+  removeCli,
+  installFinderAction,
+  removeFinderAction,
+  type IntegrationsStatus,
   endpointDraftFor,
   HID_RUN_MODE_OPTIONS,
   hidModeShowsAutoRunWarning,
   hideSettingsWindow,
   hotkeyStatus,
+  setHotkey,
+  setAutostart,
+  HOTKEY_PRESETS,
   initialSettingsState,
   isLoopbackEndpoint,
   laneOptions,
@@ -317,6 +326,14 @@ function Settings() {
   const [bridge, setBridge] = useState<BridgeStatus | null>(null);
   const [modelRows, setModelRows] = useState<LmModelRow[]>([]);
   const [verbose, setVerbose] = useState<boolean | null>(null);
+  const [hotkeyDraft, setHotkeyDraft] = useState("");
+  const [integrations, setIntegrations] = useState<IntegrationsStatus | null>(null);
+  const applyHotkey = (shortcut: string) => {
+    setHotkey(shortcut).then(
+      (status) => dispatch({ type: "hotkey", status }),
+      (err) => console.debug("settings: set_hotkey unavailable:", err),
+    );
+  };
   const [newRoot, setNewRoot] = useState("");
   // Memory retention (tour Memory step's setting, mirrored here). Optimistic
   // select, then the backend's effective value folds back — a rejected value
@@ -402,6 +419,10 @@ function Settings() {
     autostartStatus().then(
       (status) => dispatch({ type: "autostart", status }),
       (err) => console.debug("settings: autostart_status unavailable:", err),
+    );
+    integrationsStatus().then(
+      (status) => setIntegrations(status),
+      (err) => console.debug("settings: integrations_status unavailable:", err),
     );
     watcherStatus().then(
       (status) => dispatchWatcher({ type: "status", status }),
@@ -1743,6 +1764,97 @@ function Settings() {
         </section>
         )}
 
+
+        {active === "integrations" && (
+        <section className="settings-section" aria-labelledby="settings-integrations-heading">
+          <h2 id="settings-integrations-heading" className="settings-section-title">
+            Integrations
+          </h2>
+          <p className="settings-hint">
+            Optional ways into Third Eye from the rest of macOS. Everything here
+            is installed and removed only from this pane, touching exactly the
+            paths shown.
+          </p>
+          {integrations === null && (
+            <p className="settings-unavailable">
+              Integration state is unavailable outside the app.
+            </p>
+          )}
+          {integrations?.error && (
+            <div className="settings-error" role="alert">
+              <strong>Integration change failed</strong>
+              <span>{integrations.error}</span>
+            </div>
+          )}
+          {integrations !== null && (
+            <>
+              <h3 className="guard-subheading">Terminal command</h3>
+              <div className="settings-row">
+                <span className="settings-row-label">thirdeye CLI</span>
+                <span data-cli-state>
+                  {integrations.cliInstalled ?? "not installed"}
+                </span>
+                {integrations.cliInstalled ? (
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    onClick={() => removeCli().then(setIntegrations, () => undefined)}
+                  >
+                    Remove
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={integrations.cliBundled === null}
+                    onClick={() => installCli().then(setIntegrations, () => undefined)}
+                  >
+                    Install
+                  </button>
+                )}
+              </div>
+              <p className="settings-hint">
+                `thirdeye .` adds the current folder as a workspace and opens the
+                overlay; `thirdeye ask "…"` streams an answer in the terminal;
+                `thirdeye tui` is a terminal chat. If it lands in ~/.local/bin,
+                make sure that's on your PATH.
+                {integrations.cliBundled === null &&
+                  " (This build has no bundled CLI — install-app builds do.)"}
+              </p>
+              <h3 className="guard-subheading">Finder</h3>
+              <div className="settings-row">
+                <span className="settings-row-label">Quick Action</span>
+                <span data-finder-state>
+                  {integrations.finderInstalled ? "installed" : "not installed"}
+                </span>
+                {integrations.finderInstalled ? (
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    onClick={() => removeFinderAction().then(setIntegrations, () => undefined)}
+                  >
+                    Remove
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    onClick={() => installFinderAction().then(setIntegrations, () => undefined)}
+                  >
+                    Install
+                  </button>
+                )}
+              </div>
+              <p className="settings-hint">
+                Adds "Work here with Third Eye" to a folder's right-click Quick
+                Actions in Finder: it opens the overlay with that folder as a
+                workspace. Uses the CLI, so install that first.
+              </p>
+            </>
+          )}
+        </section>
+        )}
+
         {active === "workspaces" && (
         <section className="settings-section" aria-labelledby="settings-workspaces-heading">
           <h2 id="settings-workspaces-heading" className="settings-section-title">
@@ -2729,6 +2841,56 @@ function Settings() {
                 : "unavailable"}
             </span>
           </div>
+          {state.hotkey && (
+            <>
+              <div className="settings-row">
+                <span className="settings-row-label">Change hotkey</span>
+                <select
+                  className="settings-select"
+                  aria-label="Global hotkey"
+                  data-hotkey-select
+                  value={
+                    (HOTKEY_PRESETS as readonly string[]).includes(state.hotkey.shortcut)
+                      ? state.hotkey.shortcut
+                      : "custom"
+                  }
+                  onChange={(event) => {
+                    if (event.target.value === "custom") return;
+                    applyHotkey(event.target.value);
+                  }}
+                >
+                  {HOTKEY_PRESETS.map((preset) => (
+                    <option key={preset} value={preset}>
+                      {preset}
+                    </option>
+                  ))}
+                  <option value="custom">custom…</option>
+                </select>
+              </div>
+              <form
+                className="settings-workspace-add"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const shortcut = hotkeyDraft.trim();
+                  if (shortcut) applyHotkey(shortcut);
+                }}
+              >
+                <input
+                  type="text"
+                  aria-label="Custom hotkey accelerator"
+                  placeholder="e.g. super+shift+space, alt+e, ctrl+alt+t"
+                  value={hotkeyDraft}
+                  onChange={(event) => setHotkeyDraft(event.target.value)}
+                />
+                <button type="submit">Apply</button>
+              </form>
+              <p className="settings-hint">
+                Modifiers: super (⌘), ctrl, alt, shift — joined with +. A
+                conflicting or invalid shortcut keeps the current one and shows
+                the error below.
+              </p>
+            </>
+          )}
           {state.hotkey?.error && (
             <div className="settings-error" role="alert">
               <span>{state.hotkey.error}</span>
@@ -2740,6 +2902,22 @@ function Settings() {
               {state.autostart ? (state.autostart.enabled ? "on" : "off") : "unavailable"}
             </span>
           </div>
+          {state.autostart && (
+            <label className="settings-row">
+              <span className="settings-row-label">Start Third Eye at login</span>
+              <input
+                type="checkbox"
+                data-autostart-toggle
+                checked={state.autostart.enabled}
+                onChange={(event) => {
+                  setAutostart(event.target.checked).then(
+                    (status) => dispatch({ type: "autostart", status }),
+                    (err) => console.debug("settings: set_autostart unavailable:", err),
+                  );
+                }}
+              />
+            </label>
+          )}
           {state.autostart?.error && (
             <div className="settings-error" role="alert">
               <span>{state.autostart.error}</span>

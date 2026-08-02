@@ -95,7 +95,11 @@ build-web:
 	npm run build
 
 ## build-tauri: Build the Tauri desktop app bundle for the current OS
+# The thirdeye CLI is staged into src-tauri/binaries/ first so the bundler
+# ships it in Resources (Settings → Integrations installs it from there).
 build-tauri:
+	cd src-tauri && cargo build --release --bin thirdeye
+	mkdir -p src-tauri/binaries && cp src-tauri/target/release/thirdeye src-tauri/binaries/thirdeye
 	$(TAURI) build
 
 # ── Test ────────────────────────────────────────────────────────────────

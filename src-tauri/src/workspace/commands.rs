@@ -60,6 +60,43 @@ pub fn set_workspace_roots(
     status(&state)
 }
 
+/// Add ONE workspace root from an external entry point (the bridge's
+/// `add-workspace` command — CLI / Finder, spec 2026-08-02 N3). The same
+/// canonical/absolute discipline as Settings: the path must exist, be a
+/// directory, and canonicalize; duplicates are a no-op success. Persisted
+/// with rollback like `set_workspace_roots`. Returns the canonical path.
+pub fn add_workspace_root(app: &AppHandle, path: &str) -> Result<String, String> {
+    let canonical = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {path}: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    let state = app.state::<std::sync::Arc<WorkspaceState>>();
+    let display = canonical.display().to_string();
+    let previous = state.roots();
+    if previous
+        .iter()
+        .any(|r| r.canonicalize().map(|c| c == canonical).unwrap_or(false))
+    {
+        return Ok(display);
+    }
+    let mut roots: Vec<String> = previous.iter().map(|p| p.display().to_string()).collect();
+    roots.push(display.clone());
+    state.set_roots(roots.clone());
+    match crate::config::save_workspace_roots(app, &roots) {
+        Ok(()) => {
+            log::info!("workspace: root added via bridge: {display}");
+            Ok(display)
+        }
+        Err(e) => {
+            state.set_roots(previous.iter().map(|p| p.display().to_string()).collect());
+            log::error!("workspace: {e}");
+            Err(e)
+        }
+    }
+}
+
 /// Apply the persisted roots at boot (in-memory only).
 pub fn apply_persisted_workspace_roots(app: &AppHandle) {
     let roots = crate::config::load_workspace_roots(app);

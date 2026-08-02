@@ -21,6 +21,7 @@ describe("SECTION_GROUPS", () => {
       [
         "cloud",
         "input",
+        "integrations",
         "mcp",
         "memory",
         "models",

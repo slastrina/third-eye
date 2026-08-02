@@ -126,6 +126,79 @@ pub fn forward(event: &str, payload: &str) -> Option<String> {
     }
 }
 
+/// One inbound client command (protocol v2, spec 2026-08-02 N3): what an
+/// AUTHENTICATED local client — the `thirdeye` CLI — may ask the app to do.
+/// Additive: v1 clients (VS Code) never send these and are unaffected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientCommand {
+    /// Add an absolute directory to the workspace roots (persisted).
+    AddWorkspace { path: String },
+    /// Bring the overlay up, optionally pre-filling the input.
+    ShowOverlay { prefill: Option<String> },
+    /// Submit a chat AS IF typed in the overlay; the sender then receives
+    /// the `chat-*` stream frames for the run.
+    Ask { text: String },
+}
+
+/// Parse one inbound frame as a v2 command. `None` for auth frames (handled
+/// before this), unknown types, and malformed JSON — fail quiet.
+pub fn parse_command(raw: &str) -> Option<ClientCommand> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let kind = value.get("type")?.as_str()?;
+    match kind {
+        "add-workspace" => Some(ClientCommand::AddWorkspace {
+            path: value.get("path")?.as_str()?.to_string(),
+        }),
+        "show-overlay" => Some(ClientCommand::ShowOverlay {
+            prefill: value
+                .get("prefill")
+                .and_then(|p| p.as_str())
+                .map(String::from),
+        }),
+        "ask" => Some(ClientCommand::Ask {
+            text: value.get("text")?.as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Ack for one handled command: `{"type":"ok"/"err","cmd",…}`.
+pub fn command_ack(cmd: &str, result: &Result<String, String>) -> String {
+    match result {
+        Ok(detail) => serde_json::json!({"type": "ok", "cmd": cmd, "detail": detail}),
+        Err(e) => serde_json::json!({"type": "err", "cmd": cmd, "detail": e}),
+    }
+    .to_string()
+}
+
+/// Map one chat-stream app event to its bridge frame for ask-subscribed
+/// clients (never sent to clients that did not `ask` — the VS Code
+/// extension's read surface stays the coding subset only).
+pub fn forward_chat(event: &str, payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    match event {
+        "llm://token" => Some(
+            serde_json::json!({"type": "chat-token", "token": value.get("token")?.as_str()?})
+                .to_string(),
+        ),
+        "llm://done" => Some(
+            serde_json::json!({"type": "chat-done", "text": value.get("text")?.as_str()?})
+                .to_string(),
+        ),
+        "llm://error" => Some(
+            serde_json::json!({
+                "type": "chat-error",
+                "detail": value
+                    .get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_default(),
+            })
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// The `debug-request` message the `vscode_debug` tool sends: the extension
 /// asks the user inside VS Code before starting anything.
 pub fn debug_request(config: Option<&str>) -> String {
@@ -201,6 +274,49 @@ mod tests {
         .to_string();
         let done = forward("llm://tool-result", &result).unwrap();
         assert!(done.contains("\"done\""));
+    }
+
+    #[test]
+    fn v2_commands_parse_and_acks_carry_the_result() {
+        assert_eq!(
+            parse_command(r#"{"type":"add-workspace","path":"/tmp/x"}"#),
+            Some(ClientCommand::AddWorkspace {
+                path: "/tmp/x".into()
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"type":"show-overlay"}"#),
+            Some(ClientCommand::ShowOverlay { prefill: None })
+        );
+        assert_eq!(
+            parse_command(r#"{"type":"ask","text":"2+2?"}"#),
+            Some(ClientCommand::Ask {
+                text: "2+2?".into()
+            })
+        );
+        assert_eq!(parse_command(r#"{"type":"auth","token":"x"}"#), None);
+        assert_eq!(parse_command("junk"), None);
+        let ok = command_ack("ask", &Ok("submitted".into()));
+        assert!(ok.contains("\"ok\"") && ok.contains("submitted"));
+        let err = command_ack("add-workspace", &Err("not a directory".into()));
+        assert!(err.contains("\"err\"") && err.contains("not a directory"));
+    }
+
+    #[test]
+    fn chat_stream_maps_token_done_error_only() {
+        let token = serde_json::json!({"requestId": 1, "token": "Hel"}).to_string();
+        assert!(forward_chat("llm://token", &token)
+            .unwrap()
+            .contains("chat-token"));
+        let done = serde_json::json!({"requestId": 1, "text": "4", "tokenCount": 1}).to_string();
+        assert!(forward_chat("llm://done", &done)
+            .unwrap()
+            .contains("chat-done"));
+        let error = serde_json::json!({"requestId": 1, "error": {"kind": "offline"}}).to_string();
+        assert!(forward_chat("llm://error", &error)
+            .unwrap()
+            .contains("chat-error"));
+        assert!(forward_chat("llm://tool-call", "{}").is_none());
     }
 
     #[test]

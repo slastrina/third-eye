@@ -20,6 +20,8 @@ pub mod hotkey;
 pub mod hud;
 pub mod input;
 #[cfg(desktop)]
+pub mod integrations;
+#[cfg(desktop)]
 pub mod inventory;
 pub mod llm;
 #[cfg(desktop)]
@@ -304,6 +306,11 @@ pub fn run() {
             workspace::commands::workspace_roots,
             workspace::commands::set_workspace_roots,
             bridge::bridge_status,
+            integrations::integrations_status,
+            integrations::install_cli,
+            integrations::remove_cli,
+            integrations::install_finder_action,
+            integrations::remove_finder_action,
             llm::commands::verbose_status,
             llm::commands::set_verbose_status,
             llm::commands::list_models_detailed,
