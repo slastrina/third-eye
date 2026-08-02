@@ -431,6 +431,8 @@ mod tests {
                 text: self.tag.into(),
                 token_count: 1,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 
@@ -796,6 +798,8 @@ mod tests {
                     text: "old-client-reply".into(),
                     token_count: 1,
                     tool_calls: Vec::new(),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 })
             }
 

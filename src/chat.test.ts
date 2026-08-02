@@ -8,6 +8,7 @@ import {
   bannerDetail,
   base64FromDataUrl,
   composeContextBlocks,
+  formatTokens,
   FILE_CONTEXT_MAX_CHARS,
   pasteScaledSize,
   bannerTitle,
@@ -75,6 +76,45 @@ describe("image paste helpers (N1)", () => {
     const tall = pasteScaledSize(1000, 5000);
     expect(tall.height).toBe(2048);
     expect(tall.width).toBe(410);
+  });
+});
+
+describe("token spend (real usage)", () => {
+  it("done carries usage onto the message and sums the session total", () => {
+    let s = started("q1", 1);
+    s = chatReducer(s, {
+      type: "done",
+      payload: {
+        requestId: 1, text: "a1", tokenCount: 2, firstTokenMs: 5, totalMs: 9,
+        promptTokens: 6377, completionTokens: 256,
+      },
+    });
+    expect(lastMessage(s).usage).toEqual({ promptTokens: 6377, completionTokens: 256 });
+    expect(s.sessionTokens).toEqual({ promptTokens: 6377, completionTokens: 256 });
+    // A second run accumulates; a usage-less done leaves totals alone.
+    s = started("q2", 2, s);
+    s = chatReducer(s, {
+      type: "done",
+      payload: {
+        requestId: 2, text: "a2", tokenCount: 1, firstTokenMs: 5, totalMs: 9,
+        promptTokens: 1000, completionTokens: 44,
+      },
+    });
+    expect(s.sessionTokens).toEqual({ promptTokens: 7377, completionTokens: 300 });
+    s = started("q3", 3, s);
+    s = chatReducer(s, {
+      type: "done",
+      payload: { requestId: 3, text: "a3", tokenCount: 1, firstTokenMs: 5, totalMs: 9 },
+    });
+    expect(lastMessage(s).usage).toBeUndefined();
+    expect(s.sessionTokens).toEqual({ promptTokens: 7377, completionTokens: 300 });
+  });
+
+  it("formats counts compactly", () => {
+    expect(formatTokens(842)).toBe("842");
+    expect(formatTokens(6377)).toBe("6.4k");
+    expect(formatTokens(12000)).toBe("12k");
+    expect(formatTokens(123456)).toBe("123k");
   });
 });
 

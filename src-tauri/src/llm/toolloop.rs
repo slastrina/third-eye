@@ -2252,6 +2252,8 @@ impl LoopOutcome {
                 text,
                 token_count,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             },
             stopped: true,
         }
@@ -2325,6 +2327,11 @@ pub async fn run_tool_loop_with_stop(
     // surfaces so a user-stopped answer keeps whatever the model already said.
     let mut streamed_text = String::new();
     let mut streamed_tokens = 0usize;
+    // Real token spend, SUMMED across every round of the run (2026-08-03):
+    // a tool run is many requests, each re-paying the prompt.
+    let mut total_prompt: u64 = 0;
+    let mut total_completion: u64 = 0;
+    let mut saw_usage = false;
     // Repeat breaker: exact (tool, arguments) execution counts this run.
     let mut call_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for round in 0..=MAX_TOOL_ROUNDS {
@@ -2352,6 +2359,17 @@ pub async fn run_tool_loop_with_stop(
         messages = request.messages;
         streamed_text = outcome.text.clone();
         streamed_tokens = outcome.token_count;
+        if let (Some(prompt), Some(completion)) = (outcome.prompt_tokens, outcome.completion_tokens)
+        {
+            saw_usage = true;
+            total_prompt += prompt;
+            total_completion += completion;
+        }
+        let run_usage = |outcome: StreamOutcome| StreamOutcome {
+            prompt_tokens: saw_usage.then_some(total_prompt),
+            completion_tokens: saw_usage.then_some(total_completion),
+            ..outcome
+        };
 
         if outcome.tool_calls.is_empty() {
             if round > 0 {
@@ -2359,7 +2377,7 @@ pub async fn run_tool_loop_with_stop(
                     "llm: tool loop done after {round} tool round(s) (request={request_id})"
                 );
             }
-            return Ok(LoopOutcome::done(outcome));
+            return Ok(LoopOutcome::done(run_usage(outcome)));
         }
         if final_round {
             // The tools-stripped round still "called" a tool the request
@@ -2368,10 +2386,10 @@ pub async fn run_tool_loop_with_stop(
             log::warn!(
                 "llm: tool call on the tools-stripped final round ignored (request={request_id})"
             );
-            return Ok(LoopOutcome::done(StreamOutcome {
+            return Ok(LoopOutcome::done(run_usage(StreamOutcome {
                 tool_calls: Vec::new(),
                 ..outcome
-            }));
+            })));
         }
 
         // First half of the OpenAI round-trip: echo the requested calls.
@@ -2554,6 +2572,8 @@ mod tests {
             text: text.into(),
             token_count: 1,
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 
@@ -2562,6 +2582,8 @@ mod tests {
             text: String::new(),
             token_count: 0,
             tool_calls: calls,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 

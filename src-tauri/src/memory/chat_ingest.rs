@@ -701,6 +701,8 @@ mod tests {
                 text: self.reply.clone(),
                 token_count: 1,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 
@@ -770,6 +772,8 @@ mod tests {
                     text: (*reply).into(),
                     token_count: 1,
                     tool_calls: Vec::new(),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 }),
                 Step::Fail => Err(LlmError::Offline {
                     endpoint: self.endpoint().into(),

@@ -170,7 +170,14 @@ impl OpenAiClient {
         on_reasoning: Option<ReasoningSink<'_>>,
     ) -> Result<StreamOutcome, LlmError> {
         let url = format!("{}/v1/chat/completions", self.endpoint);
-        let mut body = serde_json::json!({ "messages": request.messages, "stream": true });
+        let mut body = serde_json::json!({
+            "messages": request.messages,
+            "stream": true,
+            // Real token accounting (2026-08-03): the server appends a
+            // final usage chunk; servers that ignore the option just
+            // stream as before.
+            "stream_options": { "include_usage": true },
+        });
         if let Some(model) = &self.model {
             body["model"] = serde_json::json!(model);
         }
@@ -241,6 +248,7 @@ impl OpenAiClient {
         // the model's call order on finalization).
         let mut tool_acc: std::collections::BTreeMap<usize, PartialToolCall> =
             std::collections::BTreeMap::new();
+        let mut usage: Option<(u64, u64)> = None;
 
         let mut handle_line =
             |line: &str,
@@ -274,6 +282,10 @@ impl OpenAiClient {
                         for delta in deltas {
                             tool_acc.entry(delta.index).or_default().absorb(delta);
                         }
+                        Ok(false)
+                    }
+                    Ok(SseLine::Usage { prompt, completion }) => {
+                        usage = Some((prompt, completion));
                         Ok(false)
                     }
                     Ok(SseLine::Done) => Ok(true),
@@ -352,6 +364,8 @@ impl OpenAiClient {
             text,
             token_count,
             tool_calls,
+            prompt_tokens: usage.map(|(p, _)| p),
+            completion_tokens: usage.map(|(_, c)| c),
         })
     }
 }
@@ -416,6 +430,9 @@ enum SseLine {
     Reasoning(String),
     /// Streamed `delta.tool_calls` fragments to accumulate by index.
     ToolCalls(Vec<ToolCallDelta>),
+    /// The final usage chunk (`stream_options.include_usage`, 2026-08-03):
+    /// the request's REAL prompt/completion token cost.
+    Usage { prompt: u64, completion: u64 },
     /// The `data: [DONE]` terminator.
     Done,
     /// Anything to ignore: blank lines, comments, role-change deltas,
@@ -491,6 +508,15 @@ fn parse_sse_line(line: &str) -> Result<SseLine, String> {
     }
     let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| format!("malformed SSE data line ({e}): {}", snippet(data)))?;
+    // The include_usage final chunk: usage present (choices typically empty).
+    if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
+        if let (Some(prompt), Some(completion)) = (
+            usage.get("prompt_tokens").and_then(|t| t.as_u64()),
+            usage.get("completion_tokens").and_then(|t| t.as_u64()),
+        ) {
+            return Ok(SseLine::Usage { prompt, completion });
+        }
+    }
     let delta = &value["choices"][0]["delta"];
     if let Some(content) = delta["content"].as_str() {
         if !content.is_empty() {
@@ -1060,6 +1086,29 @@ mod tests {
         assert_eq!(outcome.text, "Let me check. ");
         assert_eq!(outcome.token_count, 1);
         assert_eq!(outcome.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_chunk_lands_on_the_outcome_and_requests_opt_in() {
+        // The include_usage final chunk (empty choices) → real spend on the
+        // outcome; and every streaming request asks for it.
+        let usage_chunk = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [], "usage": {
+                "prompt_tokens": 6377, "completion_tokens": 256, "total_tokens": 6633
+            }})
+        );
+        let parts = vec![sse_token("hi"), usage_chunk, "data: [DONE]\n\n".to_string()];
+        let (endpoint, captured) = spawn_capturing_server(chunked_200(&parts, true)).await;
+        let (result, _) = run_chat(&endpoint).await;
+        let outcome = result.unwrap();
+        assert_eq!(outcome.prompt_tokens, Some(6377));
+        assert_eq!(outcome.completion_tokens, Some(256));
+        let body = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            body.contains("include_usage"),
+            "requests must opt into usage reporting: {body}"
+        );
     }
 
     #[tokio::test]

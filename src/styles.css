@@ -1476,6 +1476,21 @@ body,
   max-width: 160px;
 }
 
+.chat-usage {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--te-text-dim);
+  font-family: var(--te-font-mono);
+}
+
+.model-session-tokens {
+  font-size: 10px;
+  color: var(--te-text-dim);
+  font-family: var(--te-font-mono);
+  white-space: nowrap;
+}
+
 .chat-phase {
   margin: 4px 0 2px;
   font-size: 11px;

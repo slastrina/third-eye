@@ -420,6 +420,10 @@ pub struct DoneEvent {
     /// `None` when the stream completed without producing any token.
     pub first_token_ms: Option<u64>,
     pub total_ms: u64,
+    /// REAL token spend for the whole run, summed across tool rounds
+    /// (2026-08-03) — `None` when the backend reports no usage.
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 /// Terminal failure event. `error` is the kind-tagged [`LlmError`] JSON the
@@ -1520,6 +1524,8 @@ pub async fn chat(
                         token_count: outcome.token_count,
                         first_token_ms,
                         total_ms,
+                        prompt_tokens: outcome.prompt_tokens,
+                        completion_tokens: outcome.completion_tokens,
                     };
                     if let Err(e) = task_app.emit(DONE_EVENT, payload) {
                         log::warn!("llm: request {id} done emit failed: {e}");
@@ -2420,6 +2426,8 @@ mod tests {
                     text: "I searched for whales.".into(),
                     token_count: 4,
                     tool_calls: Vec::new(),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 },
                 stopped,
             });
@@ -2459,6 +2467,8 @@ mod tests {
                 text: String::new(),
                 token_count: 0,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 
@@ -2869,6 +2879,8 @@ mod tests {
             token_count: 3,
             first_token_ms: Some(120),
             total_ms: 900,
+            prompt_tokens: Some(6377),
+            completion_tokens: Some(256),
         })
         .unwrap();
         assert_eq!(v["requestId"], 7);
@@ -2876,6 +2888,8 @@ mod tests {
         assert_eq!(v["tokenCount"], 3);
         assert_eq!(v["firstTokenMs"], 120);
         assert_eq!(v["totalMs"], 900);
+        assert_eq!(v["promptTokens"], 6377);
+        assert_eq!(v["completionTokens"], 256);
     }
 
     #[test]
@@ -2886,9 +2900,12 @@ mod tests {
             token_count: 0,
             first_token_ms: None,
             total_ms: 5,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
         .unwrap();
         assert!(v["firstTokenMs"].is_null());
+        assert!(v["promptTokens"].is_null());
     }
 
     #[test]

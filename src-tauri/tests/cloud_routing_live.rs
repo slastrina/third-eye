@@ -245,6 +245,8 @@ impl LlmClient for LocalHeavy {
             text: "local-heavy-reply".into(),
             token_count: 1,
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 
@@ -275,6 +277,8 @@ impl LlmClient for InertThin {
             text: "thin".into(),
             token_count: 0,
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 

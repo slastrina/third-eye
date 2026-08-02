@@ -39,6 +39,7 @@ import {
   onVerboseStatus,
   verboseStatus,
   phaseStatusLine,
+  formatTokens,
   onHidApprovalRequest,
   onHidApprovalResolved,
   onMcpApprovalRequest,
@@ -1372,6 +1373,15 @@ function App() {
                 {message.role === "assistant" && message.status === "interrupted" && (
                   <span className="chat-interrupted-tag">interrupted</span>
                 )}
+                {message.role === "assistant" && message.status === "done" && message.usage && (
+                  <span
+                    className="chat-usage"
+                    title={`${message.usage.promptTokens.toLocaleString()} prompt tokens in, ${message.usage.completionTokens.toLocaleString()} completion tokens out (all tool rounds summed)`}
+                  >
+                    ↑{formatTokens(message.usage.promptTokens)} ↓
+                    {formatTokens(message.usage.completionTokens)} tok
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -1752,6 +1762,16 @@ function App() {
                 </button>
               ))}
             </div>
+            {(chat.sessionTokens.promptTokens > 0 ||
+              chat.sessionTokens.completionTokens > 0) && (
+              <span
+                className="model-session-tokens"
+                title={`This session: ${chat.sessionTokens.promptTokens.toLocaleString()} prompt tokens in, ${chat.sessionTokens.completionTokens.toLocaleString()} completion tokens out`}
+              >
+                Σ ↑{formatTokens(chat.sessionTokens.promptTokens)} ↓
+                {formatTokens(chat.sessionTokens.completionTokens)}
+              </span>
+            )}
             {/* Honest locality badge: only when the endpoint host actually is
                 this machine — never decoration (no-fake-data rule). */}
             {isLocalEndpoint(routing.endpoint) && (

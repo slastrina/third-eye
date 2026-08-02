@@ -528,6 +528,8 @@ mod tests {
                 text: "ok".into(),
                 token_count: 1,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 

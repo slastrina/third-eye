@@ -88,6 +88,10 @@ export interface DonePayload {
   requestId: number;
   text: string;
   tokenCount: number;
+  /** Real token spend for the whole run (summed across tool rounds);
+   *  null when the backend reports no usage. */
+  promptTokens?: number | null;
+  completionTokens?: number | null;
   firstTokenMs: number | null;
   totalMs: number;
 }
@@ -325,6 +329,13 @@ export interface LmModelRow {
 
 export function listModelsDetailed(): Promise<LmModelRow[]> {
   return invoke<LmModelRow[]>("list_models_detailed");
+}
+
+/** Compact token count: 842 → "842", 6377 → "6.4k", 123456 → "123k". */
+export function formatTokens(count: number): string {
+  if (count < 1000) return String(count);
+  if (count < 100_000) return `${(count / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${Math.round(count / 1000)}k`;
 }
 
 /** Human copy for one wait phase. Basic mode: plain words; verbose adds
@@ -1226,6 +1237,9 @@ export interface UiMessage {
   steps?: ChatStep[];
   /** Assistant only: memory_search tool phase (renders the indicator). */
   memory?: MemoryPhase;
+  /** Assistant only: real token spend for the turn (in/out), when the
+   *  backend reported usage. */
+  usage?: { promptTokens: number; completionTokens: number };
   /** Assistant only: accumulated chain-of-thought from a thinking model,
    *  rendered as a dimmed "Thinking…" region above the answer. Transient —
    *  streamed via llm://reasoning, never sent back as history or persisted.
@@ -1257,6 +1271,8 @@ export interface ChatState {
   /** Live background-wait status (loading model / reading prompt); null
    *  whenever anything is actually streaming. */
   phase: PhasePayload | null;
+  /** Session token spend: summed real usage of every completed run. */
+  sessionTokens: { promptTokens: number; completionTokens: number };
   /** Routing state behind the model indicator; null until the first
    *  `model_info` query resolves (or forever, outside a Tauri runtime). */
   modelInfo: ModelInfo | null;
@@ -1302,6 +1318,7 @@ export const initialChatState: ChatState = {
   banner: null,
   lastQuestion: null,
   phase: null,
+  sessionTokens: { promptTokens: 0, completionTokens: 0 },
   modelInfo: null,
   attachment: null,
   attachPending: false,
@@ -1474,6 +1491,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         banner: null,
         lastQuestion: action.question,
         phase: null,
+        sessionTokens: state.sessionTokens,
         modelInfo: state.modelInfo,
         attachment: null,
         // Dropping the pending flag makes a capture that settles after this
@@ -1751,10 +1769,25 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "done": {
       if (state.awaitingId) return { ...state, buffered: [...state.buffered, action] };
       if (action.payload.requestId !== state.requestId) return state;
+      const usage =
+        typeof action.payload.promptTokens === "number" &&
+        typeof action.payload.completionTokens === "number"
+          ? {
+              promptTokens: action.payload.promptTokens,
+              completionTokens: action.payload.completionTokens,
+            }
+          : undefined;
       return {
         ...state,
         phase: null,
         requestId: null,
+        sessionTokens: usage
+          ? {
+              promptTokens: state.sessionTokens.promptTokens + usage.promptTokens,
+              completionTokens:
+                state.sessionTokens.completionTokens + usage.completionTokens,
+            }
+          : state.sessionTokens,
         messages: withLastAssistant(state.messages, (m) => ({
           ...m,
           // The backend's accumulated text is authoritative — it replaces any
@@ -1762,6 +1795,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           text: action.payload.text,
           status: "done",
           memory: settleMemoryPhase(m.memory),
+          usage,
         })),
       };
     }

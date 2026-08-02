@@ -1463,6 +1463,8 @@ mod tests {
                 text: self.reply.clone(),
                 token_count: 1,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 

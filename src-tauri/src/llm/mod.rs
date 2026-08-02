@@ -367,6 +367,13 @@ pub struct StreamOutcome {
     pub text: String,
     pub token_count: usize,
     pub tool_calls: Vec<ToolCall>,
+    /// REAL token usage from the server's final `usage` chunk
+    /// (`stream_options.include_usage`, 2026-08-03): what the request
+    /// actually cost, prompt-side and completion-side. `None` when the
+    /// backend does not report it. In a tool run these are SUMMED across
+    /// every round by the loop.
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 /// Queryable online/offline surface: `{ online, endpoint }`. Returned by the
@@ -475,6 +482,8 @@ mod tests {
                 text: "mock reply".into(),
                 token_count: 2,
                 tool_calls: Vec::new(),
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
 
