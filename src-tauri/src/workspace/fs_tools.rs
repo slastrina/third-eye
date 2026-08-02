@@ -57,9 +57,9 @@ impl ReadFileTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: READ_FILE_TOOL.into(),
-            description: "Read a text file inside one of the user's designated workspace \
-                          folders. Use it to understand code before changing it. Long files \
-                          are truncated (marked); binary files are refused."
+            description: "Read a text file anywhere on this machine — absolute path, or relative \
+                          to the active working directory. Use it to understand code before \
+                          changing it. Long files are truncated (marked); binary refused."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -83,8 +83,8 @@ impl ListDirTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: LIST_DIR_TOOL.into(),
-            description: "List a directory inside the user's workspace folders (name, kind, \
-                          size). Call with no path to list the first workspace root."
+            description: "List a directory (name, kind, size) — absolute path, or relative to \
+                          the active working directory. No path lists the active directory."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -118,11 +118,11 @@ impl WriteFileTool {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: WRITE_FILE_TOOL.into(),
-            description: "Write (create or fully replace) ONE text file inside a designated \
-                          workspace folder. The user approves each write until they grant \
-                          always. Write complete file contents — this is not a patch tool. \
-                          Parent folders are created. Never claim a file was written unless \
-                          this tool returned ok."
+            description: "Write (create or fully replace) ONE text file. The user approves \
+                          writes per directory (tmp never needs approval). Write complete \
+                          file contents — this is not a patch tool. Parent folders are \
+                          created. Never claim a file was written unless this tool \
+                          returned ok."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -149,11 +149,7 @@ fn workspace_failure(err: WorkspaceError) -> ToolOutcome {
 #[async_trait]
 impl ToolExecutor for ReadFileTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        if self.workspace.has_roots() {
-            vec![Self::definition()]
-        } else {
-            Vec::new()
-        }
+        vec![Self::definition()]
     }
 
     fn claims(&self, name: &str) -> bool {
@@ -164,7 +160,11 @@ impl ToolExecutor for ReadFileTool {
         let Some(path) = string_arg(call, "path") else {
             return ToolOutcome::failure("invalid-arguments", "path is required");
         };
-        let resolved = match self.workspace.resolve(&path) {
+        let resolved = match self
+            .workspace
+            .resolve_or_ask(&path, &format!("read {path}"))
+            .await
+        {
             Ok(p) => p,
             Err(e) => return workspace_failure(e),
         };
@@ -195,11 +195,7 @@ impl ToolExecutor for ReadFileTool {
 #[async_trait]
 impl ToolExecutor for ListDirTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        if self.workspace.has_roots() {
-            vec![Self::definition()]
-        } else {
-            Vec::new()
-        }
+        vec![Self::definition()]
     }
 
     fn claims(&self, name: &str) -> bool {
@@ -209,14 +205,15 @@ impl ToolExecutor for ListDirTool {
     async fn execute(&self, call: &ToolCall) -> ToolOutcome {
         let path = string_arg(call, "path").unwrap_or_default();
         let target = if path.trim().is_empty() {
-            match self.workspace.roots().first() {
-                Some(root) => root.display().to_string(),
-                None => return workspace_failure(WorkspaceError::NoWorkspaces),
-            }
+            ".".to_string()
         } else {
             path
         };
-        let resolved = match self.workspace.resolve(&target) {
+        let resolved = match self
+            .workspace
+            .resolve_or_ask(&target, "list a folder")
+            .await
+        {
             Ok(p) => p,
             Err(e) => return workspace_failure(e),
         };
@@ -256,11 +253,7 @@ impl ToolExecutor for ListDirTool {
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        if self.workspace.has_roots() {
-            vec![Self::definition()]
-        } else {
-            Vec::new()
-        }
+        vec![Self::definition()]
     }
 
     fn claims(&self, name: &str) -> bool {
@@ -282,14 +275,20 @@ impl ToolExecutor for WriteFileTool {
                 ),
             );
         }
-        let resolved = match self.workspace.resolve(&path) {
+        let resolved = match self
+            .workspace
+            .resolve_or_ask(&path, &format!("write {path}"))
+            .await
+        {
             Ok(p) => p,
             Err(e) => return workspace_failure(e),
         };
-        // Approval on the shared plumbing (clipboard/run_command precedent):
-        // Off refuses, Ask prompts unless session/persistent-granted,
-        // AutoRun performs.
+        // Consent, not containment (2026-08-02): tmp is ALWAYS writable
+        // (scratch space); elsewhere the shared approval plumbing runs —
+        // Off refuses, Ask prompts unless the kind is persisted-granted or
+        // the directory was session-blessed, AutoRun performs.
         match self.mode {
+            _ if WorkspaceState::is_tmp(&resolved) => {}
             HidRunMode::Off => {
                 return ToolOutcome::failure(
                     "disabled",
@@ -303,7 +302,11 @@ impl ToolExecutor for WriteFileTool {
                     .whitelist
                     .lock()
                     .map(|w| w.contains(ActionKind::WriteFile))
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || resolved
+                        .parent()
+                        .map(|p| self.workspace.dir_granted(p))
+                        .unwrap_or(false);
                 if !granted {
                     let summary = format!(
                         "Write file: {} ({} bytes)",
@@ -313,8 +316,13 @@ impl ToolExecutor for WriteFileTool {
                     match self.approver.request(ActionKind::WriteFile, summary).await {
                         ApprovalVerdict::AllowOnce => {}
                         ApprovalVerdict::AllowKind | ApprovalVerdict::AllowAlways => {
-                            if let Ok(mut whitelist) = self.whitelist.lock() {
-                                whitelist.allow(ActionKind::WriteFile);
+                            // Session grant for the file's DIRECTORY (its
+                            // subtree included) — "this session" means
+                            // "keep working here", not "write anywhere".
+                            // (A persisted Always still seeds the kind-wide
+                            // whitelist at next boot — the forever tier.)
+                            if let Some(parent) = resolved.parent() {
+                                self.workspace.grant_dir(parent.to_path_buf());
                             }
                         }
                         ApprovalVerdict::Deny => {
@@ -396,18 +404,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_are_inert_without_roots_and_refuse_typed() {
+    async fn always_offered_and_relative_without_active_dir_refuses_typed() {
         let ws = Arc::new(WorkspaceState::new());
         let read = ReadFileTool::new(ws.clone());
-        assert!(read.definitions().is_empty(), "no roots → not offered");
+        assert_eq!(read.definitions().len(), 1, "offered even with no roots");
+        // Relative path, no active dir, no chooser installed: typed refusal.
         let outcome = read
             .execute(&call(READ_FILE_TOOL, serde_json::json!({"path": "x"})))
             .await;
-        assert_eq!(outcome.failure.as_deref(), Some("no-workspaces"));
+        assert_eq!(outcome.failure.as_deref(), Some("no-working-directory"));
     }
 
     #[tokio::test]
-    async fn read_and_list_stay_inside_and_write_round_trips() {
+    async fn reads_work_anywhere_and_writes_round_trip() {
         let (ws, dir) = scratch_ws("rw");
         let read = ReadFileTool::new(ws.clone());
         let outcome = read
@@ -418,14 +427,19 @@ mod tests {
             .await;
         assert!(outcome.ok, "{:?} {:?}", outcome.failure, outcome.content);
         assert!(outcome.content.contains("hello world"));
-        // Escape attempts refuse typed with zero io.
-        let escape = read
+        // Anywhere semantics (2026-08-02): an absolute path OUTSIDE the
+        // working directory reads fine — consent gates writes, not reads.
+        let outside = std::env::temp_dir().join(format!("te-out-{}.txt", std::process::id()));
+        std::fs::write(&outside, "outside-content").unwrap();
+        let outcome = read
             .execute(&call(
                 READ_FILE_TOOL,
-                serde_json::json!({"path": "/etc/passwd"}),
+                serde_json::json!({"path": outside.display().to_string()}),
             ))
             .await;
-        assert_eq!(escape.failure.as_deref(), Some("outside-workspace"));
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.content.contains("outside-content"));
+        let _ = std::fs::remove_file(&outside);
 
         let list = ListDirTool::new(ws.clone());
         let outcome = list
@@ -454,23 +468,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A writable NON-tmp scratch (under target/) — tmp bypasses approval.
+    fn non_tmp_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("te-fs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[tokio::test]
-    async fn write_respects_off_mode_and_size_cap() {
-        let (ws, dir) = scratch_ws("gate");
-        let off = WriteFileTool::new(
+    async fn tmp_writes_never_prompt_and_off_mode_still_blocks_elsewhere() {
+        struct PanicPrompt;
+        #[async_trait]
+        impl ApprovalPrompt for PanicPrompt {
+            async fn request(&self, _kind: ActionKind, _summary: String) -> ApprovalVerdict {
+                panic!("tmp writes must never prompt");
+            }
+        }
+        // tmp: writes sail through even in Ask mode with a panicking prompt
+        // (user direction: "writing to tmp is fine always").
+        let (ws, dir) = scratch_ws("tmpfree");
+        let write = WriteFileTool::new(
             ws.clone(),
+            HidRunMode::Ask,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(PanicPrompt),
+        );
+        let outcome = write
+            .execute(&call(
+                WRITE_FILE_TOOL,
+                serde_json::json!({"path": "free.txt", "content": "hi"}),
+            ))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        // Outside tmp, Off mode still refuses typed.
+        let non_tmp = non_tmp_scratch("off");
+        let off = WriteFileTool::new(
+            ws,
             HidRunMode::Off,
             Arc::new(Mutex::new(SessionWhitelist::new())),
             Arc::new(AllowAll),
         );
+        let target = non_tmp.join("x.txt");
         let outcome = off
             .execute(&call(
                 WRITE_FILE_TOOL,
-                serde_json::json!({"path": "x.txt", "content": "hi"}),
+                serde_json::json!({"path": target.display().to_string(), "content": "hi"}),
             ))
             .await;
         assert_eq!(outcome.failure.as_deref(), Some("disabled"));
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&non_tmp);
+    }
 
+    #[tokio::test]
+    async fn write_approval_denies_and_session_blesses_the_directory() {
+        struct CountingPrompt(std::sync::atomic::AtomicUsize, ApprovalVerdict);
+        #[async_trait]
+        impl ApprovalPrompt for CountingPrompt {
+            async fn request(&self, _kind: ActionKind, _summary: String) -> ApprovalVerdict {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.1
+            }
+        }
+        let non_tmp = non_tmp_scratch("bless");
+        let ws = Arc::new(WorkspaceState::new());
+        ws.set_roots(vec![non_tmp.display().to_string()]);
+        // Deny: typed refusal, zero io.
+        let deny = WriteFileTool::new(
+            ws.clone(),
+            HidRunMode::Ask,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(CountingPrompt(0.into(), ApprovalVerdict::Deny)),
+        );
+        let outcome = deny
+            .execute(&call(
+                WRITE_FILE_TOOL,
+                serde_json::json!({"path": "a.txt", "content": "alpha"}),
+            ))
+            .await;
+        assert_eq!(outcome.failure.as_deref(), Some("approval-denied"));
+        assert!(!non_tmp.join("a.txt").exists());
+        // AllowKind blesses the DIRECTORY: second write, same dir, no prompt.
+        let prompt = Arc::new(CountingPrompt(0.into(), ApprovalVerdict::AllowKind));
+        let write = WriteFileTool::new(
+            ws,
+            HidRunMode::Ask,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            prompt.clone(),
+        );
+        for name in ["a.txt", "b.txt"] {
+            let outcome = write
+                .execute(&call(
+                    WRITE_FILE_TOOL,
+                    serde_json::json!({"path": name, "content": "x"}),
+                ))
+                .await;
+            assert!(outcome.ok, "{outcome:?}");
+        }
+        assert_eq!(
+            prompt.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the directory blessing covers the second write"
+        );
+        let _ = std::fs::remove_dir_all(&non_tmp);
+    }
+
+    #[tokio::test]
+    async fn oversized_writes_refuse_before_any_io() {
+        let (ws, dir) = scratch_ws("gate");
         let big = "x".repeat(WRITE_MAX_BYTES + 1);
         let ask = WriteFileTool::new(
             ws,

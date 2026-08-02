@@ -97,24 +97,33 @@ pub fn install_cli(app: AppHandle) -> IntegrationsStatus {
              (dev builds do not carry it)",
         )?;
         let home = home()?;
-        let mut last_error = String::new();
-        for target in cli_link_candidates(&home) {
-            if let Some(parent) = target.parent() {
-                if std::fs::create_dir_all(parent).is_err() {
-                    continue;
-                }
-            }
-            // Idempotent: replace whatever is there (ours or stale).
-            let _ = std::fs::remove_file(&target);
-            match std::os::unix::fs::symlink(&source, &target) {
-                Ok(()) => {
-                    log::info!("integrations: CLI linked at {}", target.display());
-                    return Ok(());
-                }
-                Err(e) => last_error = format!("{}: {e}", target.display()),
-            }
+        // /usr/local/bin first — it is on every default PATH. It is usually
+        // root-owned, so a plain symlink fails; the standard macOS admin
+        // prompt (the user can cancel) creates it with consent.
+        let primary = std::path::Path::new("/usr/local/bin/thirdeye");
+        let _ = std::fs::remove_file(primary);
+        if std::os::unix::fs::symlink(&source, primary).is_ok() {
+            log::info!("integrations: CLI linked at {}", primary.display());
+            return Ok(());
         }
-        Err(format!("could not link the CLI anywhere ({last_error})"))
+        if admin_symlink(&source, primary) {
+            log::info!("integrations: CLI linked at {} (admin)", primary.display());
+            return Ok(());
+        }
+        // Fallback: ~/.local/bin — works without admin but is NOT on the
+        // default PATH; say exactly what to add.
+        let fallback = home.join(".local/bin/thirdeye");
+        if let Some(parent) = fallback.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let _ = std::fs::remove_file(&fallback);
+        std::os::unix::fs::symlink(&source, &fallback)
+            .map_err(|e| format!("{}: {e}", fallback.display()))?;
+        log::info!("integrations: CLI linked at {}", fallback.display());
+        Err(format!(
+            "linked at {} — but ~/.local/bin is not on the default PATH. Either re-run Install              and approve the admin prompt (puts it in /usr/local/bin), or add this line to your              ~/.zshrc: export PATH=\"$HOME/.local/bin:$PATH\"",
+            fallback.display()
+        ))
     })();
     status_with_error(&app, result.err())
 }
@@ -134,6 +143,23 @@ pub fn remove_cli(app: AppHandle) -> IntegrationsStatus {
         Ok(())
     })();
     status_with_error(&app, result.err())
+}
+
+/// Create `link → source` with the macOS admin prompt. False when the
+/// user cancels or the escalation fails — never an error, the caller
+/// falls back.
+fn admin_symlink(source: &std::path::Path, link: &std::path::Path) -> bool {
+    let script = format!(
+        "do shell script \"mkdir -p {parent} && ln -sf '{source}' '{link}'\" with administrator privileges",
+        parent = link.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        source = source.display(),
+        link = link.display(),
+    );
+    std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Install the Finder Quick Action: a hand-authored Automator `.workflow`

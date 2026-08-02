@@ -30,6 +30,22 @@ const CODE_SIGNALS: &[&str] = &[
     "kotlin",
     "unit test",
     "write a test",
+    // 2026-08-02: "write me a small app in my workspace" routed THIN — the
+    // list lacked the app/workspace phrasings real asks use.
+    "workspace",
+    "an app",
+    "small app",
+    "the app",
+    "my app",
+    "app that",
+    "app to",
+    "a program",
+    "the program",
+    "algorithm",
+    "write code",
+    "codebase",
+    "cli tool",
+    "command-line",
     "fix the bug",
     "fix this bug",
     "stack trace",
@@ -139,6 +155,22 @@ mod tests {
         );
         assert_eq!(
             select_lane("Refactor the ingest loop and fix the bug", None),
+            CODER_LANE
+        );
+        // The thin-routed incident phrasings (2026-08-02).
+        assert_eq!(
+            select_lane(
+                "can you write in my workspace a small app to calculate pi to 30 places",
+                None
+            ),
+            CODER_LANE
+        );
+        assert_eq!(
+            select_lane("build an app that tracks my reading list", None),
+            CODER_LANE
+        );
+        assert_eq!(
+            select_lane("implement the sorting algorithm", None),
             CODER_LANE
         );
     }

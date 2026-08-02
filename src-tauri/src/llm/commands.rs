@@ -1305,6 +1305,70 @@ pub async fn chat(
                 ));
             }
         }
+        // Ground the ACTIVE workspace (2026-08-02): "what directory are you
+        // in" must answer with the folder the user just targeted (thirdeye
+        // ./Finder), not a guess — the first root is the tools' default.
+        {
+            let ws = task_app.state::<std::sync::Arc<crate::workspace::WorkspaceState>>();
+            let roots = ws.roots();
+            if let (Some(first), Some(system)) = (
+                roots.first(),
+                messages.iter_mut().find(|m| m.role == Role::System),
+            ) {
+                let mut line = format!(
+                    "\n\nActive workspace: {} — the coding tools' default directory (relative \
+                     paths, list_dir with no path, run_in_workspace cwd).",
+                    first.display()
+                );
+                if roots.len() > 1 {
+                    line.push_str(&format!(
+                        " Other workspace folders: {}.",
+                        roots[1..]
+                            .iter()
+                            .map(|r| r.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                system.content.push_str(&line);
+            }
+        }
+        // Auto-recall (2026-08-02): stored facts surface WITHOUT the model
+        // choosing to search — the prompt clause alone demonstrably failed
+        // ("whats my name": 18 tools offered, zero searches, claimed
+        // ignorance). Structure over prose: the top memory hits for the ask
+        // ride the system turn; memory_search stays for deeper digging.
+        if let Some(store) = memory.store() {
+            let ask = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if !ask.trim().is_empty() {
+                let embedder = memory.embedder(client.endpoint());
+                match crate::memory::embed::search(&store, embedder.as_ref(), &ask, 3).await {
+                    Ok(outcome) if !outcome.results.is_empty() => {
+                        let mut block = String::from(
+                            "\n\nStored memories possibly relevant to this request (the user's \
+                             own memory store — trust these over claiming you do not know):",
+                        );
+                        for record in outcome.results.iter().take(3) {
+                            block.push_str(&format!("\n- {}", record.summary));
+                        }
+                        if let Some(system) = messages.iter_mut().find(|m| m.role == Role::System) {
+                            system.content.push_str(&block);
+                            log::info!(
+                                "llm: request {id} auto-recall injected {} memori(es)",
+                                outcome.results.len().min(3)
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::debug!("llm: request {id} auto-recall skipped: {e}"),
+                }
+            }
+        }
         // Load discovered markdown skill packs (M007 S06) into the system turn so
         // a dropped-in SKILL.md visibly shapes behavior for a matching task. The
         // discovery dir resolves through the fail-soft config triad (unset/garbage

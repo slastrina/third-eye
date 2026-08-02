@@ -70,10 +70,11 @@ export function describeCall(name: string, rawArguments: string): {
   if (name === "run_command" || name === "run_in_workspace") {
     const command = typeof args.command === "string" ? args.command : "";
     const shown = command.length > 40 ? `${command.slice(0, 40)}…` : command;
-    // Commands hold the terminal, not the pointer — input:true so the HUD
-    // shows while they run (they act on the machine like input does).
+    // Commands hold the terminal, NOT the pointer: input stays false so a
+    // terminal-only run never summons the mouse follower/ghost overlay
+    // (user report 2026-08-02) — the pill + trail still show the run.
     const fallback = name === "run_in_workspace" ? "run in workspace" : "run a command";
-    return { label: shown ? `run · ${shown}` : fallback, input: true, target: null };
+    return { label: shown ? `run · ${shown}` : fallback, input: false, target: null };
   }
   if (name === "clipboard") {
     const op = typeof args.op === "string" ? args.op : "";

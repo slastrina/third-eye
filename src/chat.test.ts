@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bannerDetail,
   base64FromDataUrl,
+  composeContextBlocks,
+  FILE_CONTEXT_MAX_CHARS,
   pasteScaledSize,
   bannerTitle,
   captureErrorTitle,
@@ -73,6 +75,21 @@ describe("image paste helpers (N1)", () => {
     const tall = pasteScaledSize(1000, 5000);
     expect(tall.height).toBe(2048);
     expect(tall.width).toBe(410);
+  });
+});
+
+describe("attached-file context blocks", () => {
+  it("appends fenced blocks with name+path and truncates past the cap", () => {
+    expect(composeContextBlocks([])).toBe("");
+    const wire = composeContextBlocks([
+      { name: "a.py", path: "/ws/a.py", text: "print(1)" },
+    ]);
+    expect(wire).toContain("[Attached file: a.py (/ws/a.py)]");
+    expect(wire).toContain("print(1)");
+    const big = composeContextBlocks([
+      { name: "big.txt", path: "/big.txt", text: "x".repeat(FILE_CONTEXT_MAX_CHARS + 5) },
+    ]);
+    expect(big).toContain("truncated");
   });
 });
 

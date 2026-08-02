@@ -412,6 +412,13 @@ pub fn run() {
             memory::commands::spawn_prune_loop(app.handle());
             llm::commands::apply_persisted_router_mode(app.handle());
             workspace::commands::apply_persisted_workspace_roots(app.handle());
+            // Pause-and-ask folder chooser (2026-08-02): tools with no
+            // working directory raise the native dialog instead of failing.
+            app.handle()
+                .state::<std::sync::Arc<workspace::WorkspaceState>>()
+                .install_chooser(std::sync::Arc::new(workspace::commands::OsascriptChooser {
+                    app: app.handle().clone(),
+                }));
             // VS Code bridge (S7): loopback WS + discovery file, fail-soft.
             bridge::start_bridge(app.handle());
 

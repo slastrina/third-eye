@@ -1861,9 +1861,11 @@ function Settings() {
             Workspaces
           </h2>
           <p className="settings-hint">
-            The only folders the coding agent may read, write, and run
-            commands in. Nothing outside these is ever touched; with none
-            configured, the coding tools are not offered at all.
+            The agent's working directories — the first is the ACTIVE one
+            (relative paths, default cwd). The agent can work anywhere, but
+            writes and commands outside directories you've approved prompt
+            you each time (tmp never prompts); with none set it asks you to
+            pick a folder when needed.
           </p>
           {workspaces === null && (
             <p className="settings-unavailable">

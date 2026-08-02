@@ -836,29 +836,33 @@ impl ApprovalPrompt for ScriptedApprover {
     }
 }
 
-/// WORKSPACE CONTAINMENT (coding-agent S3): an escape read refuses typed
-/// (`outside-workspace`) with zero io, the loop recovers with a contained
-/// read, and the REAL file contents are what the model is fed — the honest
-/// read result, asserted at the wire.
+/// ANYWHERE SEMANTICS (2026-08-02 redesign): a relative path with no
+/// working directory refuses typed (the model must ask the user — the
+/// production chooser pauses here); an ABSOLUTE path reads fine anywhere,
+/// and the REAL contents are what the model is fed.
 #[tokio::test(flavor = "multi_thread")]
-async fn eval_workspace_escape_refused_then_contained_read_feeds_real_content() {
-    let (scratch, workspace) = ScratchWorkspace::new("contain");
+async fn eval_relative_needs_a_working_dir_and_absolute_reads_anywhere() {
+    let (scratch, _workspace) = ScratchWorkspace::new("anywhere");
     std::fs::write(
         scratch.dir.join("main.rs"),
         "fn main() { real_content_marker(); }",
     )
     .unwrap();
+    let absolute = scratch.dir.join("main.rs").display().to_string();
 
     let (endpoint, captured) = scripted::spawn(vec![
-        scripted::round_tool("c1", READ_FILE_TOOL, r#"{"path":"/etc/passwd"}"#),
-        scripted::round_tool("c2", READ_FILE_TOOL, r#"{"path":"main.rs"}"#),
+        scripted::round_tool("c1", READ_FILE_TOOL, r#"{"path":"main.rs"}"#),
+        scripted::round_tool("c2", READ_FILE_TOOL, &format!(r#"{{"path":"{absolute}"}}"#)),
         scripted::round_text("main.rs calls real_content_marker."),
     ])
     .await;
 
+    // ZERO working directories and no chooser: the relative call must
+    // refuse typed; the absolute call succeeds anyway.
+    let empty = Arc::new(WorkspaceState::new());
     let executor = CompositeExecutor::new(vec![
-        Box::new(ReadFileTool::new(workspace.clone())),
-        Box::new(ListDirTool::new(workspace)),
+        Box::new(ReadFileTool::new(empty.clone())),
+        Box::new(ListDirTool::new(empty)),
     ]);
     let (text, events) = run_scenario(&endpoint, &executor, "what does main.rs do?").await;
     assert_eq!(text, "main.rs calls real_content_marker.");
@@ -866,15 +870,10 @@ async fn eval_workspace_escape_refused_then_contained_read_feeds_real_content() 
     assert_eq!(results.len(), 2, "{results:?}");
     assert_eq!(
         (results[0].1, results[0].2.as_deref()),
-        (false, Some("outside-workspace")),
-        "the escape must refuse typed"
+        (false, Some("no-working-directory")),
+        "relative without a working dir must refuse typed"
     );
-    assert!(
-        results[1].1,
-        "the contained read succeeds: {:?}",
-        results[1]
-    );
-    // The tool turn fed to the model carries the REAL file content.
+    assert!(results[1].1, "the absolute read succeeds: {:?}", results[1]);
     let third_request = scripted::body_json(&captured, 2);
     let fed = third_request["messages"]
         .as_array()
@@ -889,8 +888,8 @@ async fn eval_workspace_escape_refused_then_contained_read_feeds_real_content() 
         "the model must be fed the real file contents: {fed}"
     );
     assert!(
-        fed.contains("outside every designated workspace"),
-        "the refusal must explain the boundary: {fed}"
+        fed.contains("no working directory"),
+        "the refusal must tell the model to ask the user: {fed}"
     );
 }
 
@@ -899,7 +898,22 @@ async fn eval_workspace_escape_refused_then_contained_read_feeds_real_content() 
 /// write rides the session grant without prompting again.
 #[tokio::test(flavor = "multi_thread")]
 async fn eval_write_approval_deny_then_session_grant() {
-    let (scratch, workspace) = ScratchWorkspace::new("write");
+    // NON-tmp scratch: tmp writes are approval-free by design (2026-08-02),
+    // so the approval contract is proven outside it.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("te-eval-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Arc::new(WorkspaceState::new());
+    workspace.set_roots(vec![dir.display().to_string()]);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Cleanup(dir);
     let (endpoint, _captured) = scripted::spawn(vec![
         scripted::round_tool(
             "c1",
@@ -947,11 +961,11 @@ async fn eval_write_approval_deny_then_session_grant() {
     assert!(results[2].1, "the granted-session write succeeds");
     // Denied → nothing on disk until the grant; then both files land.
     assert_eq!(
-        std::fs::read_to_string(scratch.dir.join("notes/a.txt")).unwrap(),
+        std::fs::read_to_string(scratch.0.join("notes/a.txt")).unwrap(),
         "alpha"
     );
     assert_eq!(
-        std::fs::read_to_string(scratch.dir.join("notes/b.txt")).unwrap(),
+        std::fs::read_to_string(scratch.0.join("notes/b.txt")).unwrap(),
         "beta"
     );
     // Exactly TWO prompts: deny, then the session grant covers the third.
@@ -968,40 +982,46 @@ async fn eval_write_approval_deny_then_session_grant() {
     );
 }
 
-/// WORKSPACE EXEC (coding-agent S4): a cwd outside every root refuses typed
-/// with zero spawn; the recovered in-workspace command runs for real, its
-/// output STREAMS through the sink mid-run, and the bounded report rides
-/// the result event's preview — the transcript terminal block's feed.
+/// WORKSPACE EXEC (2026-08-02 semantics): no working directory → typed
+/// refusal; an absolute tmp cwd runs WITHOUT any prompt (tmp is free),
+/// output streams through the sink mid-run, and the bounded report rides
+/// the result event's preview.
 #[tokio::test(flavor = "multi_thread")]
-async fn eval_exec_escape_refused_then_workspace_run_streams_and_previews() {
+async fn eval_exec_no_dir_refuses_then_tmp_runs_promptless_and_streams() {
     struct CollectSink(Mutex<String>);
     impl TerminalSink for CollectSink {
         fn chunk(&self, _call_id: &str, text: &str) {
             self.0.lock().unwrap().push_str(text);
         }
     }
+    struct PanicPrompt;
+    #[async_trait]
+    impl ApprovalPrompt for PanicPrompt {
+        async fn request(&self, _k: ActionKind, _s: String) -> ApprovalVerdict {
+            panic!("tmp commands must never prompt");
+        }
+    }
 
-    let (scratch, workspace) = ScratchWorkspace::new("exec");
+    let (scratch, _ws) = ScratchWorkspace::new("exec");
+    let tmp_cwd = scratch.dir.display().to_string();
     let (endpoint, _captured) = scripted::spawn(vec![
-        scripted::round_tool(
-            "c1",
-            RUN_IN_WORKSPACE_TOOL,
-            r#"{"command":"true","cwd":"/etc"}"#,
-        ),
+        scripted::round_tool("c1", RUN_IN_WORKSPACE_TOOL, r#"{"command":"true"}"#),
         scripted::round_tool(
             "c2",
             RUN_IN_WORKSPACE_TOOL,
-            r#"{"command":"echo built-ok"}"#,
+            &format!(r#"{{"command":"echo built-ok","cwd":"{tmp_cwd}"}}"#),
         ),
         scripted::round_text("Built cleanly."),
     ])
     .await;
 
     let sink = Arc::new(CollectSink(Mutex::new(String::new())));
+    // ZERO working directories, no chooser, a PANICKING prompt: the tmp
+    // run must go through with no approval at all.
     let executor = CompositeExecutor::new(vec![Box::new(RunInWorkspaceTool::new(
-        workspace,
+        Arc::new(WorkspaceState::new()),
         Arc::new(Mutex::new(SessionWhitelist::new())),
-        Arc::new(AllowAll),
+        Arc::new(PanicPrompt),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sink.clone(),
     ))]);
@@ -1011,13 +1031,11 @@ async fn eval_exec_escape_refused_then_workspace_run_streams_and_previews() {
     assert_eq!(results.len(), 2, "{results:?}");
     assert_eq!(
         (results[0].1, results[0].2.as_deref()),
-        (false, Some("outside-workspace")),
-        "the escape cwd must refuse typed"
+        (false, Some("no-working-directory")),
+        "no working dir must refuse typed"
     );
-    assert!(results[1].1, "the workspace run succeeds: {:?}", results[1]);
-    // Output streamed live through the sink…
+    assert!(results[1].1, "the tmp run succeeds: {:?}", results[1]);
     assert!(sink.0.lock().unwrap().contains("built-ok"));
-    // …and the bounded report rides the result event as the preview.
     let preview = events
         .iter()
         .find_map(|e| match e {
@@ -1105,20 +1123,18 @@ async fn eval_edit_then_diff_shows_the_real_change_and_commits_nothing() {
     );
 }
 
-/// NO WORKSPACES (coding-agent S3): with zero roots the file tools are
-/// structurally inert — never offered in the request's tools array — and a
-/// call that names one anyway refuses typed with the Settings language.
+/// NO WORKING DIRECTORY (2026-08-02): the tools are ALWAYS offered — with
+/// zero directories a relative call refuses typed through the loop (the
+/// production chooser would pause and ask here; evals run without one).
 #[tokio::test(flavor = "multi_thread")]
-async fn eval_no_workspaces_file_tools_inert_and_refuse_typed() {
+async fn eval_tools_offered_without_dirs_and_relative_refuses_typed() {
     let (endpoint, captured) = scripted::spawn(vec![
         scripted::round_tool("c1", READ_FILE_TOOL, r#"{"path":"main.rs"}"#),
-        scripted::round_text("No workspace is configured."),
+        scripted::round_text("No working directory is set — where should I work?"),
     ])
     .await;
 
     let workspace = Arc::new(WorkspaceState::new());
-    // A non-workspace tool rides along (production always offers others) so
-    // the request carries a tools array to inspect.
     let executor = CompositeExecutor::new(vec![
         Box::new(ReadFileTool::new(workspace.clone())),
         Box::new(WriteFileTool::new(
@@ -1130,7 +1146,7 @@ async fn eval_no_workspaces_file_tools_inert_and_refuse_typed() {
         Box::new(FocusAppTool::new(Arc::new(AlwaysFocus))),
     ]);
     let (text, events) = run_scenario(&endpoint, &executor, "read main.rs").await;
-    assert_eq!(text, "No workspace is configured.");
+    assert_eq!(text, "No working directory is set — where should I work?");
     let offered = scripted::body_json(&captured, 0)["tools"]
         .as_array()
         .cloned()
@@ -1138,17 +1154,73 @@ async fn eval_no_workspaces_file_tools_inert_and_refuse_typed() {
     assert!(
         offered
             .iter()
-            .all(|t| t["function"]["name"] != READ_FILE_TOOL
-                && t["function"]["name"] != WRITE_FILE_TOOL),
-        "file tools must not be offered without roots: {offered:?}"
+            .any(|t| t["function"]["name"] == READ_FILE_TOOL)
+            && offered
+                .iter()
+                .any(|t| t["function"]["name"] == WRITE_FILE_TOOL),
+        "file tools are offered even with no directories: {offered:?}"
     );
     let results = collect_results(&events);
     assert_eq!(results.len(), 1);
     assert_eq!(
         (results[0].1, results[0].2.as_deref()),
-        (false, Some("no-workspaces")),
-        "the stray call must refuse typed"
+        (false, Some("no-working-directory")),
+        "the relative call must refuse typed"
     );
+}
+
+/// REPEAT BREAKER (2026-08-02 bugfix): a model stuck re-issuing the SAME
+/// exact failing call (the pi-script loop) gets three attempts; from the
+/// fourth the loop refuses typed (`repeated-call`) with strategy-change
+/// instructions instead of burning rounds to the ceiling. A DIFFERENT call
+/// afterwards still executes — the breaker is per exact call, not a kill.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_identical_repeated_calls_break_typed_after_three_attempts() {
+    let (scratch, workspace) = ScratchWorkspace::new("repeat");
+    let same = r#"{"command":"exit 3"}"#;
+    let mut rounds: Vec<Vec<u8>> = (0..5)
+        .map(|i| scripted::round_tool(&format!("c{i}"), RUN_IN_WORKSPACE_TOOL, same))
+        .collect();
+    // After two refusals the model "changes strategy": a different command.
+    rounds.push(scripted::round_tool(
+        "c5",
+        RUN_IN_WORKSPACE_TOOL,
+        r#"{"command":"true"}"#,
+    ));
+    rounds.push(scripted::round_text(
+        "Switched approach; the new command works.",
+    ));
+    let (endpoint, _captured) = scripted::spawn(rounds).await;
+
+    struct NullSink;
+    impl TerminalSink for NullSink {
+        fn chunk(&self, _call_id: &str, _text: &str) {}
+    }
+    let executor = CompositeExecutor::new(vec![Box::new(RunInWorkspaceTool::new(
+        workspace,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        Arc::new(AllowAll),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(NullSink),
+    ))]);
+    let (text, events) = run_scenario(&endpoint, &executor, "run my script").await;
+    assert_eq!(text, "Switched approach; the new command works.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 6, "{results:?}");
+    // Attempts 1–3 really executed (command-failed); 4–5 broke typed.
+    for result in &results[0..3] {
+        assert_eq!(result.2.as_deref(), Some("command-failed"), "{result:?}");
+    }
+    for result in &results[3..5] {
+        assert_eq!(result.2.as_deref(), Some("repeated-call"), "{result:?}");
+    }
+    // The changed call is NOT smothered by the breaker.
+    assert!(
+        results[5].1,
+        "a different call must still execute: {:?}",
+        results[5]
+    );
+    drop(scratch);
 }
 
 /// PROMPT CONTRACT: the load-bearing behavioural clauses exist. Each assert
@@ -1203,6 +1275,12 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
         HID_SYSTEM_PROMPT.contains("never claim you cannot store information"),
         "remember clause missing"
     );
+    // Personal facts search memory BEFORE claiming ignorance (the
+    // whats-my-name incident: 18 tools offered, zero searches made).
+    assert!(
+        HID_SYSTEM_PROMPT.contains("PERSONAL FACTS"),
+        "personal-facts recall clause missing"
+    );
     // Task follow-ups continue in the same app — never re-clarify.
     assert!(
         HID_SYSTEM_PROMPT.contains("CONTINUE in the same app and page"),
@@ -1248,14 +1326,28 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
         "whole-file write clause missing"
     );
     assert!(
-        HID_SYSTEM_PROMPT.contains("Settings → Workspaces"),
-        "no-workspace guidance missing"
+        HID_SYSTEM_PROMPT.contains("ALWAYS writable with no prompt"),
+        "tmp-is-free clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("a folder chooser asks the user"),
+        "pause-and-ask chooser clause missing"
     );
     // Exec (S4): builds go through run_in_workspace, and code gets BUILT
     // after writing — never claimed working unverified.
     assert!(
         HID_SYSTEM_PROMPT.contains("BUILD AND TEST it with run_in_workspace"),
         "build-after-write clause missing"
+    );
+    // No persistent shell (2026-08-02, the fake-cd incident): bare cd is
+    // refused and result headers are the truth about location.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("NO persistent shell"),
+        "no-persistent-shell clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("that IS the directory"),
+        "honest-listing clause missing"
     );
     // Diff review (S5): evaluate-the-goal, coding flavor — review the diff
     // before declaring done, and never commit/push unasked.
@@ -1265,7 +1357,7 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
     );
     assert!(
         HID_SYSTEM_PROMPT
-            .contains("git-commit or git-push workspace changes unless the user explicitly asks"),
+            .contains("git-commit or git-push changes unless the user explicitly asks"),
         "no-commit rule missing"
     );
     // Tool descriptions carry their halves of the contract.

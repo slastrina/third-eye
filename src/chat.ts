@@ -251,6 +251,15 @@ export function onTerminalChunk(cb: (payload: TerminalChunkPayload) => void): Pr
   return listen<TerminalChunkPayload>(TERMINAL_CHUNK_EVENT, (e) => cb(e.payload));
 }
 
+/** Workspace-roots broadcast (`workspace://roots`): fired on every change —
+ *  Settings edits AND bridge adds (CLI / Finder Quick Action) — so the
+ *  overlay's workspace chip stays truthful without polling. */
+export const WORKSPACE_ROOTS_EVENT = "workspace://roots";
+
+export function onWorkspaceRoots(cb: (status: WorkspaceStatus) => void): Promise<UnlistenFn> {
+  return listen<WorkspaceStatus>(WORKSPACE_ROOTS_EVENT, (e) => cb(e.payload));
+}
+
 /** VS Code bridge snapshot (coding-agent S7) — serde camelCase of Rust's
  *  BridgeStatus. Health-as-value, never an error. */
 export interface BridgeStatus {
@@ -414,6 +423,40 @@ export function frameFromImageFile(file: File): Promise<CapturedFrame> {
     };
     image.src = url;
   });
+}
+
+/** One attached text-file context (2026-08-02): a file the user explicitly
+ *  picked to ground this chat turn. Transient — rides the outgoing wire
+ *  turn, never stored (R011). */
+export interface FileContext {
+  name: string;
+  path: string;
+  text: string;
+}
+
+/** Cap per attached file — the content rides the prompt. */
+export const FILE_CONTEXT_MAX_CHARS = 48_000;
+
+/** Wire-side context blocks appended to the user's question: each attached
+ *  file as a fenced block with its name/path. Pure (unit-tested); empty
+ *  input adds nothing. */
+export function composeContextBlocks(files: FileContext[]): string {
+  return files
+    .map((file) => {
+      const total = file.text.length;
+      const shown =
+        total > FILE_CONTEXT_MAX_CHARS
+          ? `${file.text.slice(0, FILE_CONTEXT_MAX_CHARS)}
+[…truncated — ${total} chars total]`
+          : file.text;
+      return `
+
+[Attached file: ${file.name} (${file.path})]
+\`\`\`
+${shown}
+\`\`\``;
+    })
+    .join("");
 }
 
 /** Screen Recording permission snapshot — health-as-value, never an error.

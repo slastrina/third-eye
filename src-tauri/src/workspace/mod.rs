@@ -1,13 +1,16 @@
-//! Workspace roots (coding-agent S2, spec 2026-08-01): the ONLY places the
-//! coding tools may touch the filesystem.
+//! Working directories (redesigned 2026-08-02 at user direction): the
+//! coding tools may work ANYWHERE — the directories the user designates
+//! (Settings / `thirdeye <path>` / Finder) are the STARTING points, not a
+//! wall. The first entry is the ACTIVE directory: relative paths resolve
+//! against it, and with none set a relative path refuses typed so the
+//! model asks the user where to work instead of guessing.
 //!
-//! The user designates roots in Settings; nothing is implicit. Containment
-//! is checked on CANONICAL paths so `../` hops and symlinks cannot escape a
-//! root — including write targets that do not exist yet (the deepest
-//! existing ancestor is canonicalized and the remainder must be plain
-//! descending components). With zero roots configured the file tools are
-//! structurally inert (S3 offers no definitions), matching the D038
-//! pattern everywhere else.
+//! Safety moved from containment to CONSENT: every write or command in a
+//! directory the user has not yet blessed prompts (the card names the
+//! exact path; "this session" blesses that directory), EXCEPT tmp —
+//! scratch space is always writable without a prompt. Paths still resolve
+//! canonically (deepest existing ancestor + plain remainder) so symlinks
+//! and `../` cannot mislabel where io actually lands.
 
 pub mod commands;
 pub mod diff_tool;
@@ -26,11 +29,14 @@ use serde::Serialize;
 pub struct WorkspaceState {
     roots: Mutex<Vec<PathBuf>>,
     persist_error: Mutex<Option<String>>,
-    /// Per-workspace SESSION grants for `run_in_workspace` (S4): the user's
-    /// "always this session" scoped to one canonical root, not the whole
-    /// action kind. In-memory only — a restart prompts again (permanent
-    /// grants ride the persisted approved-kinds path instead).
-    exec_grants: Mutex<HashSet<PathBuf>>,
+    /// Per-DIRECTORY session grants (2026-08-02): "always this session"
+    /// blesses one canonical directory (and everything under it) for
+    /// writes and commands. In-memory only — a restart prompts again
+    /// (permanent grants ride the persisted approved-kinds path).
+    dir_grants: Mutex<HashSet<PathBuf>>,
+    /// The pause-and-ask folder chooser, installed at boot (production
+    /// only — absent in unit tests).
+    chooser: std::sync::OnceLock<std::sync::Arc<dyn DirectoryChooser>>,
 }
 
 impl WorkspaceState {
@@ -74,31 +80,86 @@ impl WorkspaceState {
         self.persist_error.lock().unwrap().clone()
     }
 
-    /// Resolve `candidate` to a canonical absolute path PROVEN to live
-    /// inside one of the roots — the single choke point every fs/exec tool
-    /// must pass before any io. See [`resolve_contained`].
+    /// Resolve `candidate` to a canonical absolute path — the single
+    /// choke point every fs/exec tool passes before io. Absolute paths go
+    /// anywhere; relative paths resolve against the ACTIVE working
+    /// directory, and with none set they refuse typed (the model must ask
+    /// the user where to work, never guess).
     pub fn resolve(&self, candidate: &str) -> Result<PathBuf, WorkspaceError> {
-        self.resolve_with_root(candidate).map(|(path, _)| path)
+        let path = Path::new(candidate);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match self.roots().first() {
+                Some(active) => active.join(path),
+                None => return Err(WorkspaceError::NoWorkingDirectory),
+            }
+        };
+        canonical_resolve(&absolute)
     }
 
-    /// [`Self::resolve`] plus the CANONICAL root that contains the result —
-    /// the grant key for per-workspace approvals (S4).
-    pub fn resolve_with_root(&self, candidate: &str) -> Result<(PathBuf, PathBuf), WorkspaceError> {
-        let roots = self.roots();
-        if roots.is_empty() {
-            return Err(WorkspaceError::NoWorkspaces);
+    /// Bless one canonical directory (and its subtree) for this session.
+    pub fn grant_dir(&self, dir: PathBuf) {
+        self.dir_grants.lock().unwrap().insert(dir);
+    }
+
+    /// Whether `path` falls under any session-blessed directory.
+    pub fn dir_granted(&self, path: &Path) -> bool {
+        self.dir_grants
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|dir| path.starts_with(dir))
+    }
+
+    /// Whether `path` is scratch space — ALWAYS writable, no prompt
+    /// (user direction 2026-08-02: "writing to tmp is fine always").
+    pub fn is_tmp(path: &Path) -> bool {
+        let tmp = std::env::temp_dir();
+        path.starts_with("/tmp")
+            || path.starts_with("/private/tmp")
+            || path.starts_with("/var/folders")
+            || path.starts_with("/private/var/folders")
+            || path.starts_with(&tmp)
+    }
+}
+
+/// The pause-and-ask seam (user request 2026-08-02): when a tool needs a
+/// working directory and none is set, the installed chooser shows the
+/// native folder dialog, PROMOTES the pick to the active directory
+/// (persisted + broadcast), and returns it. `None` = user declined.
+#[async_trait::async_trait]
+pub trait DirectoryChooser: Send + Sync {
+    async fn choose(&self, purpose: &str) -> Option<String>;
+}
+
+impl WorkspaceState {
+    /// Install the production chooser once at boot (tests leave it absent
+    /// — resolve_or_ask then degrades to the typed refusal).
+    pub fn install_chooser(&self, chooser: std::sync::Arc<dyn DirectoryChooser>) {
+        let _ = self.chooser.set(chooser);
+    }
+
+    /// [`Self::resolve`], pausing to ASK THE USER for a folder when a
+    /// relative path has no active working directory. The chooser promotes
+    /// the pick to the active directory, so the retry resolves against it.
+    pub async fn resolve_or_ask(
+        &self,
+        candidate: &str,
+        purpose: &str,
+    ) -> Result<std::path::PathBuf, WorkspaceError> {
+        match self.resolve(candidate) {
+            Err(WorkspaceError::NoWorkingDirectory) => {
+                let Some(chooser) = self.chooser.get().cloned() else {
+                    return Err(WorkspaceError::NoWorkingDirectory);
+                };
+                match chooser.choose(purpose).await {
+                    Some(_) => self.resolve(candidate),
+                    None => Err(WorkspaceError::NoWorkingDirectory),
+                }
+            }
+            other => other,
         }
-        resolve_contained_with_root(Path::new(candidate), &roots)
-    }
-
-    /// Grant `run_in_workspace` for one canonical root, this session.
-    pub fn grant_exec(&self, root: PathBuf) {
-        self.exec_grants.lock().unwrap().insert(root);
-    }
-
-    /// Whether the root already holds a session exec grant.
-    pub fn exec_granted(&self, root: &Path) -> bool {
-        self.exec_grants.lock().unwrap().contains(root)
     }
 }
 
@@ -111,19 +172,18 @@ impl WorkspaceState {
     rename_all_fields = "camelCase"
 )]
 pub enum WorkspaceError {
-    /// No roots are configured — the tools should not even be offered.
-    NoWorkspaces,
-    /// The path (canonicalized) is not inside any designated root.
-    OutsideWorkspace { path: String },
-    /// The path could not be resolved (bad syntax, unreadable ancestor).
+    /// A relative path with no active working directory — the model must
+    /// ask the user where to work (or the chooser dialog was declined).
+    NoWorkingDirectory,
+    /// The path could not be resolved (bad syntax, unreadable ancestor,
+    /// or a `..` remainder through a not-yet-existing segment).
     Unresolvable { path: String, detail: String },
 }
 
 impl WorkspaceError {
     pub fn kind(&self) -> &'static str {
         match self {
-            WorkspaceError::NoWorkspaces => "no-workspaces",
-            WorkspaceError::OutsideWorkspace { .. } => "outside-workspace",
+            WorkspaceError::NoWorkingDirectory => "no-working-directory",
             WorkspaceError::Unresolvable { .. } => "unresolvable-path",
         }
     }
@@ -132,14 +192,10 @@ impl WorkspaceError {
 impl std::fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkspaceError::NoWorkspaces => write!(
+            WorkspaceError::NoWorkingDirectory => write!(
                 f,
-                "no workspace folders are configured — the user adds them in Settings → Workspaces"
-            ),
-            WorkspaceError::OutsideWorkspace { path } => write!(
-                f,
-                "{path} is outside every designated workspace folder — file access is limited to \
-                 the workspaces the user configured"
+                "no working directory is set and the path was relative — ask the user which \
+                 folder to work in (a chooser was shown if available), or use an absolute path"
             ),
             WorkspaceError::Unresolvable { path, detail } => {
                 write!(f, "cannot resolve {path}: {detail}")
@@ -148,59 +204,36 @@ impl std::fmt::Display for WorkspaceError {
     }
 }
 
-/// Canonical containment: resolve `candidate` (absolute, or relative to the
-/// FIRST root) to a canonical path and prove it sits under a canonical
-/// root. For not-yet-existing targets, the deepest existing ancestor is
-/// canonicalized and the remaining components must be plain names (no `..`,
-/// no `.`) — so a new file's path cannot smuggle an escape either.
-pub fn resolve_contained(candidate: &Path, roots: &[PathBuf]) -> Result<PathBuf, WorkspaceError> {
-    resolve_contained_with_root(candidate, roots).map(|(path, _)| path)
-}
-
-/// [`resolve_contained`] plus the canonical root that proved containment.
-pub fn resolve_contained_with_root(
-    candidate: &Path,
-    roots: &[PathBuf],
-) -> Result<(PathBuf, PathBuf), WorkspaceError> {
-    let absolute = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        roots[0].join(candidate)
-    };
-    let (existing, remainder) = deepest_existing(&absolute);
+/// Canonical resolution WITHOUT containment (2026-08-02 redesign): the
+/// deepest existing ancestor is canonicalized (symlink-honest — io lands
+/// where the result says it lands) and the not-yet-existing remainder must
+/// be plain descending names, so `..` through a missing segment cannot
+/// alias a different location.
+pub fn canonical_resolve(absolute: &Path) -> Result<PathBuf, WorkspaceError> {
+    let (existing, remainder) = deepest_existing(absolute);
     let canonical_base = existing
         .canonicalize()
         .map_err(|e| WorkspaceError::Unresolvable {
             path: absolute.display().to_string(),
             detail: e.to_string(),
         })?;
-    // Remainder of a not-yet-existing path: only plain descending names.
     for component in remainder.components() {
         match component {
             Component::Normal(_) => {}
             _ => {
-                return Err(WorkspaceError::OutsideWorkspace {
+                return Err(WorkspaceError::Unresolvable {
                     path: absolute.display().to_string(),
+                    detail: "a not-yet-existing path segment may not contain '..' or '.'".into(),
                 })
             }
         }
     }
     // join("") would append a trailing slash (ENOTDIR on later io) — an
     // existing path has an empty remainder and IS the canonical base.
-    let resolved = if remainder.as_os_str().is_empty() {
+    Ok(if remainder.as_os_str().is_empty() {
         canonical_base
     } else {
         canonical_base.join(&remainder)
-    };
-    for root in roots {
-        if let Ok(canonical_root) = root.canonicalize() {
-            if resolved.starts_with(&canonical_root) {
-                return Ok((resolved, canonical_root));
-            }
-        }
-    }
-    Err(WorkspaceError::OutsideWorkspace {
-        path: absolute.display().to_string(),
     })
 }
 
@@ -237,79 +270,96 @@ mod tests {
     }
 
     #[test]
-    fn contains_existing_and_new_paths_inside_the_root() {
-        let root = scratch("in");
-        let roots = vec![root.clone()];
-        // Existing file.
-        let resolved =
-            resolve_contained(&root.join("sub/inside.txt"), &roots).expect("existing inside");
-        assert!(resolved.ends_with("sub/inside.txt"));
-        // The resolved path must be directly io-usable (no trailing slash).
-        assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "x");
-        // New (not yet existing) file under an existing dir.
-        assert!(resolve_contained(&root.join("sub/new.rs"), &roots).is_ok());
-        // New nested dirs, still plain descending names.
-        assert!(resolve_contained(&root.join("brand/new/tree.txt"), &roots).is_ok());
-        // Relative resolves against the first root.
-        assert!(resolve_contained(Path::new("sub/inside.txt"), &roots).is_ok());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn dotdot_and_absolute_escapes_are_refused() {
-        let root = scratch("esc");
-        let roots = vec![root.clone()];
-        let escape = root.join("sub/../../../etc/passwd");
-        assert!(matches!(
-            resolve_contained(&escape, &roots),
-            Err(WorkspaceError::OutsideWorkspace { .. }) | Err(WorkspaceError::Unresolvable { .. })
-        ));
-        assert!(matches!(
-            resolve_contained(Path::new("/etc/passwd"), &roots),
-            Err(WorkspaceError::OutsideWorkspace { .. })
-        ));
-        // A NEW path whose remainder smuggles `..` is refused before io.
-        assert!(matches!(
-            resolve_contained(&root.join("ghost/../..//x.txt"), &roots),
-            Err(WorkspaceError::OutsideWorkspace { .. }) | Err(WorkspaceError::Unresolvable { .. })
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinks_out_of_the_root_are_refused() {
-        let root = scratch("sym");
-        let outside = std::env::temp_dir().join(format!("te-ws-outside-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret.txt"), "s").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let roots = vec![root.clone()];
-        assert!(matches!(
-            resolve_contained(&root.join("link/secret.txt"), &roots),
-            Err(WorkspaceError::OutsideWorkspace { .. })
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    fn state_drops_relative_roots_and_resolves_against_the_set() {
-        let root = scratch("state");
+    fn absolute_paths_resolve_anywhere_and_relative_needs_an_active_dir() {
+        let root = scratch("any");
         let state = WorkspaceState::new();
-        assert!(matches!(
-            state.resolve("anything"),
-            Err(WorkspaceError::NoWorkspaces)
-        ));
-        state.set_roots(vec![
-            root.display().to_string(),
-            "relative/never".into(),
-            "  ".into(),
-        ]);
-        assert_eq!(state.roots().len(), 1);
-        assert!(state
+        // No working directory: absolute is fine, relative refuses typed.
+        let resolved = state
             .resolve(&root.join("sub/inside.txt").display().to_string())
-            .is_ok());
+            .expect("absolute resolves without any working directory");
+        assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "x");
+        assert!(matches!(
+            state.resolve("sub/inside.txt"),
+            Err(WorkspaceError::NoWorkingDirectory)
+        ));
+        // With an active directory the same relative path resolves.
+        state.set_roots(vec![root.display().to_string()]);
+        assert!(state.resolve("sub/inside.txt").is_ok());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_resolution_is_symlink_honest_and_refuses_ghost_dotdot() {
+        let root = scratch("canon");
+        // A new file under an existing dir resolves; ghost `..` refuses.
+        assert!(canonical_resolve(&root.join("sub/new.rs")).is_ok());
+        assert!(matches!(
+            canonical_resolve(&root.join("ghost/../x.txt")),
+            Err(WorkspaceError::Unresolvable { .. })
+        ));
+        // Symlinks resolve to their REAL location — io lands where the
+        // result says (macOS /tmp → /private/tmp is itself a symlink).
+        let resolved = canonical_resolve(&root.join("sub/inside.txt")).unwrap();
+        assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tmp_detection_and_dir_grants_cover_subtrees() {
+        assert!(WorkspaceState::is_tmp(Path::new("/tmp/x/y.txt")));
+        assert!(WorkspaceState::is_tmp(&std::env::temp_dir().join("z")));
+        assert!(!WorkspaceState::is_tmp(Path::new("/Users/alex/code")));
+        let state = WorkspaceState::new();
+        assert!(!state.dir_granted(Path::new("/a/b/c.txt")));
+        state.grant_dir(PathBuf::from("/a/b"));
+        assert!(state.dir_granted(Path::new("/a/b/c.txt")));
+        assert!(state.dir_granted(Path::new("/a/b/deep/d.txt")));
+        assert!(!state.dir_granted(Path::new("/a/other.txt")));
+    }
+
+    #[tokio::test]
+    async fn resolve_or_ask_uses_the_chooser_and_declining_refuses_typed() {
+        struct PickScratch(PathBuf, std::sync::Arc<WorkspaceState>);
+        #[async_trait::async_trait]
+        impl DirectoryChooser for PickScratch {
+            async fn choose(&self, _purpose: &str) -> Option<String> {
+                // The production chooser promotes the pick; mirror that.
+                self.1.set_roots(vec![self.0.display().to_string()]);
+                Some(self.0.display().to_string())
+            }
+        }
+        struct Decline;
+        #[async_trait::async_trait]
+        impl DirectoryChooser for Decline {
+            async fn choose(&self, _purpose: &str) -> Option<String> {
+                None
+            }
+        }
+        let root = scratch("ask");
+        let state = std::sync::Arc::new(WorkspaceState::new());
+        state.install_chooser(std::sync::Arc::new(PickScratch(
+            root.clone(),
+            state.clone(),
+        )));
+        let resolved = state
+            .resolve_or_ask("sub/inside.txt", "read a file")
+            .await
+            .expect("the chooser's pick resolves the relative path");
+        assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "x");
+
+        let declined = std::sync::Arc::new(WorkspaceState::new());
+        declined.install_chooser(std::sync::Arc::new(Decline));
+        assert!(matches!(
+            declined.resolve_or_ask("x.txt", "write").await,
+            Err(WorkspaceError::NoWorkingDirectory)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_drops_relative_roots() {
+        let state = WorkspaceState::new();
+        state.set_roots(vec!["/tmp".into(), "relative/never".into(), "  ".into()]);
+        assert_eq!(state.roots().len(), 1);
     }
 }

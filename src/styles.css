@@ -1420,6 +1420,62 @@ body,
   overflow-y: auto;
 }
 
+.attach-menu-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.attach-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  padding: 4px;
+  border: 1px solid var(--te-line-strong);
+  border-radius: var(--te-r-sm);
+  background: var(--te-glass-heavy);
+  backdrop-filter: var(--te-blur);
+  -webkit-backdrop-filter: var(--te-blur);
+  box-shadow: var(--te-shadow-panel);
+}
+
+.attach-menu button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--te-text);
+  text-align: left;
+  font-size: 12.5px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.attach-menu button:hover {
+  background: rgba(147, 218, 73, 0.16);
+}
+
+/* Ambient context (the working directory): part of the row but not
+   removable here — it is managed in Settings / thirdeye / Finder. */
+.attach-chip--ambient {
+  opacity: 0.85;
+}
+
+.model-workspace {
+  font-size: 10.5px;
+  color: var(--te-text-mid);
+  border: 1px solid var(--te-line);
+  border-radius: var(--te-r-pill);
+  padding: 2px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
 .chat-phase {
   margin: 4px 0 2px;
   font-size: 11px;

@@ -88,11 +88,7 @@ fn workspace_failure(err: WorkspaceError) -> ToolOutcome {
 #[async_trait]
 impl ToolExecutor for WorkspaceDiffTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        if self.workspace.has_roots() {
-            vec![Self::definition()]
-        } else {
-            Vec::new()
-        }
+        vec![Self::definition()]
     }
 
     fn claims(&self, name: &str) -> bool {
@@ -105,14 +101,15 @@ impl ToolExecutor for WorkspaceDiffTool {
             .and_then(|v| v.get("cwd").and_then(|c| c.as_str().map(String::from)))
             .unwrap_or_default();
         let candidate = if cwd_arg.trim().is_empty() {
-            match self.workspace.roots().first() {
-                Some(root) => root.display().to_string(),
-                None => return workspace_failure(WorkspaceError::NoWorkspaces),
-            }
+            ".".to_string()
         } else {
             cwd_arg
         };
-        let dir = match self.workspace.resolve(&candidate) {
+        let dir = match self
+            .workspace
+            .resolve_or_ask(&candidate, "review the git diff")
+            .await
+        {
             Ok(dir) => dir,
             Err(e) => return workspace_failure(e),
         };
@@ -209,11 +206,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inert_without_roots_and_refuses_typed() {
+    async fn always_offered_and_no_working_dir_refuses_typed() {
         let tool = WorkspaceDiffTool::new(Arc::new(WorkspaceState::new()));
-        assert!(tool.definitions().is_empty());
+        assert_eq!(tool.definitions().len(), 1);
         let outcome = tool.execute(&call(serde_json::json!({}))).await;
-        assert_eq!(outcome.failure.as_deref(), Some("no-workspaces"));
+        assert_eq!(outcome.failure.as_deref(), Some("no-working-directory"));
     }
 
     #[tokio::test]
@@ -252,12 +249,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escape_cwd_refused_typed() {
-        let (ws, dir) = scratch_repo("esc");
+    async fn anywhere_cwd_reads_fine_and_non_repos_stay_typed() {
+        // Anywhere semantics: an absolute cwd outside any working
+        // directory is fine for a read-only diff — /etc just isn't a repo.
+        let (ws, dir) = scratch_repo("any");
         let outcome = WorkspaceDiffTool::new(ws)
             .execute(&call(serde_json::json!({"cwd": "/etc"})))
             .await;
-        assert_eq!(outcome.failure.as_deref(), Some("outside-workspace"));
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("not-a-repo"),
+            "{outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

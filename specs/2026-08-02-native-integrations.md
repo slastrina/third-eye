@@ -83,6 +83,16 @@ nothing lands on the system without an explicit click there.
   (plutil-linted in tests); CLI install is a symlink —
   /usr/local/bin first, ~/.local/bin fallback.
 
+- 2026-08-02 (later, user-directed): CONTAINMENT REPLACED BY CONSENT.
+  The coding tools now work anywhere: relative paths use the ACTIVE
+  (first) working directory; none set → a native folder chooser pauses
+  the run and the pick becomes the active directory. Writes/commands in
+  un-blessed directories prompt per directory ("this session" blesses
+  that subtree); tmp is always free. Reads are unrestricted (visible in
+  the HUD trail). Bare `cd` refuses typed (no persistent shell). The
+  overlay context row lists every directory explicitly with ✕ removal.
+  Terminal-only runs no longer summon the mouse follower.
+
 ## Boundaries
 
 - Always: bridge stays loopback + token-auth; installs/uninstalls touch

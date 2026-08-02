@@ -139,11 +139,7 @@ impl BridgeHandler for TauriBridgeHandler {
     }
 
     fn show_overlay(&self, prefill: Option<&str>) -> Result<String, String> {
-        // An already-visible overlay refuses the Show transition — that IS
-        // the goal state, not a failure.
-        if let Err(e) = crate::overlay::show_overlay(self.app.clone()) {
-            log::debug!("bridge: show-overlay no-op: {e}");
-        }
+        summon_overlay(&self.app);
         if let Some(text) = prefill {
             let _ = self
                 .app
@@ -153,16 +149,11 @@ impl BridgeHandler for TauriBridgeHandler {
     }
 
     async fn ask(&self, text: &str) -> Result<String, String> {
-        // Best-effort overlay show (already-visible refuses the transition —
-        // that IS the goal state). The run itself goes STRAIGHT through the
-        // backend chat pipeline: no webview hop, so `thirdeye ask` works
-        // even with the overlay closed. The overlay's own transcript is
-        // frontend state, so a CLI-initiated exchange shows there as run
-        // activity (HUD/status), not as chat bubbles — the terminal is the
-        // conversation surface.
-        if let Err(e) = crate::overlay::show_overlay(self.app.clone()) {
-            log::debug!("bridge: ask show-overlay no-op: {e}");
-        }
+        // The terminal IS the conversation surface for `ask` — the overlay
+        // stays wherever it is (user report 2026-08-02: every ask popping
+        // the window was noise). `thirdeye <path>` / show-overlay still
+        // summon; the run itself goes straight through the backend chat
+        // pipeline, and the HUD pill shows activity as usual.
         log::info!("bridge: ask received ({} chars)", text.len());
         let state = self.app.state::<crate::llm::commands::LlmState>();
         let id = crate::llm::commands::chat(
@@ -172,6 +163,20 @@ impl BridgeHandler for TauriBridgeHandler {
         )
         .await?;
         Ok(format!("request {id} started"))
+    }
+}
+
+/// Summon = Show THEN Focus (the hotkey's exact chain): visible-idle is
+/// click-through, so a bridge-opened overlay left there would render as a
+/// transparent, un-clickable panel — the Finder/CLI entry points must land
+/// input-ready. Already-visible/focused transitions refusing is the goal
+/// state, not a failure.
+fn summon_overlay(app: &AppHandle) {
+    if let Err(e) = crate::overlay::show_overlay(app.clone()) {
+        log::debug!("bridge: show no-op: {e}");
+    }
+    if let Err(e) = crate::overlay::focus_overlay(app.clone()) {
+        log::debug!("bridge: focus no-op: {e}");
     }
 }
 

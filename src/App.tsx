@@ -14,6 +14,8 @@ import {
   completeFirstRun,
   composeMessages,
   frameFromImageFile,
+  composeContextBlocks,
+  type FileContext,
   freshNudgePreload,
   nudgeContextFrame,
   firstRunStatus,
@@ -31,6 +33,9 @@ import {
   onTerminalChunk,
   diffLineKind,
   onLlmPhase,
+  onWorkspaceRoots,
+  workspaceRoots,
+  setWorkspaceRoots,
   onVerboseStatus,
   verboseStatus,
   phaseStatusLine,
@@ -344,6 +349,8 @@ function App() {
       onLlmPhase((payload) => dispatchChat({ type: "phase", payload })),
       // Verbose-mode toggle applies live from the Settings window.
       onVerboseStatus((status) => setVerbose(status.enabled)),
+      // Workspace chip stays truthful across Settings/CLI/Finder changes.
+      onWorkspaceRoots((status) => setWsRoots(status.roots)),
       // Bridge v2 (spec 2026-08-02 N3): a CLI/Finder show-overlay may
       // carry a prefill for the input. (CLI `ask` runs backend-side.)
       listen<{ text: string }>("bridge://prefill", (e) => {
@@ -674,6 +681,43 @@ function App() {
       (frame) => dispatchChat({ type: "attach-done", frame }),
       (err) => dispatchChat({ type: "attach-error", error: toCaptureFlowError(err) }),
     );
+  };
+
+  /** Files picked from disk: images stage like a screenshot; text files
+   *  become context chips whose content rides the next message. */
+  const attachFiles = (list: FileList | null) => {
+    setAttachNote(null);
+    for (const file of Array.from(list ?? [])) {
+      if (file.type.startsWith("image/")) {
+        dispatchChat({ type: "attach-start" });
+        frameFromImageFile(file).then(
+          (frame) => dispatchChat({ type: "attach-done", frame }),
+          (err) =>
+            dispatchChat({
+              type: "attach-error",
+              error: { kind: "capture-failed", detail: String(err) },
+            }),
+        );
+        continue;
+      }
+      if (file.size > 1_000_000) {
+        setAttachNote(`${file.name}: over 1 MB — attach a smaller file`);
+        continue;
+      }
+      void file.text().then(
+        (text) => {
+          if (text.includes("\u0000")) {
+            setAttachNote(`${file.name}: not a text file`);
+            return;
+          }
+          setFileContexts((existing) => [
+            ...existing.filter((f) => f.name !== file.name),
+            { name: file.name, path: (file as { path?: string }).path ?? file.name, text },
+          ]);
+        },
+        () => setAttachNote(`${file.name}: could not be read`),
+      );
+    }
   };
 
   // Stop the in-flight run. The backend broadcasts the resulting run-state, but
@@ -1064,9 +1108,22 @@ function App() {
 
   const [routedLane, setRoutedLane] = useState<string | null>(null);
   const [verbose, setVerbose] = useState(false);
+  const [wsRoots, setWsRoots] = useState<string[]>([]);
+  // Attach-context row (2026-08-02 redesign): picked text files ride the
+  // next message as fenced context blocks; the menu also toggles capturing
+  // the screen with every message. All transient, per-session.
+  const [fileContexts, setFileContexts] = useState<FileContext[]>([]);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [autoScreen, setAutoScreen] = useState(false);
+  const [attachNote, setAttachNote] = useState<string | null>(null);
+  const filePickRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     verboseStatus().then(
       (status) => setVerbose(status.enabled),
+      () => undefined,
+    );
+    workspaceRoots().then(
+      (status) => setWsRoots(status.roots),
       () => undefined,
     );
     const un = onRouted((payload) => setRoutedLane(payload.lane));
@@ -1095,19 +1152,34 @@ function App() {
     // banner may have auto-timed-out minutes ago; the submit action consumes
     // the stage reducer-side either way (stale stages are simply dropped).
     const preload = freshNudgePreload(chatRef.current.nudgePreload, Date.now());
+    // Attached-file context rides the WIRE turn only; the visible bubble
+    // stays the question (the chips already showed what was attached).
+    const contexts = fileContexts;
+    const wireQuestion = trimmed + composeContextBlocks(contexts);
     dispatchChat({ type: "submit", question: trimmed, retry });
+    if (contexts.length > 0) setFileContexts([]);
     // The nudge-time screenshot (if the backend retained one) rides the
     // outgoing turn so the model can SEE what the nudge saw. Fetch failure
     // or absence degrades to text-only grounding — never blocks the send.
     const framePromise: Promise<string | null> = preload
       ? nudgeContextFrame(preload.capturedAtMs).catch(() => null)
       : Promise.resolve(null);
-    framePromise.then((nudgeFrame) => {
+    // Auto-screen (attach menu toggle): capture with EVERY message unless a
+    // frame is already staged; capture failure degrades to text-only.
+    const autoFramePromise: Promise<string | null> =
+      autoScreen && !staged
+        ? captureScreen().then(
+            (frame) => frame.base64Png,
+            () => null,
+          )
+        : Promise.resolve(null);
+    Promise.all([framePromise, autoFramePromise]).then(([nudgeFrame, autoFrame]) => {
       const attachments = [
         ...(staged ? [{ base64Png: staged.base64Png }] : []),
+        ...(autoFrame ? [{ base64Png: autoFrame }] : []),
         ...(nudgeFrame ? [{ base64Png: nudgeFrame }] : []),
       ];
-      const history = composeMessages(base, trimmed, attachments, preload, nudgeFrame !== null);
+      const history = composeMessages(base, wireQuestion, attachments, preload, nudgeFrame !== null);
       sendChat(history).then(
         (requestId) => dispatchChat({ type: "request-started", requestId }),
         (err) => dispatchChat({ type: "request-failed", detail: String(err) }),
@@ -1355,42 +1427,145 @@ function App() {
               </button>
             </div>
           )}
-          {/* Attach affordance: hidden only when the platform reports no
-              capture backend at all (supported === false). */}
-          {chat.capturePermission?.supported !== false && (
-            <div className="attach-row">
-              {chat.attachment ? (
-                <span className="attach-chip">
-                  Screen attached · {chat.attachment.width}×{chat.attachment.height}
+          {/* Context row (2026-08-02 redesign): ONE line naming everything
+              grounding the next message — the working directory, staged
+              screenshots, attached files, the every-message screen toggle —
+              behind a single ＋ Attach menu. */}
+          <div className="attach-row">
+            <div className="attach-menu-anchor">
+              <button
+                type="button"
+                className="attach-button"
+                disabled={chat.attachPending}
+                aria-expanded={attachMenuOpen}
+                onClick={() => setAttachMenuOpen((open) => !open)}
+              >
+                {chat.attachPending && <span className="attach-spinner" aria-hidden="true" />}
+                {chat.attachPending ? "Capturing…" : "＋ Attach"}
+              </button>
+              {attachMenuOpen && (
+                <div className="attach-menu" role="menu">
+                  {chat.capturePermission?.supported !== false && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        attachScreen();
+                      }}
+                    >
+                      Screenshot now
+                    </button>
+                  )}
                   <button
                     type="button"
-                    className="attach-chip-clear"
-                    aria-label="Remove screen attachment"
-                    onClick={() => dispatchChat({ type: "attach-clear" })}
+                    role="menuitem"
+                    onClick={() => {
+                      setAttachMenuOpen(false);
+                      filePickRef.current?.click();
+                    }}
                   >
-                    ×
+                    File from disk…
                   </button>
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  className="attach-button"
-                  disabled={chat.attachPending}
-                  onClick={attachScreen}
-                >
-                  {chat.attachPending && <span className="attach-spinner" aria-hidden="true" />}
-                  {chat.attachPending ? "Capturing…" : "Attach my screen"}
-                </button>
-              )}
-              {/* Privacy hint only — the button stays live so an attempted
-                  capture still surfaces the typed privacy-mode error. */}
-              {chat.privacy?.enabled && (
-                <span className="attach-privacy-hint" title="Turn Privacy Mode off in the tray menu or settings">
-                  Privacy Mode on — capture blocked
-                </span>
+                  {chat.capturePermission?.supported !== false && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        setAutoScreen((on) => !on);
+                      }}
+                    >
+                      {autoScreen ? "✓ " : ""}Screen with every message
+                    </button>
+                  )}
+                </div>
               )}
             </div>
-          )}
+            <input
+              ref={filePickRef}
+              type="file"
+              multiple
+              hidden
+              onChange={(event) => {
+                attachFiles(event.target.files);
+                event.target.value = "";
+              }}
+            />
+            {wsRoots.map((root, index) => (
+              <span
+                key={root}
+                className="attach-chip attach-chip--ambient"
+                data-workspace-chip={index === 0 ? true : undefined}
+                title={root}
+              >
+                {index === 0 ? "working in " : "also "}
+                {root.replace(/^\/Users\/[^/]+/, "~")}
+                <button
+                  type="button"
+                  className="attach-chip-clear"
+                  aria-label={`Stop working in ${root}`}
+                  onClick={() =>
+                    setWorkspaceRoots(wsRoots.filter((r) => r !== root)).then(
+                      (status) => setWsRoots(status.roots),
+                      () => undefined,
+                    )
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {chat.attachment && (
+              <span className="attach-chip">
+                screenshot · {chat.attachment.width}×{chat.attachment.height}
+                <button
+                  type="button"
+                  className="attach-chip-clear"
+                  aria-label="Remove screen attachment"
+                  onClick={() => dispatchChat({ type: "attach-clear" })}
+                >
+                  ×
+                </button>
+              </span>
+            )}
+            {fileContexts.map((file) => (
+              <span key={file.name} className="attach-chip" title={file.path}>
+                file · {file.name}
+                <button
+                  type="button"
+                  className="attach-chip-clear"
+                  aria-label={`Remove attached file ${file.name}`}
+                  onClick={() =>
+                    setFileContexts((existing) => existing.filter((f) => f.name !== file.name))
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {autoScreen && (
+              <span className="attach-chip" title="A fresh screenshot rides every message">
+                screen · every message
+                <button
+                  type="button"
+                  className="attach-chip-clear"
+                  aria-label="Stop attaching the screen to every message"
+                  onClick={() => setAutoScreen(false)}
+                >
+                  ×
+                </button>
+              </span>
+            )}
+            {attachNote && <span className="attach-privacy-hint">{attachNote}</span>}
+            {/* Privacy hint only — the menu stays live so an attempted
+                capture still surfaces the typed privacy-mode error. */}
+            {chat.privacy?.enabled && (
+              <span className="attach-privacy-hint" title="Turn Privacy Mode off in the tray menu or settings">
+                Privacy Mode on — capture blocked
+              </span>
+            )}
+          </div>
           {chat.captureError &&
             (chat.captureError.kind === "permission-denied" ? (
               <div className="capture-walkthrough" role="alert">

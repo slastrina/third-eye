@@ -371,6 +371,13 @@ impl ToolExecutor for RunCommandTool {
         if command.is_empty() {
             return ToolOutcome::failure("invalid-arguments", "command must not be empty");
         }
+        // A bare `cd` cannot work (fresh shell per command) — refuse typed
+        // so the model never builds on a directory change that never
+        // happened (workspace::exec_tool has the shared rationale).
+        #[cfg(desktop)]
+        if crate::workspace::exec_tool::bare_cd(command) {
+            return crate::workspace::exec_tool::cd_refusal(None);
+        }
         // 1. Structural gate (D038 posture): disabled means inert, typed.
         if !self.state.enabled() {
             return ToolOutcome::failure(

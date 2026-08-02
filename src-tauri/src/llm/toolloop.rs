@@ -50,6 +50,20 @@ pub const TOOL_RESULT_EVENT: &str = "llm://tool-result";
 /// while still guaranteeing termination.
 pub const MAX_TOOL_ROUNDS: usize = 40;
 
+/// How many times ONE exact (tool, arguments) call may execute per run
+/// before further repeats are refused typed. A model stuck in a loop
+/// re-issues the SAME failing call verbatim (the pi-script incident: the
+/// same `run_in_workspace` command failed round after round while the
+/// model narrated "let me fix it" and rewrote the same file) — three
+/// attempts is generous for legitimate retries; the fourth identical call
+/// cannot produce new information.
+pub const REPEATED_CALL_LIMIT: u32 = 3;
+
+/// Typed failure kind for the repeat breaker — the model is told to change
+/// strategy or report the blocker honestly, structurally (D038), instead
+/// of narrating another lap.
+pub const REPEATED_CALL_KIND: &str = "repeated-call";
+
 /// The one tool S03 ships. The name is part of the model-facing contract
 /// and the UI's memory-consulted check (T04).
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
@@ -154,27 +168,33 @@ facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk s
 battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. \
 Check find_programs before claiming an app or tool is or is not installed, and before running a \
 CLI tool you are not sure exists.\n\n\
-CODING: when the user has designated workspace folders (Settings → Workspaces), you have \
-read_file, list_dir and write_file for real coding work inside them. list_dir first to learn the \
-layout, read_file before changing a file — never write over content you have not read. write_file \
-replaces the WHOLE file, so pass the complete new contents, and the user approves each write. \
-File paths must stay inside the workspaces; anything outside is refused. To compile, test, or \
-run workspace code, use run_in_workspace (never run_command): its working directory is locked \
-inside the workspace, output streams into the chat, and timeoutSecs goes up to 600 for long \
-builds — after writing code, BUILD AND TEST it with run_in_workspace and report the real result. \
+CODING: read_file, list_dir, write_file and run_in_workspace work ANYWHERE on this machine. \
+Relative paths resolve against the ACTIVE working directory (named in your Environment); if \
+none is set, a folder chooser asks the user where to work — wait for their pick. list_dir \
+first to learn a layout, read_file before changing a file — never write over content you have \
+not read. write_file replaces the WHOLE file, so pass the complete new contents. Writes and \
+commands in a directory the user has not yet approved prompt them (approving \"this session\" \
+covers that directory); tmp (/tmp, the system temp dir) is ALWAYS writable with no prompt — \
+use it for scratch work. To compile, test, or run code, use run_in_workspace (never \
+run_command): output streams into the chat and timeoutSecs goes up to 600 for long builds — \
+after writing code, BUILD AND TEST it with run_in_workspace and report the real result. \
+There is NO persistent shell: every command starts fresh in the active working directory — a \
+bare `cd` does nothing and is refused; pass cwd for another folder. When a \
+result header names a directory in [brackets], that IS the directory you listed or read — \
+describe it as that path, never as a folder you merely intended to be in. \
 When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: \
 confirm it contains exactly the intended changes, then summarize them for the user. NEVER \
-git-commit or git-push workspace changes unless the user explicitly asks you to. \
-If these tools are not \
-offered, no workspace is configured — say so and point the user at Settings → Workspaces instead \
-of trying run_command to touch files.\n\n\
+git-commit or git-push changes unless the user explicitly asks you to.\n\n\
 You CAN recall the past: memory_search finds distilled memories of the user's activity and \
 earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. \
 When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
 about?\"), call chat_history_search with a short keyword (e.g. \"recipe\") and answer from the \
 matches — never claim you have no access to past conversations without searching first. When \
 the user asks you to REMEMBER something (\"remember that…\"), call remember with one concise \
-self-contained fact — never claim you cannot store information.\n\n\
+self-contained fact — never claim you cannot store information. The same applies to PERSONAL \
+FACTS: \"what is my name\", \"where do I work\", \"what do I like\" — memory_search FIRST (and \
+chat_history_search if memory finds nothing); only after both come back empty may you say you \
+do not know, and then offer to remember it.\n\n\
 CONTINUITY: follow-up questions usually refer to what you JUST did and what is on screen right \
 now. A page you opened earlier in this conversation is still open — \"this recipe\", \"the \
 ingredients\", \"read it to me\" mean THAT page. Answer by looking: focus_app the browser if \
@@ -2305,6 +2325,8 @@ pub async fn run_tool_loop_with_stop(
     // surfaces so a user-stopped answer keeps whatever the model already said.
     let mut streamed_text = String::new();
     let mut streamed_tokens = 0usize;
+    // Repeat breaker: exact (tool, arguments) execution counts this run.
+    let mut call_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for round in 0..=MAX_TOOL_ROUNDS {
         // Stop observed between rounds: terminate before issuing the next
         // request, with the text streamed so far (R006 — never silent).
@@ -2385,7 +2407,23 @@ pub async fn run_tool_loop_with_stop(
                 call: call.clone(),
             }));
 
-            let result = executor.execute(call).await;
+            let repeat_key = format!("{}\x01{}", call.name, call.arguments.trim());
+            let seen = call_counts.entry(repeat_key).or_insert(0);
+            *seen += 1;
+            let result = if *seen > REPEATED_CALL_LIMIT {
+                // The same exact call for the (LIMIT+1)th time: executing it
+                // again cannot produce new information — refuse typed and
+                // force a strategy change (or an honest report).
+                ToolOutcome::failure(
+                    REPEATED_CALL_KIND,
+                    format!(
+                        "you have already called {} with these EXACT arguments {} times this                          run — repeating it will give the same result. STOP repeating. Either                          solve the underlying problem a genuinely different way (different                          content, different command, different tool), or end the run and tell                          the user plainly what you tried and what is failing.",
+                        call.name, REPEATED_CALL_LIMIT
+                    ),
+                )
+            } else {
+                executor.execute(call).await
+            };
             match &result.failure {
                 None => log::info!(
                     "llm: tool result round={round} id={} count={} mode={} (request={request_id})",

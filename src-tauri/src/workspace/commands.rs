@@ -3,7 +3,17 @@
 //! persist failure, always return the authoritative snapshot.
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Broadcast on every roots change so the overlay's workspace chip and the
+/// Settings pane stay live without polling. Payload: [`WorkspaceStatus`].
+pub const WORKSPACE_ROOTS_EVENT: &str = "workspace://roots";
+
+fn broadcast_roots(app: &AppHandle, status: &WorkspaceStatus) {
+    if let Err(e) = app.emit(WORKSPACE_ROOTS_EVENT, status.clone()) {
+        log::warn!("workspace: {WORKSPACE_ROOTS_EVENT} emit failed: {e}");
+    }
+}
 
 use super::WorkspaceState;
 
@@ -57,14 +67,27 @@ pub fn set_workspace_roots(
             state.set_persist_error(Some(e));
         }
     }
-    status(&state)
+    let snapshot = status(&state);
+    broadcast_roots(&app, &snapshot);
+    snapshot
+}
+
+/// The pure "work here" ordering: `target` becomes the FIRST root — the
+/// one every coding tool defaults to (list_dir with no path, relative
+/// resolution, run_in_workspace cwd). An existing entry is MOVED to the
+/// front, never duplicated.
+pub fn promote_root(existing: &[String], target: &str) -> Vec<String> {
+    let mut roots = vec![target.to_string()];
+    roots.extend(existing.iter().filter(|r| *r != target).cloned());
+    roots
 }
 
 /// Add ONE workspace root from an external entry point (the bridge's
-/// `add-workspace` command — CLI / Finder, spec 2026-08-02 N3). The same
-/// canonical/absolute discipline as Settings: the path must exist, be a
-/// directory, and canonicalize; duplicates are a no-op success. Persisted
-/// with rollback like `set_workspace_roots`. Returns the canonical path.
+/// `add-workspace` command — CLI / Finder, spec 2026-08-02 N3) and make it
+/// the ACTIVE workspace: "work here" means the tools' default directory is
+/// THIS one, so the new root goes first (an already-known root moves to
+/// the front). Same canonical/absolute discipline as Settings; persisted
+/// with rollback. Returns the canonical path.
 pub fn add_workspace_root(app: &AppHandle, path: &str) -> Result<String, String> {
     let canonical = std::path::Path::new(path)
         .canonicalize()
@@ -75,18 +98,16 @@ pub fn add_workspace_root(app: &AppHandle, path: &str) -> Result<String, String>
     let state = app.state::<std::sync::Arc<WorkspaceState>>();
     let display = canonical.display().to_string();
     let previous = state.roots();
-    if previous
-        .iter()
-        .any(|r| r.canonicalize().map(|c| c == canonical).unwrap_or(false))
-    {
+    let previous_strings: Vec<String> = previous.iter().map(|p| p.display().to_string()).collect();
+    let roots = promote_root(&previous_strings, &display);
+    if roots == previous_strings {
         return Ok(display);
     }
-    let mut roots: Vec<String> = previous.iter().map(|p| p.display().to_string()).collect();
-    roots.push(display.clone());
     state.set_roots(roots.clone());
     match crate::config::save_workspace_roots(app, &roots) {
         Ok(()) => {
-            log::info!("workspace: root added via bridge: {display}");
+            log::info!("workspace: active root via bridge: {display}");
+            broadcast_roots(app, &status(&state));
             Ok(display)
         }
         Err(e) => {
@@ -97,6 +118,59 @@ pub fn add_workspace_root(app: &AppHandle, path: &str) -> Result<String, String>
     }
 }
 
+/// Production folder chooser (user request 2026-08-02): the native macOS
+/// folder dialog via osascript — no plugin needed. A pick is PROMOTED to
+/// the active working directory (persisted + broadcast, so the overlay
+/// chip updates mid-run). Cancel/timeout returns None and the tool
+/// refuses typed.
+pub struct OsascriptChooser {
+    pub app: AppHandle,
+}
+
+#[async_trait::async_trait]
+impl super::DirectoryChooser for OsascriptChooser {
+    async fn choose(&self, purpose: &str) -> Option<String> {
+        let prompt = format!("Third Eye needs a folder to work in — {purpose}");
+        let script = format!(
+            "POSIX path of (choose folder with prompt {})",
+            osa_quote(&prompt)
+        );
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            tokio::process::Command::new("/usr/bin/osascript")
+                .args(["-e", &script])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            log::info!("workspace: folder chooser declined/failed");
+            return None;
+        }
+        let picked = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if picked.is_empty() {
+            return None;
+        }
+        match add_workspace_root(&self.app, &picked) {
+            Ok(canonical) => {
+                log::info!("workspace: user chose working directory {canonical}");
+                Some(canonical)
+            }
+            Err(e) => {
+                log::error!("workspace: chooser pick rejected: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// AppleScript string literal (quote + escape) — the prompt is app-built,
+/// but quoting defensively costs nothing.
+fn osa_quote(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Apply the persisted roots at boot (in-memory only).
 pub fn apply_persisted_workspace_roots(app: &AppHandle) {
     let roots = crate::config::load_workspace_roots(app);
@@ -105,4 +179,21 @@ pub fn apply_persisted_workspace_roots(app: &AppHandle) {
     }
     app.state::<std::sync::Arc<WorkspaceState>>()
         .set_roots(roots);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::promote_root;
+
+    #[test]
+    fn work_here_makes_the_target_the_first_root_without_duplicates() {
+        let existing = vec!["/a".to_string(), "/b".to_string()];
+        assert_eq!(promote_root(&existing, "/c"), vec!["/c", "/a", "/b"]);
+        // An already-known root MOVES to the front (the pi-dir incident:
+        // `thirdeye .` appended, tools kept defaulting to the old first).
+        assert_eq!(promote_root(&existing, "/b"), vec!["/b", "/a"]);
+        // Already first: unchanged.
+        assert_eq!(promote_root(&existing, "/a"), vec!["/a", "/b"]);
+        assert_eq!(promote_root(&[], "/x"), vec!["/x"]);
+    }
 }

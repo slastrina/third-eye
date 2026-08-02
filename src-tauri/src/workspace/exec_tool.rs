@@ -62,6 +62,40 @@ struct RunInWorkspaceArgs {
     timeout_secs: Option<u64>,
 }
 
+/// Whether `command` is ONLY a `cd` — which cannot work: every command
+/// runs in a fresh shell, so a bare `cd` changes nothing and the model
+/// then reasons from a directory it never actually entered (the
+/// Desktop-listing incident). Compound commands (`cd x && make`) are
+/// legitimate and pass.
+pub fn bare_cd(command: &str) -> bool {
+    let trimmed = command.trim();
+    (trimmed == "cd" || trimmed.starts_with("cd "))
+        && !trimmed.contains("&&")
+        && !trimmed.contains(';')
+        && !trimmed.contains('|')
+        && !trimmed.contains('\n')
+}
+
+/// The typed refusal both exec tools return for a bare `cd`.
+pub const CD_DOES_NOT_PERSIST_KIND: &str = "cd-does-not-persist";
+
+pub fn cd_refusal(active: Option<&std::path::Path>) -> ToolOutcome {
+    let active = active
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the active workspace".into());
+    ToolOutcome::failure(
+        CD_DOES_NOT_PERSIST_KIND,
+        format!(
+            "cd does NOT persist — every command runs in a FRESH shell starting in {active}. \
+             To run something in a different folder INSIDE a workspace, pass it as the cwd \
+             argument (or `cd there && command` in one call). Folders OUTSIDE the workspaces \
+             are unreachable by design: say so and tell the user to add the folder in \
+             Settings → Workspaces (or `thirdeye <path>` in a terminal). Never claim the \
+             directory changed."
+        ),
+    )
+}
+
 /// Clamp a requested timeout into the exec band.
 pub fn clamp_timeout(requested: Option<u64>) -> u64 {
     requested
@@ -285,11 +319,7 @@ fn workspace_failure(err: WorkspaceError) -> ToolOutcome {
 #[async_trait]
 impl ToolExecutor for RunInWorkspaceTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        if self.workspace.has_roots() {
-            vec![Self::definition()]
-        } else {
-            Vec::new()
-        }
+        vec![Self::definition()]
     }
 
     fn claims(&self, name: &str) -> bool {
@@ -310,19 +340,24 @@ impl ToolExecutor for RunInWorkspaceTool {
         if command.is_empty() {
             return ToolOutcome::failure("invalid-arguments", "command must not be empty");
         }
-        // Containment first: the cwd must resolve INSIDE a root and exist as
-        // a directory before approval ever shows the user a summary.
+        if bare_cd(&command) {
+            return cd_refusal(self.workspace.roots().first().map(|p| p.as_path()));
+        }
+        // Resolve the cwd (2026-08-02 anywhere semantics): the active
+        // working directory by default; any absolute path otherwise; with
+        // neither, the chooser pauses to ask the user for a folder.
         let cwd_arg = args.cwd.unwrap_or_default();
         let candidate = if cwd_arg.trim().is_empty() {
-            match self.workspace.roots().first() {
-                Some(root) => root.display().to_string(),
-                None => return workspace_failure(WorkspaceError::NoWorkspaces),
-            }
+            ".".to_string()
         } else {
             cwd_arg
         };
-        let (cwd, root) = match self.workspace.resolve_with_root(&candidate) {
-            Ok(pair) => pair,
+        let cwd = match self
+            .workspace
+            .resolve_or_ask(&candidate, &format!("run: {command}"))
+            .await
+        {
+            Ok(cwd) => cwd,
             Err(e) => return workspace_failure(e),
         };
         if !cwd.is_dir() {
@@ -331,15 +366,16 @@ impl ToolExecutor for RunInWorkspaceTool {
                 format!("cwd {} is not an existing directory", cwd.display()),
             );
         }
-        // Approval: a kind-wide grant (persisted Always, seeded at boot)
-        // covers every root; otherwise the SESSION grant is per root.
+        // Consent (not containment): tmp is always fine; a kind-wide grant
+        // (persisted Always) or a session-blessed directory skips the
+        // prompt; anything else asks, naming the exact directory.
         let kind_granted = self
             .whitelist
             .lock()
             .map(|w| w.contains(ActionKind::RunInWorkspace))
             .unwrap_or(false);
-        if !kind_granted && !self.workspace.exec_granted(&root) {
-            let summary = format!("Run in {}: {command}", root.display());
+        if !WorkspaceState::is_tmp(&cwd) && !kind_granted && !self.workspace.dir_granted(&cwd) {
+            let summary = format!("Run in {}: {command}", cwd.display());
             match self
                 .approver
                 .request(ActionKind::RunInWorkspace, summary)
@@ -347,13 +383,13 @@ impl ToolExecutor for RunInWorkspaceTool {
             {
                 ApprovalVerdict::AllowOnce => {}
                 ApprovalVerdict::AllowKind | ApprovalVerdict::AllowAlways => {
-                    // Session grant, scoped to THIS workspace root only.
-                    self.workspace.grant_exec(root.clone());
+                    // Session grant for THIS directory (and its subtree).
+                    self.workspace.grant_dir(cwd.clone());
                 }
                 ApprovalVerdict::Deny => {
                     return ToolOutcome::failure(
                         "approval-denied",
-                        format!("the user declined to run in {}: {command}", root.display()),
+                        format!("the user declined to run in {}: {command}", cwd.display()),
                     );
                 }
             }
@@ -417,6 +453,32 @@ mod tests {
         (tool, prompt, sink)
     }
 
+    /// Writable NON-tmp scratch (tmp bypasses approval by design).
+    fn non_tmp_scratch(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("te-exec-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn tool_with(
+        ws: Arc<WorkspaceState>,
+        verdict: ApprovalVerdict,
+    ) -> (RunInWorkspaceTool, Arc<ScriptedPrompt>, Arc<RecordingSink>) {
+        let prompt = Arc::new(ScriptedPrompt::new(verdict));
+        let sink = Arc::new(RecordingSink(Mutex::new(String::new())));
+        let tool = RunInWorkspaceTool::new(
+            ws,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            prompt.clone(),
+            Arc::new(AtomicBool::new(false)),
+            sink.clone(),
+        );
+        (tool, prompt, sink)
+    }
+
     fn call(args: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "c1".into(),
@@ -426,42 +488,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inert_without_roots_and_refuses_typed() {
+    async fn always_offered_and_no_working_dir_refuses_typed() {
         let ws = Arc::new(WorkspaceState::new());
         let (tool, _, _) = tool(ws, ApprovalVerdict::AllowOnce);
-        assert!(tool.definitions().is_empty());
+        assert_eq!(tool.definitions().len(), 1, "offered without roots");
         let outcome = tool
             .execute(&call(serde_json::json!({"command": "true"})))
             .await;
-        assert_eq!(outcome.failure.as_deref(), Some("no-workspaces"));
+        assert_eq!(outcome.failure.as_deref(), Some("no-working-directory"));
     }
 
     #[tokio::test]
-    async fn cwd_escape_refused_typed_before_any_spawn() {
-        let (ws, dir) = scratch_ws("escape");
-        let (tool, prompt, _) = tool(ws, ApprovalVerdict::AllowOnce);
-        let outcome = tool
-            .execute(&call(serde_json::json!({"command": "true", "cwd": "/tmp"})))
-            .await;
-        assert_eq!(outcome.failure.as_deref(), Some("outside-workspace"));
-        assert_eq!(
-            prompt.1.load(Ordering::SeqCst),
-            0,
-            "refused before approval"
+    async fn tmp_cwd_never_prompts_and_elsewhere_asks_with_the_directory() {
+        struct PanicPrompt;
+        #[async_trait::async_trait]
+        impl ApprovalPrompt for PanicPrompt {
+            async fn request(&self, _k: ActionKind, _s: String) -> ApprovalVerdict {
+                panic!("tmp commands must never prompt");
+            }
+        }
+        // tmp cwd (scratch_ws lives in temp_dir): runs with no prompt.
+        let (ws, dir) = scratch_ws("tmpfree");
+        let sink = Arc::new(RecordingSink(Mutex::new(String::new())));
+        let tool = RunInWorkspaceTool::new(
+            ws,
+            Arc::new(Mutex::new(SessionWhitelist::new())),
+            Arc::new(PanicPrompt),
+            Arc::new(AtomicBool::new(false)),
+            sink,
         );
+        let outcome = tool
+            .execute(&call(serde_json::json!({"command": "echo tmp-free"})))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
         let _ = std::fs::remove_dir_all(&dir);
+        // A non-tmp cwd prompts, naming the exact directory.
+        let non_tmp = non_tmp_scratch("ask");
+        let ws = Arc::new(WorkspaceState::new());
+        ws.set_roots(vec![non_tmp.display().to_string()]);
+        let (tool, prompt, _) = tool_with(ws, ApprovalVerdict::AllowOnce);
+        let outcome = tool
+            .execute(&call(serde_json::json!({"command": "true"})))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(prompt.1.load(Ordering::SeqCst), 1, "non-tmp prompts");
+        let _ = std::fs::remove_dir_all(&non_tmp);
     }
 
     #[tokio::test]
     async fn deny_never_executes() {
-        let (ws, dir) = scratch_ws("deny");
-        let (tool, _, _) = tool(ws, ApprovalVerdict::Deny);
+        let non_tmp = non_tmp_scratch("deny");
+        let ws = Arc::new(WorkspaceState::new());
+        ws.set_roots(vec![non_tmp.display().to_string()]);
+        let (tool, _, _) = tool_with(ws, ApprovalVerdict::Deny);
         let outcome = tool
             .execute(&call(serde_json::json!({"command": "touch never.txt"})))
             .await;
         assert_eq!(outcome.failure.as_deref(), Some("approval-denied"));
-        assert!(!dir.join("never.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!non_tmp.join("never.txt").exists());
+        let _ = std::fs::remove_dir_all(&non_tmp);
     }
 
     #[tokio::test]
@@ -489,42 +574,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_grant_is_per_root_not_per_kind() {
-        let dir_a = std::env::temp_dir().join(format!("te-exec-ga-{}", std::process::id()));
-        let dir_b = std::env::temp_dir().join(format!("te-exec-gb-{}", std::process::id()));
-        for d in [&dir_a, &dir_b] {
-            let _ = std::fs::remove_dir_all(d);
-            std::fs::create_dir_all(d).unwrap();
-        }
+    async fn session_grant_blesses_the_directory_not_the_kind() {
+        let dir_a = non_tmp_scratch("ga");
+        let dir_b = non_tmp_scratch("gb");
         let ws = Arc::new(WorkspaceState::new());
-        ws.set_roots(vec![
-            dir_a.display().to_string(),
-            dir_b.display().to_string(),
-        ]);
-        let (tool, prompt, _) = tool(ws, ApprovalVerdict::AllowKind);
-        // First run in root A prompts and grants A for the session.
-        let first = tool
-            .execute(&call(serde_json::json!({"command": "true"})))
-            .await;
-        assert!(first.ok, "{first:?}");
-        // Second run in A: no new prompt.
-        let second = tool
-            .execute(&call(serde_json::json!({"command": "true"})))
-            .await;
-        assert!(second.ok);
-        assert_eq!(prompt.1.load(Ordering::SeqCst), 1, "root A granted");
-        // A run in root B prompts AGAIN — the grant never crossed roots.
-        let third = tool
+        ws.set_roots(vec![dir_a.display().to_string()]);
+        let (tool, prompt, _) = tool_with(ws, ApprovalVerdict::AllowKind);
+        // First run in A prompts and blesses A; the second is silent.
+        for _ in 0..2 {
+            let outcome = tool
+                .execute(&call(serde_json::json!({"command": "true"})))
+                .await;
+            assert!(outcome.ok, "{outcome:?}");
+        }
+        assert_eq!(prompt.1.load(Ordering::SeqCst), 1, "directory blessed");
+        // Directory B prompts AGAIN — the blessing never crossed dirs.
+        let outcome = tool
             .execute(&call(serde_json::json!({
                 "command": "true",
                 "cwd": dir_b.display().to_string(),
             })))
             .await;
-        assert!(third.ok);
-        assert_eq!(prompt.1.load(Ordering::SeqCst), 2, "root B re-prompts");
-        for d in [&dir_a, &dir_b] {
-            let _ = std::fs::remove_dir_all(d);
-        }
+        assert!(outcome.ok);
+        assert_eq!(prompt.1.load(Ordering::SeqCst), 2, "dir B re-prompts");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[tokio::test]
@@ -584,6 +658,29 @@ mod tests {
         assert_eq!(outcome.failure.as_deref(), Some("command-failed"));
         assert!(outcome.content.contains("oops"));
         assert!(outcome.content.contains("exit code: 3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bare_cd_refuses_typed_and_compound_cd_passes() {
+        assert!(bare_cd("cd /tmp"));
+        assert!(bare_cd("  cd .."));
+        assert!(bare_cd("cd"));
+        assert!(!bare_cd("cd sub && cargo test"));
+        assert!(!bare_cd("cd x; make"));
+        assert!(!bare_cd("echo cd"));
+        let (ws, dir) = scratch_ws("cd");
+        let (tool, prompt, _) = tool(ws, ApprovalVerdict::AllowOnce);
+        let outcome = tool
+            .execute(&call(serde_json::json!({"command": "cd /tmp"})))
+            .await;
+        assert_eq!(outcome.failure.as_deref(), Some(CD_DOES_NOT_PERSIST_KIND));
+        assert!(outcome.content.contains("FRESH"), "{}", outcome.content);
+        assert_eq!(
+            prompt.1.load(Ordering::SeqCst),
+            0,
+            "refused before approval"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
