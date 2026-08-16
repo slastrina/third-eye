@@ -32,10 +32,10 @@ use third_eye_lib::llm::openai::OpenAiClient;
 use third_eye_lib::llm::toolloop::{
     run_tool_loop, ApprovalGate, ApprovalPrompt, ApprovalVerdict, ChatHistorySearchTool,
     CompositeExecutor, FocusAppTool, FocusedApp as FocusedAppGate, InputTool, MemorySearchTool,
-    ReadPageTool, ScreenQueryTool, ScreenSeen, ToolEvent, UrlGroundingExecutor, UrlSeen,
-    CHAT_HISTORY_SEARCH_TOOL, HID_SYSTEM_PROMPT, INPUT_ACTION_TOOL, MEMORY_SEARCH_TOOL,
-    NO_SCREEN_QUERY_KIND, READ_PAGE_TOOL, SCREEN_QUERY_TOOL, TOO_MANY_OPENS_KIND,
-    UNGROUNDED_URL_KIND, VERIFICATION_FAILED_KIND,
+    Opener, ReadPageTool, ScreenQueryTool, ScreenSeen, ToolEvent, UrlGroundingExecutor, UrlSeen,
+    WebSearchTool, CHAT_HISTORY_SEARCH_TOOL, HID_SYSTEM_PROMPT, INPUT_ACTION_TOOL,
+    MEMORY_SEARCH_TOOL, NO_SCREEN_QUERY_KIND, READ_PAGE_TOOL, SCREEN_QUERY_TOOL,
+    TOO_MANY_OPENS_KIND, UNGROUNDED_URL_KIND, VERIFICATION_FAILED_KIND, WEB_SEARCH_TOOL,
 };
 use third_eye_lib::llm::ChatMessage;
 use third_eye_lib::memory::MemoryStore;
@@ -329,7 +329,7 @@ async fn run_scenario(
         &client,
         executor,
         vec![
-            ChatMessage::system(HID_SYSTEM_PROMPT),
+            ChatMessage::system(HID_SYSTEM_PROMPT.as_str()),
             ChatMessage::user(ask),
         ],
         7,
@@ -1169,6 +1169,157 @@ async fn eval_tools_offered_without_dirs_and_relative_refuses_typed() {
     );
 }
 
+/// WEB SEARCH (2026-08-17 consistency work): one call opens the TEMPLATED
+/// site URL — never a model-composed one — and returns the on-screen
+/// results with grounded coordinates, which the very next click may use.
+/// The whole "how do I search" decision surface, gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_web_search_opens_the_template_and_grounds_the_click() {
+    struct RecordedOpener(Mutex<Vec<String>>);
+    #[async_trait]
+    impl Opener for RecordedOpener {
+        async fn open(&self, url: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(url.to_string());
+            Ok(())
+        }
+    }
+
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            WEB_SEARCH_TOOL,
+            r#"{"query":"half life 2","site":"ebay"}"#,
+        ),
+        // The click aims at the element web_search just returned (the
+        // FixedScreen center) — grounded by the search itself.
+        scripted::round_tool(
+            "c2",
+            INPUT_ACTION_TOOL,
+            r#"{"action":"mouse-click","button":"left","x":840,"y":240}"#,
+        ),
+        scripted::round_text("Clicked the first listing."),
+    ])
+    .await;
+
+    let input = Arc::new(ScriptedInput::new(Vec::new()));
+    let screen_seen = Arc::new(ScreenSeen::new());
+    let focused_app = Arc::new(FocusedAppGate::new());
+    let (gate, screen) = hid_gate(input.clone(), screen_seen.clone(), focused_app.clone());
+    let opener = Arc::new(RecordedOpener(Mutex::new(Vec::new())));
+    let web = WebSearchTool::new(
+        ScreenQueryTool::new(Arc::new(FixedScreen), screen_seen, focused_app),
+        Arc::new(UrlSeen::new()),
+        opener.clone(),
+    );
+    let executor = CompositeExecutor::new(vec![Box::new(gate), Box::new(screen), Box::new(web)]);
+
+    let (text, events) = run_scenario(&endpoint, &executor, "find half life 2 on ebay").await;
+    assert_eq!(text, "Clicked the first listing.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].1, "web_search succeeds: {:?}", results[0]);
+    assert!(
+        results[1].1,
+        "the grounded click succeeds: {:?}",
+        results[1]
+    );
+    // The URL came from the TEMPLATE, encoded — never the model.
+    assert_eq!(
+        opener.0.lock().unwrap().as_slice(),
+        ["https://www.ebay.com/sch/i.html?_nkw=half+life+2"]
+    );
+    // The click really landed at the element the search returned.
+    let actions = input.actions.lock().unwrap().clone();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    match &actions[0] {
+        InputAction::MouseClick { x, y, .. } => {
+            assert_eq!((x.unwrap(), y.unwrap()), (840, 240));
+        }
+        other => panic!("expected a click, got {other:?}"),
+    }
+}
+
+/// PROGRESS RULE (2026-08-17, replacing the fixed open cap): past the free
+/// budget, READING the open page earns exactly one more navigation —
+/// multi-hop research keeps going, blind tab-flooding still stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_reading_the_page_earns_the_next_open() {
+    /// Claims run_command but never runs anything — no real browser tabs.
+    struct StubRunner;
+    #[async_trait]
+    impl third_eye_lib::llm::toolloop::ToolExecutor for StubRunner {
+        fn definitions(&self) -> Vec<third_eye_lib::llm::ToolDefinition> {
+            vec![third_eye_lib::llm::ToolDefinition {
+                name: "run_command".into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+        fn claims(&self, name: &str) -> bool {
+            name == "run_command"
+        }
+        async fn execute(
+            &self,
+            _call: &third_eye_lib::llm::ToolCall,
+        ) -> third_eye_lib::llm::toolloop::ToolOutcome {
+            third_eye_lib::llm::toolloop::ToolOutcome::success("opened")
+        }
+    }
+
+    let open = |id: &str, n: u32| {
+        scripted::round_tool(
+            id,
+            "run_command",
+            &format!(r#"{{"command":"open \"https://site{n}.example/\""}}"#),
+        )
+    };
+    let (endpoint, _captured) = scripted::spawn(vec![
+        open("c1", 1),
+        open("c2", 2),
+        // Budget exhausted, page unread: the third open must refuse…
+        open("c3", 3),
+        // …reading the page earns exactly one more…
+        scripted::round_tool("c4", SCREEN_QUERY_TOOL, "{}"),
+        open("c5", 3),
+        // …which is spent: the next unread open refuses again.
+        open("c6", 4),
+        scripted::round_text("Done."),
+    ])
+    .await;
+
+    let input = Arc::new(ScriptedInput::new(Vec::new()));
+    let screen_seen = Arc::new(ScreenSeen::new());
+    let focused_app = Arc::new(FocusedAppGate::new());
+    let (gate, screen) = hid_gate(input, screen_seen, focused_app);
+    let composite =
+        CompositeExecutor::new(vec![Box::new(gate), Box::new(screen), Box::new(StubRunner)]);
+    let executor = CompositeExecutor::new(vec![Box::new(UrlGroundingExecutor::new(
+        composite,
+        Arc::new(UrlSeen::new()),
+    ))]);
+
+    let (_text, events) = run_scenario(&endpoint, &executor, "research these sites").await;
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 6, "{results:?}");
+    assert!(results[0].1 && results[1].1, "two free opens: {results:?}");
+    assert_eq!(
+        results[2].2.as_deref(),
+        Some(TOO_MANY_OPENS_KIND),
+        "unread third open refused"
+    );
+    assert!(results[3].1, "the read succeeds");
+    assert!(
+        results[4].1,
+        "reading earned the next open: {:?}",
+        results[4]
+    );
+    assert_eq!(
+        results[5].2.as_deref(),
+        Some(TOO_MANY_OPENS_KIND),
+        "the earned open is spent; unread navigation stops again"
+    );
+}
+
 /// REPEAT BREAKER (2026-08-02 bugfix): a model stuck re-issuing the SAME
 /// exact failing call (the pi-script loop) gets three attempts; from the
 /// fourth the loop refuses typed (`repeated-call`) with strategy-change
@@ -1291,29 +1442,50 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
         HID_SYSTEM_PROMPT.contains("must summarize WHAT YOU FOUND"),
         "findings-first answer clause missing"
     );
-    // On-page search boxes beat hand-built query URLs.
+    // ONE search doctrine (2026-08-17): web_search, never hand-built URLs
+    // or address-bar typing — the three-way doctrine flip WAS the ebay
+    // inconsistency.
     assert!(
-        HID_SYSTEM_PROMPT.contains("USE that search box"),
-        "on-page search clause missing"
+        HID_SYSTEM_PROMPT.contains("call web_search"),
+        "web_search doctrine missing"
     );
-    // Navigation reuses the open browser window (new tab), never a second
-    // window from `open`.
     assert!(
-        HID_SYSTEM_PROMPT.contains("navigate IN that window"),
+        HID_SYSTEM_PROMPT.contains("NEVER compose search or product URLs by hand"),
+        "hand-built-URL prohibition missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("never type URLs into the address bar"),
+        "address-bar prohibition missing"
+    );
+    // Progress rule: reading the open page earns the next navigation.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("READ the page that is already open"),
+        "read-before-open clause missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("Direct navigation is only for URLs the user gave you"),
+        "grounded-navigation clause missing"
+    );
+    // Work in the open window; refine on the same site.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("work IN that window"),
         "reuse-the-window clause missing"
     );
+    // Lane assembly: coder runs carry no browsing doctrine and vice versa —
+    // the split is the point, so pin it.
+    let coder = third_eye_lib::llm::toolloop::system_prompt_for_lane("coder");
+    let heavy = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy");
     assert!(
-        HID_SYSTEM_PROMPT.contains("Typed URLs follow the same grounding rules"),
-        "typed-URL grounding clause missing"
+        coder.contains("BUILD AND TEST") && !coder.contains("web_search"),
+        "coder prompt must carry coding, not browsing"
     );
-    // Web navigation: search-then-choose, never invented deep URLs.
     assert!(
-        HID_SYSTEM_PROMPT.contains("NEVER invent specific page URLs"),
-        "URL-guessing prohibition missing"
+        heavy.contains("call web_search") && !heavy.contains("BUILD AND TEST"),
+        "heavy prompt must carry browsing, not coding"
     );
     assert!(
-        HID_SYSTEM_PROMPT.contains("open ONE search-results URL"),
-        "search-then-choose flow missing"
+        coder.contains("verified") && heavy.contains("verified"),
+        "both lanes carry the core honesty contract"
     );
     // Coding workflow (S3): read-before-write, whole-file writes, and the
     // no-workspace path points at Settings instead of run_command tricks.

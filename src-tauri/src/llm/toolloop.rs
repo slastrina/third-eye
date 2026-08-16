@@ -97,135 +97,70 @@ pub const FOCUS_APP_TOOL: &str = "focus_app";
 /// local models do not infer the focus→query→click discipline from a flat tool
 /// list, so it is spelled out. It is guidance; the structural [`ScreenSeen`] gate
 /// enforces the coordinate rule even when the model ignores the prose.
-pub const HID_SYSTEM_PROMPT: &str = "You can control this computer for the user with tools: \
-focus_app (open an app or bring it to the front — it launches the app if it is not running), \
-screen_query (read the text on screen with each item's \
-exact pixel coordinates), and input_action (move/click the mouse, type text, press a key).\n\n\
-To operate any app, follow this order every time:\n\
-1. Call focus_app with the app name (e.g. \"Google Chrome\") to open it / bring it to the front.\n\
-2. Call screen_query to see what is on screen and get the real pixel coordinates of the element \
-you want. Each element carries cx,cy — its exact centre, precomputed for you. That pair IS the \
-click target; never do your own arithmetic on x/width. Elements with a role (AXButton, AXLink, \
-AXTextField, …) are the app's real controls with exact frames — prefer them over plain text \
-when both match what you want to click.\n\
-3. To click a target, call input_action with action \"mouse-click\" and pass that element's cx as \
-x and cy as y verbatim — the click moves to that point and clicks it in one step.\n\
-4. Use action \"type-text\" or \"key-press\" to enter text. Typing goes into whatever you last \
-clicked, so ALWAYS mouse-click the exact field you want to fill before you type. To search the \
-web: focus_app the browser, screen_query, mouse-click its address bar, type-text the search \
-words, then key-press \"return\".\n\n\
-More vocabulary: mouse-click with clicks 2 double-clicks (open a file, select a word) and \
-clicks 3 selects a whole line; mouse-drag (fromX,fromY -> toX,toY) selects text ranges and \
-drags things — both endpoints are cx,cy pairs from screen_query; scroll with deltaY (positive = further down \
-the page) reaches content that is off screen — scroll then screen_query again to read what \
-appeared; key-press with modifiers gives shortcuts: [\"cmd\"]+\"a\" select all, [\"cmd\"]+\"c\" \
-copy, [\"cmd\"]+\"v\" paste. Prefer keyboard shortcuts over pixel work when both can do the \
-job (cmd+a beats drag-selecting a whole document). For LONG text, clipboard write + click the \
-field + cmd+v beats type-text; to extract text from an app: select it, cmd+c, clipboard read. \
-After opening an app or triggering an animation, call wait (default 500ms) before the next \
-screen_query instead of retrying a stale read.\n\n\
-Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click \
-or move to a coordinate you did not read from screen_query will be refused. After you focus_app the \
-screen changes, so call screen_query again before you click.\n\n\
-Always focus_app FIRST, before screen_query. Once you have focused an app, screen_query returns only \
-that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a \
-coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it \
-hides the user's windows instead of doing what they asked.\n\n\
-Every input_action result carries a `verified` block — what ACTUALLY happened, measured from the \
-OS after the action: `cursor` is where the mouse really ended up, `focus` names the app and UI \
-element that now holds keyboard focus (its role, title, and current value), and for type-text \
-`textEntered` reports whether your text was really observed in the focused field. VALIDATE every \
-action against it before moving on: after a mouse-click, verified.clickedElement names the UI \
-element that was actually under the click (its role and title) — if it is not the thing you aimed \
-at (wrong title, role AXGroup instead of the link/button you wanted), the click landed off target: \
-screen_query again and re-aim at a better element. After clicking a text field, verified.focus should name that \
-field in the app you focused; after type-text, verified.textEntered should be true and \
-verified.focus.value should contain what you typed. If verified contradicts your intent — the \
-focused app is wrong, textEntered is false, the value is missing your text — the action landed in \
-the wrong place: call screen_query again, re-aim, and retry instead of continuing the sequence. \
-When the evidence shows your action landed in a DIFFERENT app than the one you focused, the tool \
-fails it for you (kind verification-failed) — treat that like any failed step: screen_query, \
-re-aim, retry.\n\n\
-Report tool results honestly, using the `verified` evidence: only claim an action worked when its \
-verified block confirms it. If a tool call returns an error, tell the user it failed and why — \
-never claim an action succeeded when the tool reported a failure.\n\n\
-EVALUATE THE GOAL before finishing: after the last action of any on-screen task, take_screenshot \
-(or screen_query) and CHECK the screen actually shows what the user asked for — the result state, \
-not just your last action's success. If focus_app reports visibleWindows 0, the app is frontmost \
-but the user sees NOTHING — open a window (key-press \"n\" with modifiers [\"cmd\"]) and verify \
-again, or say plainly that the app has no window open. Only declare the task done when the final \
-look confirms it; otherwise describe what you see and what is still missing. Your FINAL ANSWER \
-must summarize WHAT YOU FOUND — the actual content: item names, prices, ratings, key facts read \
-from the page (read_page before answering a find-task) — not a list of the steps you took; the \
-user watched the steps happen. Write answers in plain prose/markdown — never LaTeX math \
-notation ($$…$$); this is a chat overlay, not a paper. take_screenshot does \
-NOT save a file unless you pass save: true (Desktop by default, `directory` for a user-named \
-folder) — when the user asks to save a screenshot pass save: true and quote the exact saved path \
-from the result; never claim a screenshot was saved anywhere else.\n\n\
-You also have find_programs (search what is installed on this machine — GUI apps and terminal \
-tools) and run_command (run one shell command; the user approves each one). For simple machine \
-facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk space (`df -h`), \
-battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. \
-Check find_programs before claiming an app or tool is or is not installed, and before running a \
-CLI tool you are not sure exists.\n\n\
-CODING: read_file, list_dir, write_file and run_in_workspace work ANYWHERE on this machine. \
-Relative paths resolve against the ACTIVE working directory (named in your Environment); if \
-none is set, a folder chooser asks the user where to work — wait for their pick. list_dir \
-first to learn a layout, read_file before changing a file — never write over content you have \
-not read. write_file replaces the WHOLE file, so pass the complete new contents. Writes and \
-commands in a directory the user has not yet approved prompt them (approving \"this session\" \
-covers that directory); tmp (/tmp, the system temp dir) is ALWAYS writable with no prompt — \
-use it for scratch work. To compile, test, or run code, use run_in_workspace (never \
-run_command): output streams into the chat and timeoutSecs goes up to 600 for long builds — \
-after writing code, BUILD AND TEST it with run_in_workspace and report the real result. \
-There is NO persistent shell: every command starts fresh in the active working directory — a \
-bare `cd` does nothing and is refused; pass cwd for another folder. When a \
-result header names a directory in [brackets], that IS the directory you listed or read — \
-describe it as that path, never as a folder you merely intended to be in. \
-When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: \
-confirm it contains exactly the intended changes, then summarize them for the user. NEVER \
-git-commit or git-push changes unless the user explicitly asks you to.\n\n\
-You CAN recall the past: memory_search finds distilled memories of the user's activity and \
-earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. \
-When the user asks what they said, asked, or discussed before (\"what recipes have I asked \
-about?\"), call chat_history_search with a short keyword (e.g. \"recipe\") and answer from the \
-matches — never claim you have no access to past conversations without searching first. When \
-the user asks you to REMEMBER something (\"remember that…\"), call remember with one concise \
-self-contained fact — never claim you cannot store information. The same applies to PERSONAL \
-FACTS: \"what is my name\", \"where do I work\", \"what do I like\" — memory_search FIRST (and \
-chat_history_search if memory finds nothing); only after both come back empty may you say you \
-do not know, and then offer to remember it.\n\n\
-CONTINUITY: follow-up questions usually refer to what you JUST did and what is on screen right \
-now. A page you opened earlier in this conversation is still open — \"this recipe\", \"the \
-ingredients\", \"read it to me\" mean THAT page. Answer by looking: focus_app the browser if \
-needed, then read_page for the page's full text (or screen_query/take_screenshot for layout). \
-Never claim you cannot see a page you opened — read it. The same goes for the TASK: a \
-follow-up that refines what you just did (\"now the PC version\", \"only ones under $50\", \
-\"sort by price\") means CONTINUE in the same app and page — refine the search there, use the \
-site's filters, read the results, answer. Never ask whether the user wants you to \"actually \
-search\" — they just asked; act.\n\n\
-When the site you need is ALREADY open and shows its own search box, USE that search box — \
-click it, type the query, press return — instead of composing a parameterized URL by hand. \
-Hand-built query URLs are only for opening a NEW search-results page on a search engine.\n\
-When the browser is ALREADY focused with a visible window, navigate IN that window: key-press \
-[\"cmd\"]+\"t\" for a new tab, type-text the URL, key-press \"return\" — never run_command `open` \
-then, it can spawn a second window and split your view of the page. Use `open` only to launch or \
-reach a browser that has no window yet. Typed URLs follow the same grounding rules as opened ones.\n\
-To open a website or run a web search, prefer ONE run_command with `open` and the full URL — \
-e.g. `open \"https://www.google.com/search?q=lasagne+recipes\"` — the browser opens and loads it \
-directly, with no clicking or typing. NEVER invent specific page URLs (a recipe page, an article, \
-a product) — you do not know they exist, and opening several guessed URLs floods the user's \
-browser with dead tabs. When the user wants you to FIND something (\"find me a lasagne recipe\"), \
-open ONE search-results URL, screen_query the results, pick the best match, and click it — then \
-verify the page loaded before answering. At most one page beyond the search results per task: \
-invented URLs and extra opens are refused (ungrounded-url / too-many-opens) — when that happens, \
-CLICK results on the page you already have instead. Only drive the browser with screen_query/input_action \
-for interactions a URL cannot express (filling forms, pressing page buttons).\n\n\
-When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed`, or any error — \
-the action DID NOT HAPPEN. Tell the user exactly what you completed, what failed, and why \
-(e.g. \"I opened Chrome, but input control is disabled so I could not type the search\"). NEVER \
-describe an outcome you did not verify from a successful tool result: claiming an unperformed \
-action happened is the worst possible answer.";
+/// The lane-independent core of the agent contract (2026-08-17 prompt
+/// split): tool mechanics, grounding, verified-honesty, recall,
+/// continuity, refusal honesty. Browsing and coding doctrine ride only
+/// the lanes that need them — a 9B follows a short prompt with no
+/// internal tensions far better than one wall of imperatives.
+pub const HID_SYSTEM_PROMPT_CORE: &str = r#"You can control this computer for the user with tools: focus_app (open an app or bring it to the front — it launches the app if it is not running), screen_query (read the text on screen with each item's exact pixel coordinates), and input_action (move/click the mouse, type text, press a key).
+
+To operate any app, follow this order every time:
+1. Call focus_app with the app name (e.g. "Google Chrome") to open it / bring it to the front.
+2. Call screen_query to see what is on screen and get the real pixel coordinates of the element you want. Each element carries cx,cy — its exact centre, precomputed for you. That pair IS the click target; never do your own arithmetic on x/width. Elements with a role (AXButton, AXLink, AXTextField, …) are the app's real controls with exact frames — prefer them over plain text when both match what you want to click.
+3. To click a target, call input_action with action "mouse-click" and pass that element's cx as x and cy as y verbatim — the click moves to that point and clicks it in one step.
+4. Use action "type-text" or "key-press" to enter text. Typing goes into whatever you last clicked, so ALWAYS mouse-click the exact field you want to fill before you type.
+
+More vocabulary: mouse-click with clicks 2 double-clicks (open a file, select a word) and clicks 3 selects a whole line; mouse-drag (fromX,fromY -> toX,toY) selects text ranges and drags things — both endpoints are cx,cy pairs from screen_query; scroll with deltaY (positive = further down the page) reaches content that is off screen — scroll then screen_query again to read what appeared; key-press with modifiers gives shortcuts: ["cmd"]+"a" select all, ["cmd"]+"c" copy, ["cmd"]+"v" paste. Prefer keyboard shortcuts over pixel work when both can do the job (cmd+a beats drag-selecting a whole document). For LONG text, clipboard write + click the field + cmd+v beats type-text; to extract text from an app: select it, cmd+c, clipboard read. After opening an app or triggering an animation, call wait (default 500ms) before the next screen_query instead of retrying a stale read.
+
+Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click or move to a coordinate you did not read from screen_query will be refused. After you focus_app the screen changes, so call screen_query again before you click.
+
+Always focus_app FIRST, before screen_query. Once you have focused an app, screen_query returns only that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it hides the user's windows instead of doing what they asked.
+
+Every input_action result carries a `verified` block — what ACTUALLY happened, measured from the OS after the action: `cursor` is where the mouse really ended up, `focus` names the app and UI element that now holds keyboard focus (its role, title, and current value), and for type-text `textEntered` reports whether your text was really observed in the focused field. VALIDATE every action against it before moving on: after a mouse-click, verified.clickedElement names the UI element that was actually under the click (its role and title) — if it is not the thing you aimed at (wrong title, role AXGroup instead of the link/button you wanted), the click landed off target: screen_query again and re-aim at a better element. After clicking a text field, verified.focus should name that field in the app you focused; after type-text, verified.textEntered should be true and verified.focus.value should contain what you typed. If verified contradicts your intent — the focused app is wrong, textEntered is false, the value is missing your text — the action landed in the wrong place: call screen_query again, re-aim, and retry instead of continuing the sequence. When the evidence shows your action landed in a DIFFERENT app than the one you focused, the tool fails it for you (kind verification-failed) — treat that like any failed step: screen_query, re-aim, retry.
+
+Report tool results honestly, using the `verified` evidence: only claim an action worked when its verified block confirms it. If a tool call returns an error, tell the user it failed and why — never claim an action succeeded when the tool reported a failure.
+
+EVALUATE THE GOAL before finishing: after the last action of any on-screen task, take_screenshot (or screen_query) and CHECK the screen actually shows what the user asked for — the result state, not just your last action's success. If focus_app reports visibleWindows 0, the app is frontmost but the user sees NOTHING — open a window (key-press "n" with modifiers ["cmd"]) and verify again, or say plainly that the app has no window open. Only declare the task done when the final look confirms it; otherwise describe what you see and what is still missing. Your FINAL ANSWER must summarize WHAT YOU FOUND — the actual content: item names, prices, ratings, key facts read from the page (read_page before answering a find-task) — not a list of the steps you took; the user watched the steps happen. Write answers in plain prose/markdown — never LaTeX math notation ($$…$$); this is a chat overlay, not a paper. take_screenshot does NOT save a file unless you pass save: true (Desktop by default, `directory` for a user-named folder) — when the user asks to save a screenshot pass save: true and quote the exact saved path from the result; never claim a screenshot was saved anywhere else.
+
+You also have find_programs (search what is installed on this machine — GUI apps and terminal tools) and run_command (run one shell command; the user approves each one). For simple machine facts — the time (`date`), public IP (`curl -s ifconfig.me`), hostname, disk space (`df -h`), battery (`pmset -g batt`) — prefer ONE short read-only run_command over driving the screen. Check find_programs before claiming an app or tool is or is not installed, and before running a CLI tool you are not sure exists.
+
+You CAN recall the past: memory_search finds distilled memories of the user's activity and earlier conversations; chat_history_search finds the verbatim messages of past chat sessions. When the user asks what they said, asked, or discussed before ("what recipes have I asked about?"), call chat_history_search with a short keyword (e.g. "recipe") and answer from the matches — never claim you have no access to past conversations without searching first. When the user asks you to REMEMBER something ("remember that…"), call remember with one concise self-contained fact — never claim you cannot store information. The same applies to PERSONAL FACTS: "what is my name", "where do I work", "what do I like" — memory_search FIRST (and chat_history_search if memory finds nothing); only after both come back empty may you say you do not know, and then offer to remember it.
+
+CONTINUITY: follow-up questions usually refer to what you JUST did and what is on screen right now. A page you opened earlier in this conversation is still open — "this recipe", "the ingredients", "read it to me" mean THAT page. Answer by looking: focus_app the browser if needed, then read_page for the page's full text (or screen_query/take_screenshot for layout). Never claim you cannot see a page you opened — read it. The same goes for the TASK: a follow-up that refines what you just did ("now the PC version", "only ones under $50", "sort by price") means CONTINUE in the same app and page — refine the search there, use the site's filters, read the results, answer. Never ask whether the user wants you to "actually search" — they just asked; act.
+
+When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed`, or any error — the action DID NOT HAPPEN. Tell the user exactly what you completed, what failed, and why (e.g. "I opened Chrome, but input control is disabled so I could not type the search"). NEVER describe an outcome you did not verify from a successful tool result: claiming an unperformed action happened is the worst possible answer."#;
+
+/// The browsing playbook (thin + heavy lanes). One search doctrine —
+/// web_search — replacing the three competing strategies (hand-built
+/// URLs vs. on-page search box vs. address-bar typing) whose per-run
+/// coin flips were the ebay inconsistency (user report 2026-08-17).
+pub const HID_SYSTEM_PROMPT_BROWSING: &str = r#"WEB SEARCH — the ONE way to find things online: call web_search with the query, and site "ebay", "amazon", or "youtube" when the user wants that site (default google). It opens the results page and returns what is on screen with exact click coordinates: pick the best result, mouse-click its cx,cy, then read_page to extract the actual information before answering. NEVER compose search or product URLs by hand, never type URLs into the address bar, and never google another site's listings when web_search can search that site directly.
+Direct navigation is only for URLs the user gave you or that appeared in a page or tool result (run_command `open <url>`). READ the page that is already open (screen_query or read_page) before opening another one — opening page after page without reading is refused (too-many-opens); prefer clicking links on the open page over new navigations.
+When the browser already shows the site you need, work IN that window — click its controls, use its filters. A follow-up that refines a search ("only under $50", "now the PC version") means refine on the SAME site: another web_search there or the site's own filters."#;
+
+/// The coding contract (coder lane only).
+pub const HID_SYSTEM_PROMPT_CODING: &str = r#"CODING: read_file, list_dir, write_file and run_in_workspace work ANYWHERE on this machine. Relative paths resolve against the ACTIVE working directory (named in your Environment); if none is set, a folder chooser asks the user where to work — wait for their pick. list_dir first to learn a layout, read_file before changing a file — never write over content you have not read. write_file replaces the WHOLE file, so pass the complete new contents. Writes and commands in a directory the user has not yet approved prompt them (approving "this session" covers that directory); tmp (/tmp, the system temp dir) is ALWAYS writable with no prompt — use it for scratch work. To compile, test, or run code, use run_in_workspace (never run_command): output streams into the chat and timeoutSecs goes up to 600 for long builds — after writing code, BUILD AND TEST it with run_in_workspace and report the real result. There is NO persistent shell: every command starts fresh in the active working directory — a bare `cd` does nothing and is refused; pass cwd for another folder. When a result header names a directory in [brackets], that IS the directory you listed or read — describe it as that path, never as a folder you merely intended to be in. When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: confirm it contains exactly the intended changes, then summarize them for the user. NEVER git-commit or git-push changes unless the user explicitly asks you to."#;
+
+/// Assemble the system prompt for one routed lane: coder runs carry the
+/// coding contract and no browsing doctrine; every other lane carries the
+/// browsing playbook and no coding contract. The full concatenation stays
+/// available as [`struct@HID_SYSTEM_PROMPT`] for the prompt-contract evals.
+pub fn system_prompt_for_lane(lane: &str) -> String {
+    let section = if lane == "coder" {
+        HID_SYSTEM_PROMPT_CODING
+    } else {
+        HID_SYSTEM_PROMPT_BROWSING
+    };
+    format!("{HID_SYSTEM_PROMPT_CORE}\n\n{section}")
+}
+
+/// Every clause in one string — the prompt-contract eval surface (each
+/// load-bearing clause is pinned there regardless of which lane carries it).
+pub static HID_SYSTEM_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{HID_SYSTEM_PROMPT_CORE}\n\n{HID_SYSTEM_PROMPT_BROWSING}\n\n{HID_SYSTEM_PROMPT_CODING}"
+    )
+});
 
 /// The typed failure kind the [`ApprovalGate`] returns when the model tries to
 /// aim the mouse at coordinates it never obtained from [`SCREEN_QUERY_TOOL`].
@@ -540,7 +475,7 @@ pub struct ToolOutcome {
 
 impl ToolOutcome {
     /// A plain successful outcome: `content` rides to the model verbatim.
-    pub(crate) fn success(content: impl Into<String>) -> Self {
+    pub fn success(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             ok: true,
@@ -553,7 +488,7 @@ impl ToolOutcome {
 
     /// A typed failure: the model sees `{"error": detail}` (so it can
     /// recover or answer without the tool), the UI sees the kind.
-    pub(crate) fn failure(kind: &str, detail: impl Into<String>) -> Self {
+    pub fn failure(kind: &str, detail: impl Into<String>) -> Self {
         let detail = detail.into();
         Self {
             content: serde_json::json!({ "error": detail }).to_string(),
@@ -807,6 +742,11 @@ pub struct UrlGroundingExecutor {
     seen: Arc<UrlSeen>,
     /// Successful `open <url>` navigations this run — the tab-flood brake.
     opens: std::sync::atomic::AtomicUsize,
+    /// Whether the model has READ a page (screen_query / read_page /
+    /// web_search) since its last navigation — the progress rule
+    /// (2026-08-17): reading earns another open, so multi-hop research is
+    /// unbounded while blind tab-flooding still stops at the budget.
+    read_since_open: std::sync::atomic::AtomicBool,
 }
 
 /// Browser navigations allowed per run: the search page plus one more.
@@ -823,6 +763,7 @@ impl UrlGroundingExecutor {
             inner,
             seen,
             opens: std::sync::atomic::AtomicUsize::new(0),
+            read_since_open: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
@@ -881,32 +822,225 @@ impl ToolExecutor for UrlGroundingExecutor {
                         ),
                     );
                 }
-                // The tab-flood brake: past the budget, no more navigations
-                // this run — grounded or not.
-                if self.opens.load(std::sync::atomic::Ordering::SeqCst) >= MAX_OPENS_PER_RUN {
-                    log::warn!("llm: run_command refused — open budget exhausted ({url:?})");
+                // The progress rule (2026-08-17, replacing the fixed cap's
+                // premature quitting): past the free budget, another open
+                // is EARNED by reading the page you already have — blind
+                // open-after-open still stops.
+                let past_budget =
+                    self.opens.load(std::sync::atomic::Ordering::SeqCst) >= MAX_OPENS_PER_RUN;
+                if past_budget
+                    && !self
+                        .read_since_open
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    log::warn!("llm: run_command refused — unread page open ({url:?})");
                     return ToolOutcome::failure(
                         TOO_MANY_OPENS_KIND,
-                        format!(
-                            "you have already opened {MAX_OPENS_PER_RUN} pages this run — do not \
-                             open more tabs. Work with what is open: focus_app the browser, \
-                             read_page or screen_query it, and CLICK links on the page instead \
-                             of opening new URLs."
-                        ),
+                        "you opened a page and have not read it — screen_query or read_page \
+                         the page that is open (and click its links) before navigating \
+                         anywhere else."
+                            .to_string(),
                     );
                 }
                 let outcome = self.inner.execute(call).await;
                 if outcome.ok {
                     self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.read_since_open
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 self.seen.harvest(&outcome.content);
                 return outcome;
             }
         }
         let outcome = self.inner.execute(call).await;
+        // A successful read earns the next navigation (progress rule); a
+        // web_search both opened and read, so it satisfies itself.
+        if outcome.ok
+            && matches!(
+                call.name.as_str(),
+                SCREEN_QUERY_TOOL | READ_PAGE_TOOL | WEB_SEARCH_TOOL
+            )
+        {
+            self.read_since_open
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // Everything the model just read is now legitimately navigable.
         self.seen.harvest(&outcome.content);
         outcome
+    }
+}
+
+/// One-call web/site search (2026-08-17 consistency work): the model's
+/// riskiest freeform sequence — compose a URL vs. find the search box vs.
+/// type into the address bar — collapsed into deterministic code. The URL
+/// comes from a TEMPLATE (never the model's imagination), the page opens,
+/// and after a settle pause the same screen harvest as `screen_query`
+/// returns the results with grounded click coordinates. The cx/cy pattern,
+/// applied to search.
+pub struct WebSearchTool {
+    screen: ScreenQueryTool,
+    url_seen: Arc<UrlSeen>,
+    opener: Arc<dyn Opener>,
+}
+
+pub const WEB_SEARCH_TOOL: &str = "web_search";
+
+/// How long the results page gets to render before the screen harvest.
+const WEB_SEARCH_SETTLE_MS: u64 = 2500;
+
+/// Browser-open seam so tests never launch a real browser.
+#[async_trait]
+pub trait Opener: Send + Sync {
+    async fn open(&self, url: &str) -> Result<(), String>;
+}
+
+/// Production opener: macOS `open` — the default browser takes the URL.
+pub struct SystemOpener;
+
+#[async_trait]
+impl Opener for SystemOpener {
+    async fn open(&self, url: &str) -> Result<(), String> {
+        let status = tokio::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+            .await
+            .map_err(|e| format!("could not run open: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("open exited {status}"))
+        }
+    }
+}
+
+/// The search-results URL for one engine/site — templates live HERE, in
+/// code, so every run builds the identical URL for the identical ask.
+pub fn search_url(site: &str, query: &str) -> String {
+    let encoded = url_encode_query(query);
+    match site {
+        "ebay" => format!("https://www.ebay.com/sch/i.html?_nkw={encoded}"),
+        "amazon" => format!("https://www.amazon.com/s?k={encoded}"),
+        "youtube" => format!("https://www.youtube.com/results?search_query={encoded}"),
+        _ => format!("https://www.google.com/search?q={encoded}"),
+    }
+}
+
+/// Minimal query percent-encoding (space → `+`, unreserved kept, the rest
+/// `%XX`) — dependency-free and stable.
+pub fn url_encode_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for byte in query.trim().bytes() {
+        match byte {
+            b' ' => out.push('+'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+impl WebSearchTool {
+    pub fn new(screen: ScreenQueryTool, url_seen: Arc<UrlSeen>, opener: Arc<dyn Opener>) -> Self {
+        Self {
+            screen,
+            url_seen,
+            opener,
+        }
+    }
+
+    pub fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: WEB_SEARCH_TOOL.into(),
+            description: "Search the web — or a specific site — in ONE call: opens the \
+                          results page in the browser and returns what is on screen with \
+                          exact click coordinates (cx,cy). THE way to find anything online: \
+                          never build search URLs by hand or type into the address bar. \
+                          Then mouse-click the best result and read_page it."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search words, e.g. \"half life 2\"."
+                    },
+                    "site": {
+                        "type": "string",
+                        "enum": ["google", "ebay", "amazon", "youtube"],
+                        "description": "Where to search (default google). Use the site the user named — searching ebay searches EBAY's listings directly."
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for WebSearchTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    fn claims(&self, name: &str) -> bool {
+        name == WEB_SEARCH_TOOL
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return ToolOutcome::failure(
+                    "invalid-arguments",
+                    format!("invalid {WEB_SEARCH_TOOL} arguments: {e}"),
+                )
+            }
+        };
+        let query = args
+            .get("query")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return ToolOutcome::failure("invalid-arguments", "query must not be empty");
+        }
+        let site = args
+            .get("site")
+            .and_then(|s| s.as_str())
+            .unwrap_or("google")
+            .to_lowercase();
+        let url = search_url(&site, &query);
+        // The templated URL is by construction legitimate navigation.
+        self.url_seen.harvest(&url);
+        if let Err(e) = self.opener.open(&url).await {
+            return ToolOutcome::failure("open-failed", format!("could not open {url}: {e}"));
+        }
+        log::info!("llm: web_search site={site} url={url}");
+        tokio::time::sleep(std::time::Duration::from_millis(WEB_SEARCH_SETTLE_MS)).await;
+        // The same harvest as screen_query: results with grounded cx/cy.
+        let screen_call = ToolCall {
+            id: call.id.clone(),
+            name: SCREEN_QUERY_TOOL.into(),
+            arguments: "{}".into(),
+        };
+        let screen = self.screen.execute(&screen_call).await;
+        if !screen.ok {
+            return ToolOutcome::failure(
+                "screen-read-failed",
+                format!(
+                    "opened {url}, but reading the results screen failed: {}",
+                    screen.content
+                ),
+            );
+        }
+        ToolOutcome::success(format!(
+            "Opened the {site} search results for \"{query}\" ({url}). What is on screen now \
+             (click a result via its cx,cy, then read_page):\n{}",
+            screen.content
+        ))
     }
 }
 

@@ -39,7 +39,7 @@ use super::router::{ModelInfo, ModelRouter, HEAVY_LANE, THIN_LANE};
 use super::toolloop::{
     run_tool_loop_with_stop, ApprovalGate, ApprovalPrompt, ApprovalVerdict, CompositeExecutor,
     FocusAppTool, FocusedApp, InputTool, LoopOutcome, MemorySearchTool, ScreenQueryTool,
-    ScreenSeen, ToolEvent, ToolExecutor, HID_SYSTEM_PROMPT, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
+    ScreenSeen, ToolEvent, ToolExecutor, TOOL_CALL_EVENT, TOOL_RESULT_EVENT,
 };
 use super::{skills, ChatMessage, LlmClient, LlmError, LlmHealth, Role};
 
@@ -861,6 +861,7 @@ pub async fn chat(
     // (sticky once escalated); manual mode keeps the router's pinned active
     // lane. Either way the REAL routed lane is broadcast — the footer never
     // guesses.
+    let routed_lane: String;
     let client: Arc<dyn LlmClient> = if state.auto_route() {
         let ask = messages
             .iter()
@@ -870,6 +871,7 @@ pub async fn chat(
             .unwrap_or("");
         let locked = state.auto_locked();
         let lane = crate::llm::routing::select_lane(ask, locked.as_deref());
+        routed_lane = lane.to_string();
         if crate::llm::routing::locks_conversation(lane) {
             state.lock_auto_lane(lane);
         }
@@ -886,6 +888,7 @@ pub async fn chat(
         }
     } else {
         let info = state.router.info();
+        routed_lane = info.active_lane.clone();
         broadcast_routed(&app, id, &info.active_lane, "");
         state.router.clone()
     };
@@ -1015,6 +1018,15 @@ pub async fn chat(
         let input_state = task_app.state::<crate::input::commands::InputState>();
         let screen_state = task_app.state::<crate::screenquery::commands::ScreenQueryState>();
         let appfocus_state = task_app.state::<crate::appfocus::commands::AppFocusState>();
+        // URL grounding seen-set (2026-07-27, one-shot fix made structural):
+        // seeded from the USER's words; created HERE so web_search can mark
+        // its templated URLs and the grounding wrapper below shares it.
+        let url_seen = std::sync::Arc::new(crate::llm::toolloop::UrlSeen::new());
+        for m in &messages {
+            if m.role == Role::User {
+                url_seen.harvest(&m.content);
+            }
+        }
         let mut executors: Vec<Box<dyn ToolExecutor>> = Vec::new();
         match memory.store() {
             Some(store) => {
@@ -1101,8 +1113,16 @@ pub async fn chat(
         )));
         executors.push(Box::new(ScreenQueryTool::new(
             screen_state.backend(),
-            screen_seen,
+            screen_seen.clone(),
             focused_app.clone(),
+        )));
+        // One-call site search (2026-08-17 consistency work): the templated
+        // URL opens and the screen harvest returns grounded results — the
+        // model's three competing search doctrines collapsed into code.
+        executors.push(Box::new(crate::llm::toolloop::WebSearchTool::new(
+            ScreenQueryTool::new(screen_state.backend(), screen_seen, focused_app.clone()),
+            url_seen.clone(),
+            std::sync::Arc::new(crate::llm::toolloop::SystemOpener),
         )));
         // Page-text continuity (2026-07-27): read the focused app's full
         // content so follow-ups about an open page are answered by reading
@@ -1265,15 +1285,6 @@ pub async fn chat(
                 offered.join(", ")
             );
         }
-        // URL grounding + tab budget (2026-07-27, the one-shot fix made
-        // structural): seed the seen-set from the USER's words; tool results
-        // feed it as they land inside the wrapper.
-        let url_seen = std::sync::Arc::new(crate::llm::toolloop::UrlSeen::new());
-        for m in &messages {
-            if m.role == Role::User {
-                url_seen.harvest(&m.content);
-            }
-        }
         let executor = crate::llm::toolloop::UrlGroundingExecutor::new(executor, url_seen);
         // Chat-ingest capture (M008 S01): the ask is the last user turn,
         // cloned NOW — `messages` gains system-turn inserts below and then
@@ -1290,8 +1301,14 @@ pub async fn chat(
         // and must not be clobbered. Prepended so it leads the conversation.
         let mut messages = messages;
         if !messages.iter().any(|m| m.role == Role::System) {
-            messages.insert(0, ChatMessage::system(HID_SYSTEM_PROMPT));
-            log::debug!("llm: request {id} grounded with HID orchestration system prompt");
+            // Lane-assembled prompt (2026-08-17 consistency work): coder
+            // runs carry the coding contract, everything else the browsing
+            // playbook — never both, never the old three-doctrine wall.
+            messages.insert(
+                0,
+                ChatMessage::system(crate::llm::toolloop::system_prompt_for_lane(&routed_lane)),
+            );
+            log::debug!("llm: request {id} grounded with the {routed_lane} lane system prompt");
         }
         // Ground continuation in FACT (2026-08-01): follow-ups like "now
         // find the PC listing" mean "continue in the app I watched you

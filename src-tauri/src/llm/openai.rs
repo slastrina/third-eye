@@ -34,6 +34,11 @@ use super::{ChatRequest, LlmClient, LlmError, LlmHealth, ReasoningSink, StreamOu
 /// S05) nor the `THIRD_EYE_ENDPOINT` env var names one.
 pub const DEFAULT_ENDPOINT: &str = "http://localhost:1234";
 
+/// Sampling temperature for every request this app makes. Agents reward
+/// determinism; 0.2 keeps enough freedom to break ties without the
+/// doctrine-flipping variance of model defaults (~0.7–0.8).
+pub const AGENT_TEMPERATURE: f64 = 0.2;
+
 /// Failing fast on an unreachable endpoint is what turns "offline" into a
 /// banner instead of a hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -173,6 +178,11 @@ impl OpenAiClient {
         let mut body = serde_json::json!({
             "messages": request.messages,
             "stream": true,
+            // Agent determinism (2026-08-17): an agent making 15–20
+            // sequential decisions per task cannot afford default-sampling
+            // variance — at ~0.8 the per-run doctrine coin flips WERE the
+            // reported inconsistency. Low, not zero: ties still break.
+            "temperature": AGENT_TEMPERATURE,
             // Real token accounting (2026-08-03): the server appends a
             // final usage chunk; servers that ignore the option just
             // stream as before.
@@ -1108,6 +1118,10 @@ mod tests {
         assert!(
             body.contains("include_usage"),
             "requests must opt into usage reporting: {body}"
+        );
+        assert!(
+            body.contains("\"temperature\":0.2"),
+            "requests must pin the agent temperature: {body}"
         );
     }
 

@@ -44,6 +44,11 @@ pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
         "Capture the screen to look at it; saves only when asked",
     ),
     (
+        crate::llm::toolloop::WEB_SEARCH_TOOL,
+        "Web search",
+        "One-call web/site search that returns clickable results",
+    ),
+    (
         crate::llm::toolloop::READ_PAGE_TOOL,
         "Read page",
         "Read the focused window's full text (recipes, articles)",

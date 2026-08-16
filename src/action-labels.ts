@@ -92,6 +92,16 @@ export function describeCall(name: string, rawArguments: string): {
     return { label: "look at the screen", input: false, target: null };
   }
   if (name === "screen_query") return { label: "read the screen", input: false, target: null };
+  if (name === "web_search") {
+    const query = typeof args.query === "string" ? args.query : "";
+    const site = typeof args.site === "string" ? args.site : "";
+    const where = site && site !== "google" ? ` on ${site}` : "";
+    return {
+      label: query ? `search${where} · “${query}”` : "search the web",
+      input: false,
+      target: null,
+    };
+  }
   if (name === "read_page") return { label: "read the page", input: false, target: null };
   if (name === "memory_search") {
     const query = typeof args.query === "string" ? args.query : "";

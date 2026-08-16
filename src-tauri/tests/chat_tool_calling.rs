@@ -1005,7 +1005,7 @@ async fn live_small_model_follows_targeting_discipline() {
         &client,
         &executor,
         vec![
-            ChatMessage::system(HID_SYSTEM_PROMPT),
+            ChatMessage::system(HID_SYSTEM_PROMPT.as_str()),
             ChatMessage::user("Click the Google Chrome address bar so I can type a new URL."),
         ],
         1,
