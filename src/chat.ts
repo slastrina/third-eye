@@ -317,6 +317,24 @@ export function onVerboseStatus(cb: (status: VerboseStatus) => void): Promise<Un
   return listen<VerboseStatus>(VERBOSE_STATUS_EVENT, (e) => cb(e.payload));
 }
 
+/** Teach Me mode (2026-08-18): human-way keyboard/mouse only, narrated,
+ *  ending in a do-it-yourself recap — the shortcut tools are structurally
+ *  stripped backend-side. Same status shape as verbose. Keep in sync with
+ *  TEACH_MODE_EVENT in Rust. */
+export const TEACH_MODE_EVENT = "settings://teach-mode";
+
+export function teachMode(): Promise<VerboseStatus> {
+  return invoke<VerboseStatus>("teach_mode");
+}
+
+export function setTeachMode(enable: boolean): Promise<VerboseStatus> {
+  return invoke<VerboseStatus>("set_teach_mode", { enable });
+}
+
+export function onTeachMode(cb: (status: VerboseStatus) => void): Promise<UnlistenFn> {
+  return listen<VerboseStatus>(TEACH_MODE_EVENT, (e) => cb(e.payload));
+}
+
 /** One served model with LM Studio's native detail — serde camelCase of
  *  Rust's LmModelRow (empty list when the endpoint is not LM Studio). */
 export interface LmModelRow {

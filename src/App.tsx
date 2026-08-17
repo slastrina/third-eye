@@ -38,6 +38,9 @@ import {
   setWorkspaceRoots,
   onVerboseStatus,
   verboseStatus,
+  teachMode,
+  setTeachMode,
+  onTeachMode,
   phaseStatusLine,
   formatTokens,
   onHidApprovalRequest,
@@ -350,6 +353,7 @@ function App() {
       onLlmPhase((payload) => dispatchChat({ type: "phase", payload })),
       // Verbose-mode toggle applies live from the Settings window.
       onVerboseStatus((status) => setVerbose(status.enabled)),
+      onTeachMode((status) => setTeach(status.enabled)),
       // Workspace chip stays truthful across Settings/CLI/Finder changes.
       onWorkspaceRoots((status) => setWsRoots(status.roots)),
       // Bridge v2 (spec 2026-08-02 N3): a CLI/Finder show-overlay may
@@ -1109,6 +1113,7 @@ function App() {
 
   const [routedLane, setRoutedLane] = useState<string | null>(null);
   const [verbose, setVerbose] = useState(false);
+  const [teach, setTeach] = useState(false);
   const [wsRoots, setWsRoots] = useState<string[]>([]);
   // Attach-context row (2026-08-02 redesign): picked text files ride the
   // next message as fenced context blocks; the menu also toggles capturing
@@ -1121,6 +1126,10 @@ function App() {
   useEffect(() => {
     verboseStatus().then(
       (status) => setVerbose(status.enabled),
+      () => undefined,
+    );
+    teachMode().then(
+      (status) => setTeach(status.enabled),
       () => undefined,
     );
     workspaceRoots().then(
@@ -1761,6 +1770,27 @@ function App() {
                   {lane.name}
                 </button>
               ))}
+              <button
+                type="button"
+                className="model-lane model-lane--teach"
+                data-teach-toggle
+                aria-pressed={teach}
+                title={
+                  teach
+                    ? "Teach Me is ON: visible keyboard & mouse only, narrated, with a do-it-yourself recap. Click for efficient mode."
+                    : "Teach Me mode: do tasks the human way — visible clicks and typing, no terminal shortcuts — and teach you the steps."
+                }
+                onClick={() => {
+                  const enable = !teach;
+                  setTeach(enable);
+                  setTeachMode(enable).then(
+                    (status) => setTeach(status.enabled),
+                    () => undefined,
+                  );
+                }}
+              >
+                🎓 teach
+              </button>
             </div>
             {(chat.sessionTokens.promptTokens > 0 ||
               chat.sessionTokens.completionTokens > 0) && (

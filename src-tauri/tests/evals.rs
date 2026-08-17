@@ -1473,8 +1473,8 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
     );
     // Lane assembly: coder runs carry no browsing doctrine and vice versa —
     // the split is the point, so pin it.
-    let coder = third_eye_lib::llm::toolloop::system_prompt_for_lane("coder");
-    let heavy = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy");
+    let coder = third_eye_lib::llm::toolloop::system_prompt_for_lane("coder", false);
+    let heavy = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy", false);
     assert!(
         coder.contains("BUILD AND TEST") && !coder.contains("web_search"),
         "coder prompt must carry coding, not browsing"
@@ -1487,6 +1487,36 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
         coder.contains("verified") && heavy.contains("verified"),
         "both lanes carry the core honesty contract"
     );
+    // Teach Me mode (2026-08-18): the human-way contract REPLACES the
+    // browsing playbook, the shortcut tools are named as stripped, and the
+    // lesson ends with a do-it-yourself recap. Coder runs ignore teach.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("TEACH ME MODE"),
+        "teach contract missing"
+    );
+    assert!(
+        HID_SYSTEM_PROMPT.contains("Do it yourself"),
+        "teach recap clause missing"
+    );
+    let teach = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy", true);
+    assert!(
+        teach.contains("TEACH ME MODE") && !teach.contains("call web_search"),
+        "teach prompt replaces the browsing playbook"
+    );
+    assert!(
+        third_eye_lib::llm::toolloop::system_prompt_for_lane("coder", true)
+            .contains("BUILD AND TEST"),
+        "coder lane keeps its contract regardless of teach"
+    );
+    for tool in ["run_command", "web_search", "run_in_workspace"] {
+        assert!(
+            third_eye_lib::llm::toolloop::teach_mode_strips(tool),
+            "{tool} must be stripped in teach mode"
+        );
+    }
+    assert!(!third_eye_lib::llm::toolloop::teach_mode_strips(
+        "input_action"
+    ));
     // Coding workflow (S3): read-before-write, whole-file writes, and the
     // no-workspace path points at Settings instead of run_command tricks.
     assert!(

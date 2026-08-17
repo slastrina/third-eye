@@ -141,24 +141,41 @@ When the browser already shows the site you need, work IN that window — click 
 /// The coding contract (coder lane only).
 pub const HID_SYSTEM_PROMPT_CODING: &str = r#"CODING: read_file, list_dir, write_file and run_in_workspace work ANYWHERE on this machine. Relative paths resolve against the ACTIVE working directory (named in your Environment); if none is set, a folder chooser asks the user where to work — wait for their pick. list_dir first to learn a layout, read_file before changing a file — never write over content you have not read. write_file replaces the WHOLE file, so pass the complete new contents. Writes and commands in a directory the user has not yet approved prompt them (approving "this session" covers that directory); tmp (/tmp, the system temp dir) is ALWAYS writable with no prompt — use it for scratch work. To compile, test, or run code, use run_in_workspace (never run_command): output streams into the chat and timeoutSecs goes up to 600 for long builds — after writing code, BUILD AND TEST it with run_in_workspace and report the real result. There is NO persistent shell: every command starts fresh in the active working directory — a bare `cd` does nothing and is refused; pass cwd for another folder. When a result header names a directory in [brackets], that IS the directory you listed or read — describe it as that path, never as a folder you merely intended to be in. When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: confirm it contains exactly the intended changes, then summarize them for the user. NEVER git-commit or git-push changes unless the user explicitly asks you to."#;
 
-/// Assemble the system prompt for one routed lane: coder runs carry the
-/// coding contract and no browsing doctrine; every other lane carries the
-/// browsing playbook and no coding contract. The full concatenation stays
-/// available as [`struct@HID_SYSTEM_PROMPT`] for the prompt-contract evals.
-pub fn system_prompt_for_lane(lane: &str) -> String {
+/// Teach Me mode (user request 2026-08-18): the Wolfram-Alpha "show the
+/// proof" of computer use. Replaces the browsing playbook — the efficient
+/// shortcuts it teaches are structurally stripped in this mode.
+pub const HID_SYSTEM_PROMPT_TEACH: &str = r#"TEACH ME MODE is ON: the user wants to LEARN how to do this themselves — show the human way, not just the result. Work exactly like a person at the keyboard: visible clicks, typing, and standard keyboard shortcuts only. The terminal and one-shot search shortcuts are unavailable on purpose — do not mention wanting them.
+NARRATE as you go: before each action, one short line saying what you are doing and why ("Opening Chrome", "Clicking the search box", "Pressing cmd+t for a new tab"). To search the web the human way: focus the browser, key-press "t" with ["cmd"] for a new tab, click the address bar if needed, type-text the search words, key-press "return" — then read the results on screen like a person would.
+FINISH with a numbered "Do it yourself" recap: the exact steps — app names, what to click, what to type, which shortcuts — so the user can repeat the whole task without you."#;
+
+/// Assemble the system prompt for one routed lane + mode: coder runs carry
+/// the coding contract; teach-mode runs carry the human-way teaching
+/// contract instead of the browsing playbook; everything else browses. The
+/// full concatenation stays available as [`struct@HID_SYSTEM_PROMPT`] for
+/// the prompt-contract evals.
+pub fn system_prompt_for_lane(lane: &str, teach: bool) -> String {
     let section = if lane == "coder" {
         HID_SYSTEM_PROMPT_CODING
+    } else if teach {
+        HID_SYSTEM_PROMPT_TEACH
     } else {
         HID_SYSTEM_PROMPT_BROWSING
     };
     format!("{HID_SYSTEM_PROMPT_CORE}\n\n{section}")
 }
 
+/// The tools Teach Me mode structurally REMOVES: the invisible shortcuts a
+/// human at the keyboard does not have. Pure — the assembly filter and the
+/// tests share it.
+pub fn teach_mode_strips(tool: &str) -> bool {
+    tool == "run_command" || tool == WEB_SEARCH_TOOL || tool == "run_in_workspace"
+}
+
 /// Every clause in one string — the prompt-contract eval surface (each
 /// load-bearing clause is pinned there regardless of which lane carries it).
 pub static HID_SYSTEM_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "{HID_SYSTEM_PROMPT_CORE}\n\n{HID_SYSTEM_PROMPT_BROWSING}\n\n{HID_SYSTEM_PROMPT_CODING}"
+        "{HID_SYSTEM_PROMPT_CORE}\n\n{HID_SYSTEM_PROMPT_BROWSING}\n\n{HID_SYSTEM_PROMPT_CODING}\n\n{HID_SYSTEM_PROMPT_TEACH}"
     )
 });
 

@@ -313,6 +313,8 @@ pub fn run() {
             integrations::remove_finder_action,
             llm::commands::verbose_status,
             llm::commands::set_verbose_status,
+            llm::commands::teach_mode,
+            llm::commands::set_teach_mode,
             llm::commands::list_models_detailed,
             tool_toggles::tool_toggles_status,
             tool_toggles::set_tool_enabled,

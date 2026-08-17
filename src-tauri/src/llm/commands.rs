@@ -1027,6 +1027,14 @@ pub async fn chat(
                 url_seen.harvest(&m.content);
             }
         }
+        // Teach Me mode (2026-08-18): a HUMAN at the keyboard has no
+        // terminal and no one-shot search — those tools are structurally
+        // absent, so the model cannot take the shortcut it is meant to be
+        // teaching around. Coder-lane runs keep their build tools.
+        let teach_active = crate::config::load_teach_mode(&task_app) && routed_lane != "coder";
+        if teach_active {
+            log::info!("llm: request {id} runs in TEACH ME mode (human-way tools only)");
+        }
         let mut executors: Vec<Box<dyn ToolExecutor>> = Vec::new();
         match memory.store() {
             Some(store) => {
@@ -1119,11 +1127,14 @@ pub async fn chat(
         // One-call site search (2026-08-17 consistency work): the templated
         // URL opens and the screen harvest returns grounded results — the
         // model's three competing search doctrines collapsed into code.
-        executors.push(Box::new(crate::llm::toolloop::WebSearchTool::new(
-            ScreenQueryTool::new(screen_state.backend(), screen_seen, focused_app.clone()),
-            url_seen.clone(),
-            std::sync::Arc::new(crate::llm::toolloop::SystemOpener),
-        )));
+        // Teach mode strips it: searching is done the visible human way.
+        if !teach_active {
+            executors.push(Box::new(crate::llm::toolloop::WebSearchTool::new(
+                ScreenQueryTool::new(screen_state.backend(), screen_seen, focused_app.clone()),
+                url_seen.clone(),
+                std::sync::Arc::new(crate::llm::toolloop::SystemOpener),
+            )));
+        }
         // Page-text continuity (2026-07-27): read the focused app's full
         // content so follow-ups about an open page are answered by reading
         // it. Same backend seam and focus intent as screen_query.
@@ -1168,18 +1179,21 @@ pub async fn chat(
             // Workspace exec (coding-agent S4): cwd locked inside a root,
             // per-root session grants, live output over llm://terminal-chunk,
             // and the run's own Stop flag kills the process GROUP mid-build.
-            executors.push(Box::new(
-                crate::workspace::exec_tool::RunInWorkspaceTool::new(
-                    ws,
-                    approval.whitelist(),
-                    approver.clone(),
-                    stop.clone(),
-                    Arc::new(TauriTerminalSink {
-                        app: task_app.clone(),
-                        request_id: id,
-                    }),
-                ),
-            ));
+            // Teach mode strips it outside the coder lane.
+            if !teach_active {
+                executors.push(Box::new(
+                    crate::workspace::exec_tool::RunInWorkspaceTool::new(
+                        ws,
+                        approval.whitelist(),
+                        approver.clone(),
+                        stop.clone(),
+                        Arc::new(TauriTerminalSink {
+                            app: task_app.clone(),
+                            request_id: id,
+                        }),
+                    ),
+                ));
+            }
         }
         // Machine inventory (computer-control I1): read-only cache search, no
         // gate needed — it discloses what the filesystem scan already found.
@@ -1217,14 +1231,16 @@ pub async fn chat(
         )));
         // Wait (ungated): a bounded settle pause touches nothing.
         executors.push(Box::new(crate::clipboard_tool::WaitTool));
-        executors.push(Box::new(crate::command_runner::RunCommandTool::new(
-            task_app
-                .state::<Arc<crate::command_runner::CommandState>>()
-                .inner()
-                .clone(),
-            approval.whitelist(),
-            approver.clone(),
-        )));
+        if !teach_active {
+            executors.push(Box::new(crate::command_runner::RunCommandTool::new(
+                task_app
+                    .state::<Arc<crate::command_runner::CommandState>>()
+                    .inner()
+                    .clone(),
+                approval.whitelist(),
+                approver.clone(),
+            )));
+        }
         // External MCP tools (M007 S02): when an already-serving MCP client peer
         // has been injected for this run, mount an McpExecutor so the agent loop
         // SEES the server's tools — each namespaced under `mcp__` so a collision
@@ -1306,7 +1322,10 @@ pub async fn chat(
             // playbook — never both, never the old three-doctrine wall.
             messages.insert(
                 0,
-                ChatMessage::system(crate::llm::toolloop::system_prompt_for_lane(&routed_lane)),
+                ChatMessage::system(crate::llm::toolloop::system_prompt_for_lane(
+                    &routed_lane,
+                    teach_active,
+                )),
             );
             log::debug!("llm: request {id} grounded with the {routed_lane} lane system prompt");
         }
@@ -1862,6 +1881,42 @@ fn normalized_endpoint(raw: &str) -> Result<String, String> {
         )),
         Err(e) => Err(format!("\"{trimmed}\" is not a valid URL: {e}")),
     }
+}
+
+/// Teach-mode broadcast (2026-08-18): the footer toggle applies to every
+/// surface live. Payload: [`VerboseStatus`] (same shape: enabled+error).
+pub const TEACH_MODE_EVENT: &str = "settings://teach-mode";
+
+/// Read the persisted Teach Me toggle.
+#[tauri::command]
+pub fn teach_mode(app: AppHandle) -> VerboseStatus {
+    VerboseStatus {
+        enabled: crate::config::load_teach_mode(&app),
+        error: None,
+    }
+}
+
+/// Flip Teach Me mode: persist + broadcast. Applies to the NEXT run — the
+/// tool belt and prompt are assembled per request.
+#[tauri::command]
+pub fn set_teach_mode(app: AppHandle, enable: bool) -> VerboseStatus {
+    let status = match crate::config::save_teach_mode(&app, enable) {
+        Ok(()) => VerboseStatus {
+            enabled: enable,
+            error: None,
+        },
+        Err(e) => {
+            log::error!("llm: {e}");
+            VerboseStatus {
+                enabled: crate::config::load_teach_mode(&app),
+                error: Some(e),
+            }
+        }
+    };
+    if let Err(e) = app.emit(TEACH_MODE_EVENT, status.clone()) {
+        log::warn!("llm: {TEACH_MODE_EVENT} emit failed: {e}");
+    }
+    status
 }
 
 /// Verbose-status broadcast (2026-08-02): toggling in Settings applies to

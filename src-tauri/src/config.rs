@@ -1620,6 +1620,37 @@ pub fn save_verbose_status(app: &AppHandle, enabled: bool) -> Result<(), String>
     Ok(())
 }
 
+/// Store key for Teach Me mode (2026-08-18): when true, runs work the
+/// way a HUMAN would — visible keyboard/mouse only, the terminal and
+/// one-shot search shortcuts structurally removed — and narrate so the
+/// user learns the steps. Default off ("efficient": anything goes).
+pub const TEACH_MODE_KEY: &str = "teachMode";
+
+/// Read the persisted Teach Me toggle; absent/garbage → off.
+pub fn load_teach_mode(app: &AppHandle) -> bool {
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        return false;
+    };
+    matches!(
+        store.get(TEACH_MODE_KEY),
+        Some(serde_json::Value::Bool(true))
+    )
+}
+
+/// Persist the Teach Me toggle. The error names the failed path.
+pub fn save_teach_mode(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = store_path(app);
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("failed to open settings store at {path}: {e}"))?;
+    store.set(TEACH_MODE_KEY, serde_json::json!(enabled));
+    store
+        .save()
+        .map_err(|e| format!("failed to persist {TEACH_MODE_KEY}={enabled} to {path}: {e}"))?;
+    log::info!("config: persisted {TEACH_MODE_KEY}={enabled} to {path}");
+    Ok(())
+}
+
 pub fn load_commands_enabled(app: &AppHandle) -> Option<bool> {
     let store = match app.store(SETTINGS_STORE) {
         Ok(store) => store,

@@ -1476,6 +1476,11 @@ body,
   max-width: 160px;
 }
 
+.model-lane--teach[aria-pressed="true"] {
+  border-color: var(--te-amber-border);
+  color: var(--te-amber);
+}
+
 .chat-usage {
   display: inline-block;
   margin-top: 2px;
