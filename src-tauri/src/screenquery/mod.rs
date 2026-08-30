@@ -164,6 +164,17 @@ impl std::error::Error for ScreenQueryError {}
 pub trait ScreenQuery: Send + Sync {
     async fn query(&self) -> Result<Vec<ScreenElement>, ScreenQueryError>;
 
+    /// `query`, reading only `window_of`'s front window when the backend
+    /// can (the 2026-08-30 fast path); `None` reads the whole screen.
+    /// Backends without window scoping (fallback, mocks) answer `query`.
+    async fn query_scoped(
+        &self,
+        window_of: Option<&str>,
+    ) -> Result<Vec<ScreenElement>, ScreenQueryError> {
+        let _ = window_of;
+        self.query().await
+    }
+
     /// The focused app's interactive elements from its accessibility tree —
     /// real buttons/links/fields with exact point frames. Best-effort and
     /// additive: backends without an AX walk (fallback, mocks) return empty

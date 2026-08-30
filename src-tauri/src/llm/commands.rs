@@ -1301,7 +1301,8 @@ pub async fn chat(
                 offered.join(", ")
             );
         }
-        let executor = crate::llm::toolloop::UrlGroundingExecutor::new(executor, url_seen);
+        let executor = crate::llm::toolloop::UrlGroundingExecutor::new(executor, url_seen)
+            .with_opener(std::sync::Arc::new(crate::llm::toolloop::SystemOpener));
         // Chat-ingest capture (M008 S01): the ask is the last user turn,
         // cloned NOW — `messages` gains system-turn inserts below and then
         // moves into the loop, and `LoopOutcome` does not return it.
@@ -1342,6 +1343,19 @@ pub async fn chat(
                 system.content.push_str(&format!(
                     "\n\nEnvironment: the frontmost app right now is {front}. If this \
                      conversation was already working in it, follow-up requests continue THERE."
+                ));
+            }
+        }
+        // The page that is ALREADY open (2026-08-30): "do more on that page"
+        // must act on the tab showing it, not open it again. Chrome's front
+        // tab (title + URL) rides the same environment line; never launches
+        // Chrome, bounded readback.
+        if let Some((title, url)) = crate::browser::front_tab().await {
+            if let Some(system) = messages.iter_mut().find(|m| m.role == Role::System) {
+                system.content.push_str(&format!(
+                    "\nThe browser (Google Chrome) already shows: {title:?} — {url}. If the \
+                     request is about that page, work IN it (focus_app Google Chrome, \
+                     screen_query, click/type there) — do not open it again."
                 ));
             }
         }

@@ -300,6 +300,37 @@ test("a summoned dismiss grounds exactly the next question, consume-once", async
   expect(second[second.length - 1]).toEqual({ role: "user", content: "and a follow-up" });
 });
 
+test("the summoned chat SHOWS the nudge context as a chip the user can drop", async ({ page }) => {
+  await installNudgeIpcMock(page);
+  await page.goto("/");
+  await waitForListener(page, "nudge://dismiss");
+  await emit(page, "nudge://show", nudgePayload);
+  await emit(page, "overlay://state-changed", "visible-idle");
+  await emit(page, "nudge://dismiss", "summoned");
+  await emit(page, "overlay://state-changed", "visible-focused");
+  await expect(page.locator(".overlay-panel")).toBeVisible();
+
+  // The chip names what the nudge was about and where — the user is not
+  // left guessing whether the chat "knows" why it nudged.
+  const chip = page.locator("[data-nudge-chip]");
+  await expect(chip).toBeVisible();
+  await expect(chip).toContainText("Looks like a stack trace — want a hand?");
+  await expect(chip).toContainText("VS Code");
+  await expect(chip).toContainText("just now");
+  await expect(chip).toHaveAttribute("title", /TypeError: cannot read properties of undefined/);
+
+  // Dropping the chip drops the grounding: the question goes out bare.
+  await chip.getByRole("button", { name: "Forget the nudge context" }).click();
+  await expect(chip).toHaveCount(0);
+  const input = page.getByLabel("Overlay input");
+  await input.fill("unrelated question");
+  await input.press("Enter");
+  const calls = await page.evaluate(() => (window as any).__mockNudge.chatCalls());
+  expect(calls).toHaveLength(1);
+  const first = calls[0] as Array<{ role: string; content: string }>;
+  expect(first.every((m) => m.role !== "system")).toBe(true);
+});
+
 test("an auto-timeout dismiss still grounds the next question (late summon)", async ({ page }) => {
   await installNudgeIpcMock(page);
   await page.goto("/");

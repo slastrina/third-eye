@@ -18,6 +18,8 @@ import {
   initialChatState,
   freshNudgePreload,
   NUDGE_PRELOAD_FRESH_MS,
+  nudgeChipDetail,
+  nudgeChipLabel,
   nudgeContextMessage,
   nextProbeDelay,
   showStopButton,
@@ -1086,6 +1088,29 @@ describe("chatReducer nudge lifecycle", () => {
     s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
     expect(s.nudge).toBeNull();
     expect(s.nudgePreload).toEqual(nudge);
+  });
+
+  it("the user can drop the staged context from the chip", () => {
+    let s = chatReducer(initialChatState, { type: "nudge-shown", payload: nudge });
+    s = chatReducer(s, { type: "nudge-dismissed", reason: "summoned" });
+    expect(s.nudgePreload).toEqual(nudge);
+    s = chatReducer(s, { type: "nudge-preload-cleared" });
+    expect(s.nudgePreload).toBeNull();
+  });
+
+  it("the chip names the nudge, the app, and how long ago it was", () => {
+    const t = nudge.capturedAtMs;
+    expect(nudgeChipLabel(nudge, t + 3_000)).toBe(
+      `nudge · ${nudge.message} · ${nudge.appContext} · just now`,
+    );
+    expect(nudgeChipLabel(nudge, t + 40_000)).toContain("· 40s ago");
+    expect(nudgeChipLabel(nudge, t + 3 * 60_000)).toContain("· 3m ago");
+    expect(nudgeChipLabel({ ...nudge, appContext: null }, t)).toBe(
+      `nudge · ${nudge.message} · just now`,
+    );
+    const detail = nudgeChipDetail({ ...nudge, screenText: "  line one\n\n  line two  " });
+    expect(detail).toContain("line one line two");
+    expect(nudgeChipDetail({ ...nudge, screenText: "x".repeat(500) }, 100)).toMatch(/x{100}…$/);
   });
 
   it("a dismiss with no nudge showing is a no-op and cannot wipe a staged preload", () => {

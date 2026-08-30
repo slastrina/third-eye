@@ -895,6 +895,7 @@ impl AppFocus for RecordingFocus {
             app: app_name.to_string(),
             launched: false,
             visible_windows: None,
+            front_window: None,
         })
     }
     async fn running_apps(&self) -> Vec<String> {

@@ -404,6 +404,82 @@ fn observe_focus_settled() -> Option<FocusReport> {
     read_focused_element().map(redact_focus)
 }
 
+/// What a `type-text` run delivers to the keyboard, piece by piece: literal
+/// text goes through enigo's unicode entry, but every newline becomes a REAL
+/// Return keypress. enigo posts a `\n` as a unicode-string event (U+200B +
+/// LF on keycode 0 — the `a` key): Terminal renders a stray `<200b>` inside
+/// the command plus an `a` on the next prompt, browsers ignore it, and the
+/// verification needle never matches — the 2026-08-30 teach-mode incident
+/// ("typed the command but never pressed Enter, kept retyping it"). `\r\n`
+/// and a lone `\r` count as one Return. Pure — the split is unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypePiece {
+    Text(String),
+    Return,
+}
+
+fn type_pieces(text: &str) -> Vec<TypePiece> {
+    // A small model that "ends the command with \n" often JSON-escapes it
+    // twice and sends the two CHARACTERS backslash + n (2026-08-30 screenshot:
+    // Terminal showed `curl -s ifconfig.me\n` typed literally). Trailing
+    // literal escapes are a submit intent, never text — peel them into
+    // Returns. Mid-text ones stay literal (`printf("hi\n")` in an editor).
+    let mut text = text;
+    let mut trailing_returns = 0usize;
+    while let Some(rest) = text
+        .strip_suffix("\\n")
+        .or_else(|| text.strip_suffix("\\r"))
+    {
+        text = rest.strip_suffix("\\r").unwrap_or(rest);
+        trailing_returns += 1;
+    }
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                if !buf.is_empty() {
+                    out.push(TypePiece::Text(std::mem::take(&mut buf)));
+                }
+                out.push(TypePiece::Return);
+            }
+            _ => buf.push(c),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(TypePiece::Text(buf));
+    }
+    out.extend(std::iter::repeat_n(TypePiece::Return, trailing_returns));
+    out
+}
+
+/// The text `observe_text_entry` looks for in the focused element: the tail
+/// (≤64 chars) of the LAST literal piece — long runs may scroll out of
+/// AXValue's head, but the most recent keystrokes are at the end. The
+/// submitting newline is not part of it: after `cmd\n` a terminal shows the
+/// command's output and a search box has navigated away, so demanding the
+/// `\n` in the value would fail every submit and send the model into a
+/// retype loop. `None` when nothing verifiable was typed.
+fn verification_needle(text: &str) -> Option<String> {
+    let last = type_pieces(text)
+        .into_iter()
+        .filter_map(|p| match p {
+            TypePiece::Text(t) if !t.trim().is_empty() => Some(t),
+            _ => None,
+        })
+        .next_back()?;
+    let chars: Vec<char> = last.chars().collect();
+    Some(if chars.len() > 64 {
+        chars[chars.len() - 64..].iter().collect()
+    } else {
+        last
+    })
+}
+
 /// Post-`type-text` observation: poll (bounded) until the focused element's
 /// value contains the typed text's tail, then report the snapshot and whether
 /// it matched. AX value propagation lags the keystrokes by tens of
@@ -412,19 +488,11 @@ fn observe_focus_settled() -> Option<FocusReport> {
 /// targets (canvases, games, password fields) never echo — and the model is
 /// told to treat it as "not confirmed", not as proof of failure.
 fn observe_text_entry(text: &str) -> (Option<FocusReport>, Option<bool>) {
-    // Compare on the typed text's tail: long runs may scroll out of AXValue's
-    // head, but the most recent keystrokes are at the end.
-    let chars: Vec<char> = text.chars().collect();
-    let needle: String = if chars.len() > 64 {
-        chars[chars.len() - 64..].iter().collect()
-    } else {
-        text.to_string()
-    };
-    if needle.trim().is_empty() {
-        // Whitespace-only input is unverifiable by containment; report the
-        // settled focus without claiming either way.
+    let Some(needle) = verification_needle(text) else {
+        // Whitespace-only input (or a bare Return) is unverifiable by
+        // containment; report the settled focus without claiming either way.
         return (observe_focus_settled(), None);
-    }
+    };
     const POLL: std::time::Duration = std::time::Duration::from_millis(50);
     const TRIES: u32 = 14; // ≤ ~700ms
     let mut last: Option<FocusReport> = None;
@@ -504,6 +572,28 @@ extern "C" {
 /// timeout only fires in headless contexts (test harnesses) where blocking
 /// forever — or crashing like before — are the alternatives.
 const MAIN_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A throwaway enigo handle for one keyboard action (main thread only —
+/// callers hop via [`on_main_keyboard`]). Never opens the permission prompt:
+/// the caller's preflight already settled that.
+fn keyboard() -> Result<Enigo, String> {
+    Enigo::new(&Settings {
+        open_prompt_to_get_permissions: false,
+        ..Settings::default()
+    })
+    .map_err(|e| format!("enigo init failed: {e}"))
+}
+
+/// One real Return keypress on the main thread — the keystroke a newline in
+/// `type-text` stands for.
+fn press_return_on_main() -> Result<(), InputError> {
+    on_main_keyboard(|| {
+        keyboard()?
+            .key(Key::Return, Direction::Click)
+            .map_err(|e| format!("return press failed: {e}"))
+    })?
+    .map_err(|detail| InputError::InputFailed { detail })
+}
 
 /// Run `f` on the main thread and return its result. Keyboard synthesis
 /// ONLY — mouse events have no main-thread requirement and their glide
@@ -781,39 +871,60 @@ fn perform_blocking(action: InputAction) -> Result<ActionReport, InputError> {
         InputAction::TypeText { text } => {
             // Keyboard synthesis happens ON THE MAIN THREAD (TSM assert —
             // see on_main_keyboard); the pacing sleeps stay here, off-main,
-            // so the UI never freezes for the typing rhythm.
-            match paced_char_delay(text.chars().count()) {
+            // so the UI never freezes for the typing rhythm. Newlines are
+            // delivered as real Return keypresses (see type_pieces).
+            let pieces = type_pieces(&text);
+            let units: usize = pieces
+                .iter()
+                .map(|p| match p {
+                    TypePiece::Text(t) => t.chars().count(),
+                    TypePiece::Return => 1,
+                })
+                .sum();
+            match paced_char_delay(units) {
                 None => {
-                    if !text.is_empty() {
-                        let burst = text.clone();
-                        on_main_keyboard(move || {
-                            let mut e = Enigo::new(&Settings {
-                                open_prompt_to_get_permissions: false,
-                                ..Settings::default()
-                            })
-                            .map_err(|e| format!("enigo init failed: {e}"))?;
-                            e.text(&burst)
-                                .map_err(|e| format!("text entry failed: {e}"))
-                        })?
-                        .map_err(|detail| InputError::InputFailed { detail })?;
+                    for piece in pieces {
+                        match piece {
+                            TypePiece::Text(burst) => {
+                                on_main_keyboard(move || {
+                                    keyboard()?
+                                        .text(&burst)
+                                        .map_err(|e| format!("text entry failed: {e}"))
+                                })?
+                                .map_err(|detail| InputError::InputFailed { detail })?;
+                            }
+                            TypePiece::Return => press_return_on_main()?,
+                        }
                     }
                 }
                 Some(delay) => {
-                    for (i, ch) in text.chars().enumerate() {
+                    let mut i = 0usize;
+                    let pace = |i: usize| {
                         if i > 0 && !delay.is_zero() {
                             std::thread::sleep(delay);
                         }
-                        on_main_keyboard(move || {
-                            let mut e = Enigo::new(&Settings {
-                                open_prompt_to_get_permissions: false,
-                                ..Settings::default()
-                            })
-                            .map_err(|e| format!("enigo init failed: {e}"))?;
-                            let mut buf = [0u8; 4];
-                            e.text(ch.encode_utf8(&mut buf))
-                                .map_err(|e| format!("text entry failed at char {i}: {e}"))
-                        })?
-                        .map_err(|detail| InputError::InputFailed { detail })?;
+                    };
+                    for piece in pieces {
+                        match piece {
+                            TypePiece::Text(run) => {
+                                for ch in run.chars() {
+                                    pace(i);
+                                    on_main_keyboard(move || {
+                                        let mut buf = [0u8; 4];
+                                        keyboard()?.text(ch.encode_utf8(&mut buf)).map_err(|e| {
+                                            format!("text entry failed at char {i}: {e}")
+                                        })
+                                    })?
+                                    .map_err(|detail| InputError::InputFailed { detail })?;
+                                    i += 1;
+                                }
+                            }
+                            TypePiece::Return => {
+                                pace(i);
+                                press_return_on_main()?;
+                                i += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -902,7 +1013,7 @@ fn modifier_key(name: &str) -> Result<Key, InputError> {
 /// model gets an actionable error instead of a silent no-op (R007).
 fn key_from_str(key: &str) -> Result<Key, InputError> {
     let named = match key.to_ascii_lowercase().as_str() {
-        "return" | "enter" => Some(Key::Return),
+        "return" | "enter" | "newline" | "linefeed" | "\n" | "\r" | "\r\n" => Some(Key::Return),
         "tab" => Some(Key::Tab),
         "space" => Some(Key::Space),
         "escape" | "esc" => Some(Key::Escape),
@@ -968,6 +1079,89 @@ mod tests {
         assert_eq!(status.granted, first);
     }
 
+    /// Incident 2026-08-30 (teach mode, Terminal): `cmd\n` must type the
+    /// command and press a REAL Return — never hand the `\n` to enigo's
+    /// unicode path.
+    #[test]
+    fn type_pieces_turn_newlines_into_return_presses() {
+        use TypePiece::*;
+        assert_eq!(
+            type_pieces("echo hi\n"),
+            vec![Text("echo hi".into()), Return]
+        );
+        assert_eq!(
+            type_pieces("a\r\nb\rc\n\n"),
+            vec![
+                Text("a".into()),
+                Return,
+                Text("b".into()),
+                Return,
+                Text("c".into()),
+                Return,
+                Return
+            ],
+            "\\r\\n is one Return; a lone \\r is one Return; consecutive newlines each press"
+        );
+        assert_eq!(type_pieces("plain"), vec![Text("plain".into())]);
+        assert_eq!(type_pieces("\n"), vec![Return]);
+        assert!(type_pieces("").is_empty());
+    }
+
+    /// 2026-08-30 screenshot: the 9B sent the two characters `\` `n` (double
+    /// JSON escaping) and Terminal typed them literally. A TRAILING literal
+    /// escape is a submit; a mid-text one is text the user asked for.
+    #[test]
+    fn trailing_literal_backslash_n_is_a_return_but_mid_text_stays_literal() {
+        use TypePiece::*;
+        assert_eq!(
+            type_pieces(r"curl -s ifconfig.me\n"),
+            vec![Text("curl -s ifconfig.me".into()), Return]
+        );
+        assert_eq!(
+            type_pieces(r"ls\r\n"),
+            vec![Text("ls".into()), Return],
+            r"a literal \r\n is one Return"
+        );
+        assert_eq!(
+            type_pieces(r"echo hi\n\n"),
+            vec![Text("echo hi".into()), Return, Return]
+        );
+        assert_eq!(
+            type_pieces(r#"printf("hi\n")"#),
+            vec![Text(r#"printf("hi\n")"#.into())],
+            "code being typed keeps its escapes"
+        );
+        assert_eq!(
+            verification_needle(r"curl -s ifconfig.me\n").as_deref(),
+            Some("curl -s ifconfig.me")
+        );
+    }
+
+    /// The submit newline is not something the field can echo back: the
+    /// needle is the last literal run, so `cmd\n` verifies on `cmd` instead
+    /// of failing every submit and driving a retype loop.
+    #[test]
+    fn verification_needle_skips_the_submitting_newline() {
+        assert_eq!(verification_needle("echo hi\n").as_deref(), Some("echo hi"));
+        assert_eq!(
+            verification_needle("first\nsecond").as_deref(),
+            Some("second")
+        );
+        assert_eq!(verification_needle("plain").as_deref(), Some("plain"));
+        assert_eq!(
+            verification_needle("\n"),
+            None,
+            "a bare Return is unverifiable"
+        );
+        assert_eq!(verification_needle("   "), None);
+        let long: String = "x".repeat(100);
+        assert_eq!(
+            verification_needle(&long).map(|n| n.chars().count()),
+            Some(64),
+            "tail-64 of the last run"
+        );
+    }
+
     #[test]
     fn has_permission_requires_both_ax_trust_and_post_event_access() {
         // The bug this guards: AX trust alone let events be silently dropped.
@@ -1004,6 +1198,11 @@ mod tests {
     fn named_keys_resolve_case_insensitively() {
         assert_eq!(key_from_str("return").unwrap(), Key::Return);
         assert_eq!(key_from_str("ENTER").unwrap(), Key::Return);
+        // A model that "presses" a newline character means Return, never a
+        // unicode LF event (which Terminal renders as `<200b>` garbage).
+        assert_eq!(key_from_str("\n").unwrap(), Key::Return);
+        assert_eq!(key_from_str("\r").unwrap(), Key::Return);
+        assert_eq!(key_from_str("newline").unwrap(), Key::Return);
         assert_eq!(key_from_str("Tab").unwrap(), Key::Tab);
         assert_eq!(key_from_str("escape").unwrap(), Key::Escape);
         assert_eq!(key_from_str("esc").unwrap(), Key::Escape);

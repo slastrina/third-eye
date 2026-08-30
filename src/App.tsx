@@ -17,6 +17,8 @@ import {
   composeContextBlocks,
   type FileContext,
   freshNudgePreload,
+  nudgeChipDetail,
+  nudgeChipLabel,
   nudgeContextFrame,
   firstRunStatus,
   hotkeyStatus,
@@ -1121,6 +1123,17 @@ function App() {
   const [fileContexts, setFileContexts] = useState<FileContext[]>([]);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [autoScreen, setAutoScreen] = useState(false);
+  // The staged nudge context is visible while it is still fresh enough to
+  // ground a question: a slow tick re-evaluates freshness so the chip ages
+  // ("2m ago") and disappears when freshNudgePreload would ignore it.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (!chat.nudgePreload) return;
+    setNowTick(Date.now());
+    const timer = window.setInterval(() => setNowTick(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, [chat.nudgePreload]);
+  const nudgeContext = freshNudgePreload(chat.nudgePreload, nowTick);
   const [attachNote, setAttachNote] = useState<string | null>(null);
   const filePickRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -1535,6 +1548,23 @@ function App() {
                 </button>
               </span>
             ))}
+            {nudgeContext && (
+              <span
+                className="attach-chip attach-chip--nudge"
+                data-nudge-chip="true"
+                title={nudgeChipDetail(nudgeContext)}
+              >
+                <span className="attach-chip-text">{nudgeChipLabel(nudgeContext, nowTick)}</span>
+                <button
+                  type="button"
+                  className="attach-chip-clear"
+                  aria-label="Forget the nudge context"
+                  onClick={() => dispatchChat({ type: "nudge-preload-cleared" })}
+                >
+                  ×
+                </button>
+              </span>
+            )}
             {chat.attachment && (
               <span className="attach-chip">
                 screenshot · {chat.attachment.width}×{chat.attachment.height}

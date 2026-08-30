@@ -266,36 +266,172 @@ fn recognize_text_with_bounds(
 }
 
 /// The coordinate-bearing sibling of [`extract_blocking`]: capture the
-/// primary display, recognize its text with bounding boxes, and return the
-/// elements. The source image's own pixel `width()`/`height()` are the
-/// normalization basis (NOT `max_dimension`, which only caps the capture) so
-/// the flipped boxes land in real screen pixels. The `CGImage` is a local
-/// that dies at the end of this function — only the elements escape (R011).
+/// display, recognize its text with bounding boxes, and return the elements
+/// in logical screen points. Whole-screen scope — see
+/// [`extract_elements_scoped_blocking`] for the window-cropped fast path.
 pub fn extract_elements_blocking(max_dimension: u32) -> Result<Vec<TextElement>, OcrError> {
+    extract_elements_scoped_blocking(max_dimension, None).map(|(elements, _)| elements)
+}
+
+/// Which pixels a screen query actually recognized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryScope {
+    /// Only the scoped app's front window was OCR'd (the fast path).
+    Window,
+    /// The whole display was OCR'd — no scope, no matching window, or the
+    /// window read nothing (fallback).
+    Screen,
+}
+
+/// A crop of the captured frame, in captured-pixel space (top-left origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// A window covering at least this fraction of the frame is not worth
+/// cropping — the OCR saving would not pay for the extra pass.
+const CROP_MIN_SAVING: f64 = 0.85;
+/// Crops narrower than this (pixels) are chrome slivers, not content.
+const CROP_MIN_EDGE: i32 = 16;
+
+/// The frame region to OCR for `app`: its FRONT window (the window list is
+/// topmost-first), clamped to the frame. `None` when the app has no usable
+/// window on screen or its window already covers nearly the whole frame —
+/// the caller then reads the whole screen as before. Pure.
+pub fn crop_rect_for(app: &str, windows: &[WindowAppRect], cw: u32, ch: u32) -> Option<CropRect> {
+    let win = windows
+        .iter()
+        .find(|w| w.w > 0 && w.h > 0 && crate::appfocus::macos::names_match(&w.app, app))?;
+    let x0 = win.x.max(0);
+    let y0 = win.y.max(0);
+    let x1 = (win.x + win.w).min(cw as i32);
+    let y1 = (win.y + win.h).min(ch as i32);
+    if x1 - x0 < CROP_MIN_EDGE || y1 - y0 < CROP_MIN_EDGE {
+        return None;
+    }
+    let full = cw as f64 * ch as f64;
+    if full > 0.0 && ((x1 - x0) as f64 * (y1 - y0) as f64) / full >= CROP_MIN_SAVING {
+        return None;
+    }
+    Some(CropRect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+/// Translate a crop-space element back into frame-pixel space. Pure.
+fn shift_element(el: TextElement, dx: i32, dy: i32) -> TextElement {
+    TextElement {
+        x: el.x + dx,
+        y: el.y + dy,
+        cx: el.cx + dx,
+        cy: el.cy + dy,
+        ..el
+    }
+}
+
+/// Capture the display and recognize text — only inside `window_of`'s front
+/// window when one is on screen (2026-08-30: OCR cost scales with pixels,
+/// and a screen_query already filters its answer to the focused app, so
+/// reading the Dock, the wallpaper and every other window was paid for and
+/// thrown away). Boxes come back in logical screen points either way: the
+/// crop is OCR'd in its own pixel space, shifted back into the frame, then
+/// mapped through the frame geometry exactly as the whole-screen path is —
+/// click targets are identical to a full read. An empty crop falls back to
+/// the whole screen (a dialog from another app may be what is showing).
+/// The source image's own pixel `width()`/`height()` are the normalization
+/// basis (NOT `max_dimension`, which only caps the capture). The `CGImage`
+/// dies at the end of this function — only the elements escape (R011).
+pub fn extract_elements_scoped_blocking(
+    max_dimension: u32,
+    window_of: Option<&str>,
+) -> Result<(Vec<TextElement>, QueryScope), OcrError> {
     let start = Instant::now();
     // The window→app rects come back in the SAME pixel space the captured image
     // is normalized to, so each element can be labelled with its owning app.
     let (image, windows, geometry) = capture_display_image_with_geometry_blocking(max_dimension)?;
     let (cw, ch) = (image.width() as u32, image.height() as u32);
-    let result = recognize_text_with_bounds(as_vision_cgimage(&image), cw, ch, &windows)
-        // Attribution ran in captured-pixel space (windows are in that space);
-        // NOW map every box back to logical screen points so the model aims a
-        // click in the coordinate space the input backend actually clicks in.
-        .map(|elements| -> Vec<TextElement> {
-            elements
-                .into_iter()
-                .map(|el| to_screen_points(el, geometry))
-                .collect()
-        });
+    let frame = as_vision_cgimage(&image);
+    let mut scope = QueryScope::Screen;
+    let mut recognized: Option<Vec<TextElement>> = None;
+    if let Some((app, rect)) =
+        window_of.and_then(|app| crop_rect_for(app, &windows, cw, ch).map(|r| (app, r)))
+    {
+        let cropped = objc2_core_graphics::CGImage::with_image_in_rect(
+            Some(frame),
+            objc2_core_foundation::CGRect::new(
+                objc2_core_foundation::CGPoint::new(rect.x as f64, rect.y as f64),
+                objc2_core_foundation::CGSize::new(rect.w as f64, rect.h as f64),
+            ),
+        );
+        match cropped {
+            Some(cropped) => {
+                // Attribution runs in crop space: the same windows, shifted.
+                let shifted: Vec<WindowAppRect> = windows
+                    .iter()
+                    .map(|w| WindowAppRect {
+                        app: w.app.clone(),
+                        x: w.x - rect.x,
+                        y: w.y - rect.y,
+                        w: w.w,
+                        h: w.h,
+                        layer: w.layer,
+                    })
+                    .collect();
+                let elements =
+                    recognize_text_with_bounds(&cropped, rect.w as u32, rect.h as u32, &shifted)?;
+                if elements.is_empty() {
+                    log::debug!(
+                        "screen_query: {app:?} window crop read nothing — reading the whole screen"
+                    );
+                } else {
+                    scope = QueryScope::Window;
+                    recognized = Some(
+                        elements
+                            .into_iter()
+                            .map(|el| shift_element(el, rect.x, rect.y))
+                            .collect(),
+                    );
+                }
+            }
+            None => log::warn!("screen_query: crop {rect:?} failed — reading the whole screen"),
+        }
+    }
+    let pixels = match (
+        scope,
+        window_of.and_then(|a| crop_rect_for(a, &windows, cw, ch)),
+    ) {
+        (QueryScope::Window, Some(r)) => format!("{}×{} of {cw}×{ch}", r.w, r.h),
+        _ => format!("{cw}×{ch}"),
+    };
+    let result = match recognized {
+        Some(elements) => Ok(elements),
+        None => recognize_text_with_bounds(frame, cw, ch, &windows),
+    }
+    // Attribution ran in captured-pixel space (windows are in that space);
+    // NOW map every box back to logical screen points so the model aims a
+    // click in the coordinate space the input backend actually clicks in.
+    .map(|elements| -> Vec<TextElement> {
+        elements
+            .into_iter()
+            .map(|el| to_screen_points(el, geometry))
+            .collect()
+    });
     match &result {
         Ok(elements) => log::debug!(
-            "screen_query: {} element(s) in {} ms",
+            "screen_query: {} element(s) in {} ms (scope={scope:?}, {pixels})",
             elements.len(),
             start.elapsed().as_millis()
         ),
         Err(err) => log::error!("screen_query: {} ({err})", err.kind()),
     }
-    result
+    result.map(|elements| (elements, scope))
 }
 
 /// Convert one element's bounding box from captured-pixel space to logical
@@ -627,6 +763,69 @@ mod tests {
             pt.x + pt.width / 2 + 1,
             "naive arithmetic lands at 3"
         );
+    }
+
+    /// The window-scoped fast path (2026-08-30): crop to the app's FRONT
+    /// window, clamped to the frame; skip when it would not save anything.
+    #[test]
+    fn crop_rect_picks_the_front_window_and_clamps_to_the_frame() {
+        let windows = vec![
+            win("Terminal", 100, 80, 900, 600, 3), // front Terminal window
+            win("Terminal", 40, 40, 1200, 900, 2), // one behind it
+            win("Google Chrome", -50, -20, 1500, 1100, 1),
+        ];
+        assert_eq!(
+            crop_rect_for("Terminal", &windows, 2048, 1330),
+            Some(CropRect {
+                x: 100,
+                y: 80,
+                w: 900,
+                h: 600
+            }),
+            "topmost-first: the first matching window is the front one"
+        );
+        assert_eq!(
+            crop_rect_for("chrome", &windows, 2048, 1330),
+            Some(CropRect {
+                x: 0,
+                y: 0,
+                w: 1450,
+                h: 1080
+            }),
+            "fuzzy name match; a window hanging off the top-left is clamped"
+        );
+        assert_eq!(crop_rect_for("Finder", &windows, 2048, 1330), None);
+    }
+
+    #[test]
+    fn crop_rect_is_none_when_nothing_would_be_saved() {
+        let full = vec![win("Zed", 0, 0, 2000, 1300, 0)];
+        assert_eq!(
+            crop_rect_for("Zed", &full, 2048, 1330),
+            None,
+            "a near-full-screen window reads the whole frame"
+        );
+        let sliver = vec![win("Zed", 10, 10, 8, 500, 0)];
+        assert_eq!(crop_rect_for("Zed", &sliver, 2048, 1330), None);
+        let zero = vec![win("Zed", 10, 10, 0, 0, 0)];
+        assert_eq!(crop_rect_for("Zed", &zero, 2048, 1330), None);
+    }
+
+    #[test]
+    fn shifted_elements_land_back_in_frame_space() {
+        let el = TextElement {
+            text: "ok".into(),
+            x: 5,
+            y: 6,
+            width: 10,
+            height: 4,
+            cx: 10,
+            cy: 8,
+            app: None,
+        };
+        let back = shift_element(el, 100, 80);
+        assert_eq!((back.x, back.y, back.cx, back.cy), (105, 86, 110, 88));
+        assert_eq!((back.width, back.height), (10, 4));
     }
 
     #[test]

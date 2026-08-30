@@ -136,7 +136,7 @@ When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed
 /// coin flips were the ebay inconsistency (user report 2026-08-17).
 pub const HID_SYSTEM_PROMPT_BROWSING: &str = r#"WEB SEARCH — the ONE way to find things online: call web_search with the query, and site "ebay", "amazon", or "youtube" when the user wants that site (default google). It opens the results page and returns what is on screen with exact click coordinates: pick the best result, mouse-click its cx,cy, then read_page to extract the actual information before answering. NEVER compose search or product URLs by hand, never type URLs into the address bar, and never google another site's listings when web_search can search that site directly.
 Direct navigation is only for URLs the user gave you or that appeared in a page or tool result (run_command `open <url>`). READ the page that is already open (screen_query or read_page) before opening another one — opening page after page without reading is refused (too-many-opens); prefer clicking links on the open page over new navigations.
-When the browser already shows the site you need, work IN that window — click its controls, use its filters. A follow-up that refines a search ("only under $50", "now the PC version") means refine on the SAME site: another web_search there or the site's own filters."#;
+When the browser already shows the site you need, work IN that window — click its controls, use its filters. A follow-up that refines a search ("only under $50", "now the PC version") means refine on the SAME site: another web_search there or the site's own filters. Every web_search and open lands in ONE Third Eye tab that is reused — never press cmd+t or cmd+n to get "a fresh" tab or window, and when the Environment line says the browser already shows the page the user is talking about, do NOT open it again: focus_app the browser, screen_query, and act on that page."#;
 
 /// The coding contract (coder lane only).
 pub const HID_SYSTEM_PROMPT_CODING: &str = r#"CODING: read_file, list_dir, write_file and run_in_workspace work ANYWHERE on this machine. Relative paths resolve against the ACTIVE working directory (named in your Environment); if none is set, a folder chooser asks the user where to work — wait for their pick. list_dir first to learn a layout, read_file before changing a file — never write over content you have not read. write_file replaces the WHOLE file, so pass the complete new contents. Writes and commands in a directory the user has not yet approved prompt them (approving "this session" covers that directory); tmp (/tmp, the system temp dir) is ALWAYS writable with no prompt — use it for scratch work. To compile, test, or run code, use run_in_workspace (never run_command): output streams into the chat and timeoutSecs goes up to 600 for long builds — after writing code, BUILD AND TEST it with run_in_workspace and report the real result. There is NO persistent shell: every command starts fresh in the active working directory — a bare `cd` does nothing and is refused; pass cwd for another folder. When a result header names a directory in [brackets], that IS the directory you listed or read — describe it as that path, never as a folder you merely intended to be in. When the build is clean, call workspace_diff and REVIEW the diff before declaring the task done: confirm it contains exactly the intended changes, then summarize them for the user. NEVER git-commit or git-push changes unless the user explicitly asks you to."#;
@@ -145,7 +145,7 @@ pub const HID_SYSTEM_PROMPT_CODING: &str = r#"CODING: read_file, list_dir, write
 /// proof" of computer use. Replaces the browsing playbook — the efficient
 /// shortcuts it teaches are structurally stripped in this mode.
 pub const HID_SYSTEM_PROMPT_TEACH: &str = r#"TEACH ME MODE is ON: the user wants to LEARN how to do this themselves — show the human way, not just the result. Work exactly like a person at the keyboard: visible clicks, typing, and standard keyboard shortcuts only. The terminal and one-shot search shortcuts are unavailable on purpose — do not mention wanting them.
-NARRATE as you go: before each action, one short line saying what you are doing and why ("Opening Chrome", "Clicking the search box", "Pressing cmd+t for a new tab"). To search the web the human way: focus the browser, key-press "t" with ["cmd"] for a new tab, click the address bar if needed, type-text the search words, key-press "return" — then read the results on screen like a person would.
+NARRATE as you go: before each action, one short line saying what you are doing and why ("Opening Chrome", "Clicking the search box", "Pressing cmd+t for a new tab"). To search the web the human way: focus the browser, key-press "l" with ["cmd"] to select the address bar of the CURRENT tab (no new tabs or windows — work in the one that is open), type-text the search words, key-press "return" — then read the results on screen like a person would. To run a terminal command the human way: focus Terminal, type-text the command ending with a newline (the newline presses Return) or key-press "return" after it, then read_page to read the output (it reads the terminal's text directly — no screenshot).
 FINISH with a numbered "Do it yourself" recap: the exact steps — app names, what to click, what to type, which shortcuts — so the user can repeat the whole task without you."#;
 
 /// Assemble the system prompt for one routed lane + mode: coder runs carry
@@ -764,6 +764,10 @@ pub struct UrlGroundingExecutor {
     /// (2026-08-17): reading earns another open, so multi-hop research is
     /// unbounded while blind tab-flooding still stops at the budget.
     read_since_open: std::sync::atomic::AtomicBool,
+    /// When set, a grounded `open <url>` is navigated HERE (Third Eye's one
+    /// tab) instead of running the shell `open` — which always spawns a
+    /// new tab. Absent in the evals, whose stub runner records the command.
+    opener: Option<Arc<dyn Opener>>,
 }
 
 /// Browser navigations allowed per run: the search page plus one more.
@@ -781,7 +785,14 @@ impl UrlGroundingExecutor {
             seen,
             opens: std::sync::atomic::AtomicUsize::new(0),
             read_since_open: std::sync::atomic::AtomicBool::new(true),
+            opener: None,
         }
+    }
+
+    /// Route grounded `open <url>` commands through `opener` (one tab).
+    pub fn with_opener(mut self, opener: Arc<dyn Opener>) -> Self {
+        self.opener = Some(opener);
+        self
     }
 }
 
@@ -859,7 +870,22 @@ impl ToolExecutor for UrlGroundingExecutor {
                             .to_string(),
                     );
                 }
-                let outcome = self.inner.execute(call).await;
+                let outcome = match &self.opener {
+                    // One tab: the navigation lands in Third Eye's own tab
+                    // (re-pointed or raised), never a fresh `open` tab.
+                    Some(opener) => match opener.open(&url).await {
+                        Ok(()) => ToolOutcome::success(
+                            serde_json::json!({
+                                "ok": true,
+                                "opened": url,
+                                "note": "navigated Third Eye's browser tab — the page is now showing; focus_app the browser and screen_query/read_page it."
+                            })
+                            .to_string(),
+                        ),
+                        Err(e) => ToolOutcome::failure("open-failed", format!("could not open {url}: {e}")),
+                    },
+                    None => self.inner.execute(call).await,
+                };
                 if outcome.ok {
                     self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     self.read_since_open
@@ -911,22 +937,15 @@ pub trait Opener: Send + Sync {
     async fn open(&self, url: &str) -> Result<(), String>;
 }
 
-/// Production opener: macOS `open` — the default browser takes the URL.
+/// Production opener: Third Eye's ONE browser tab (see `crate::browser`) —
+/// the first navigation opens it, every later one reuses it; non-Chrome
+/// default browsers fall back to macOS `open`.
 pub struct SystemOpener;
 
 #[async_trait]
 impl Opener for SystemOpener {
     async fn open(&self, url: &str) -> Result<(), String> {
-        let status = tokio::process::Command::new("/usr/bin/open")
-            .arg(url)
-            .status()
-            .await
-            .map_err(|e| format!("could not run open: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("open exited {status}"))
-        }
+        crate::browser::open_url(url).await.map(|_| ())
     }
 }
 
@@ -1534,7 +1553,7 @@ impl InputTool {
                     },
                     "text": {
                         "type": "string",
-                        "description": "type-text: the Unicode text to type as keystrokes."
+                        "description": "type-text: the Unicode text to type as keystrokes. A newline (\\n) in the text presses Return — end a terminal command or a search with \\n to run/submit it (or key-press \"return\" separately)."
                     },
                     "key": {
                         "type": "string",
@@ -1681,9 +1700,10 @@ impl ScreenQueryTool {
         }
     }
 
-    /// The model-facing definition. No arguments: a screen query is a snapshot
-    /// of whatever is on screen right now, so a small model can call it with an
-    /// empty object.
+    /// The model-facing definition. Callable with an empty object: a screen
+    /// query is a snapshot of whatever is on screen right now. The one
+    /// optional argument, `scope`, widens the read from the focused app's
+    /// window (the default, fast) to the whole display.
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: SCREEN_QUERY_TOOL.into(),
@@ -1695,11 +1715,20 @@ impl ScreenQueryTool {
                           frames — ALWAYS prefer clicking one of those over plain recognized \
                           text when both match your target. To click an element, pass its cx as \
                           x and cy as y to input_action verbatim; do not compute your own \
-                          coordinates."
+                          coordinates. By default it reads only the focused app's front \
+                          window (fast); pass scope \"screen\" to read the whole display when \
+                          something OUTSIDE that window matters (another app's dialog, \
+                          Spotlight, a menu)."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["window", "screen"],
+                        "description": "window (default): the focused app's front window only. screen: the whole display."
+                    }
+                },
                 "required": []
             }),
         }
@@ -1722,15 +1751,21 @@ impl ToolExecutor for ScreenQueryTool {
                 ),
             );
         }
-        // No arguments to parse — a screen query is a snapshot of the current
-        // screen. The whole capture/recognize pipeline lives behind the backend.
-        match self.backend.query().await {
+        // Window scope by default (2026-08-30): the answer is filtered to the
+        // focused app anyway, so only its front window is captured/OCR'd —
+        // a fraction of the pixels. `scope: "screen"` reads everything.
+        let whole_screen = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|v| v.get("scope").and_then(|s| s.as_str()).map(String::from))
+            .is_some_and(|s| s.eq_ignore_ascii_case("screen"));
+        let focused = self.focused_app.current();
+        let window_of = if whole_screen { None } else { focused.clone() };
+        match self.backend.query_scoped(window_of.as_deref()).await {
             Ok(elements) => {
                 // Filter to the focused app (if one was focused): the model then
                 // only ever sees — and can only aim a click at — elements inside
                 // that app, never the desktop wallpaper (which on Sonoma+ hides
                 // all windows) or another app's chrome (M005 targeting fix).
-                let focused = self.focused_app.current();
                 let total = elements.len();
                 if let Some(app) = &focused {
                     // Diagnostic (M005): the distinct app-attribution strings in
@@ -1896,6 +1931,7 @@ impl ToolExecutor for FocusAppTool {
                     "focused": focused.app,
                     "launched": focused.launched,
                     "visibleWindows": focused.visible_windows,
+                    "frontWindow": focused.front_window,
                     "warning": if focused.visible_windows == Some(0) {
                         Some("the app is frontmost but has ZERO visible windows — the user sees nothing; open a window (key-press \"n\" with modifiers [\"cmd\"]) or tell the user")
                     } else { None },
@@ -4202,6 +4238,7 @@ mod tests {
                 app: app_name.to_string(),
                 launched: false,
                 visible_windows: None,
+                front_window: None,
             })
         }
 

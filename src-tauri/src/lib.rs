@@ -5,6 +5,7 @@ pub mod appfocus;
 pub mod autostart;
 #[cfg(desktop)]
 pub mod bridge;
+pub mod browser;
 pub mod capture;
 #[cfg(desktop)]
 pub mod clipboard_tool;

@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 
 use super::{ScreenElement, ScreenQuery, ScreenQueryError};
-use crate::ocr::macos::{extract_elements_blocking, TextElement};
+use crate::ocr::macos::{extract_elements_scoped_blocking, TextElement};
 
 /// Capture cap for on-demand screen queries. Near-native (4096 covers most
 /// Retina panels without downscaling): the OCR boxes ARE the click targets,
@@ -54,15 +54,24 @@ impl From<TextElement> for ScreenElement {
 #[async_trait]
 impl ScreenQuery for MacosScreenQuery {
     async fn query(&self) -> Result<Vec<ScreenElement>, ScreenQueryError> {
+        self.query_scoped(None).await
+    }
+
+    async fn query_scoped(
+        &self,
+        window_of: Option<&str>,
+    ) -> Result<Vec<ScreenElement>, ScreenQueryError> {
         let max_dimension = self.max_dimension;
+        let window_of = window_of.map(str::to_string);
         // Capture blocks on Swift completion handlers and Vision recognition is
         // CPU-heavy — both stay off the async runtime (OCR precedent).
-        let elements =
-            tokio::task::spawn_blocking(move || extract_elements_blocking(max_dimension))
-                .await
-                .map_err(|e| ScreenQueryError::RecognitionFailed {
-                    detail: format!("screen-query task panicked: {e}"),
-                })??;
+        let (elements, _scope) = tokio::task::spawn_blocking(move || {
+            extract_elements_scoped_blocking(max_dimension, window_of.as_deref())
+        })
+        .await
+        .map_err(|e| ScreenQueryError::RecognitionFailed {
+            detail: format!("screen-query task panicked: {e}"),
+        })??;
         Ok(elements.into_iter().map(ScreenElement::from).collect())
     }
     async fn page_text(&self, app_name: &str) -> Option<String> {

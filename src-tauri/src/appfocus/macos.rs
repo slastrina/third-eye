@@ -55,6 +55,14 @@ const LAUNCH_VERIFY_MS: u64 = 8_000;
 /// Frontmost-poll cadence during verification.
 const VERIFY_POLL_MS: u64 = 150;
 
+/// How long a fronted app gets to put a window ON SCREEN before the count
+/// is believed: a Space switch or de-minimize animation takes a beat, and
+/// an instant CGWindowList read mid-animation says 0 — which the prompt
+/// turned into "press cmd+n", i.e. a SECOND window (2026-08-30 report:
+/// "it opens Terminal/Chrome twice").
+const WINDOW_SETTLE_MS: u64 = 1_000;
+const WINDOW_POLL_MS: u64 = 100;
+
 /// The live macOS backend: launch-or-focus by name, success = verified
 /// frontmost.
 pub struct MacosAppFocus;
@@ -191,6 +199,127 @@ fn visible_window_count(pid: i32) -> Option<usize> {
     }
 }
 
+// Raw HIServices FFI (the input/macos.rs precedent): the window restore and
+// front-title readback are a handful of single attribute copies — bounded
+// sync IPC, no tree walk.
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementCreateApplication(pid: i32) -> *mut std::ffi::c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *mut std::ffi::c_void,
+        attribute: *const objc2_core_foundation::CFString,
+        value: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: *mut std::ffi::c_void,
+        attribute: *const objc2_core_foundation::CFString,
+        value: *const std::ffi::c_void,
+    ) -> i32;
+    fn AXUIElementPerformAction(
+        element: *mut std::ffi::c_void,
+        action: *const objc2_core_foundation::CFString,
+    ) -> i32;
+}
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRelease(cf: *mut std::ffi::c_void);
+    fn CFGetTypeID(cf: *mut std::ffi::c_void) -> usize;
+    fn CFStringGetTypeID() -> usize;
+    fn CFArrayGetTypeID() -> usize;
+}
+
+/// First element of an AX-returned CFArray (the array is released by the
+/// caller; the element is borrowed from it).
+unsafe fn first_of_cf_array(array: *mut std::ffi::c_void) -> Option<*mut std::ffi::c_void> {
+    if CFGetTypeID(array) != CFArrayGetTypeID() {
+        return None;
+    }
+    let arr = &*(array as *const objc2_core_foundation::CFArray);
+    if arr.count() == 0 {
+        return None;
+    }
+    let first = arr.value_at_index(0) as *mut std::ffi::c_void;
+    (!first.is_null()).then_some(first)
+}
+
+unsafe fn ax_copy(element: *mut std::ffi::c_void, name: &str) -> Option<*mut std::ffi::c_void> {
+    let attr = objc2_core_foundation::CFString::from_str(name);
+    let mut value: *mut std::ffi::c_void = std::ptr::null_mut();
+    if AXUIElementCopyAttributeValue(element, &*attr, &mut value) != 0 || value.is_null() {
+        return None;
+    }
+    Some(value)
+}
+
+unsafe fn ax_copy_string(element: *mut std::ffi::c_void, name: &str) -> Option<String> {
+    let value = ax_copy(element, name)?;
+    let out = if CFGetTypeID(value) == CFStringGetTypeID() {
+        Some((*(value as *const objc2_core_foundation::CFString)).to_string())
+    } else {
+        None
+    };
+    CFRelease(value);
+    out.filter(|s| !s.trim().is_empty())
+}
+
+/// Title of the app's focused window (falling back to its first window) —
+/// the "what is already showing" evidence on the focus_app result.
+fn front_window_title(pid: i32) -> Option<String> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let mut title = None;
+        if let Some(win) = ax_copy(app, "AXFocusedWindow") {
+            title = ax_copy_string(win, "AXTitle");
+            CFRelease(win);
+        }
+        if title.is_none() {
+            if let Some(windows) = ax_copy(app, "AXWindows") {
+                if let Some(first) = first_of_cf_array(windows) {
+                    title = ax_copy_string(first, "AXTitle");
+                }
+                CFRelease(windows);
+            }
+        }
+        CFRelease(app);
+        title
+    }
+}
+
+/// Bring one of the app's existing windows back on screen — un-minimize it
+/// and raise it — so a fronted app that HAS windows (minimized, or parked
+/// on another Space) shows one instead of the model opening a second.
+/// Returns whether a window was found to restore.
+fn restore_a_window(pid: i32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let mut restored = false;
+        if let Some(windows) = ax_copy(app, "AXWindows") {
+            if let Some(first) = first_of_cf_array(windows) {
+                if let Some(no) = objc2_core_foundation::kCFBooleanFalse {
+                    let minimized = objc2_core_foundation::CFString::from_str("AXMinimized");
+                    let _ = AXUIElementSetAttributeValue(
+                        first,
+                        &*minimized,
+                        no as *const objc2_core_foundation::CFBoolean as *const std::ffi::c_void,
+                    );
+                }
+                let raise = objc2_core_foundation::CFString::from_str("AXRaise");
+                let _ = AXUIElementPerformAction(first, &*raise);
+                restored = true;
+            }
+            CFRelease(windows);
+        }
+        CFRelease(app);
+        restored
+    }
+}
+
 /// Pid of a running app by localized name (for the window count readback).
 pub(crate) fn pid_for_app_name(name: &str) -> Option<i32> {
     let workspace = NSWorkspace::sharedWorkspace();
@@ -203,17 +332,36 @@ pub(crate) fn pid_for_app_name(name: &str) -> Option<i32> {
     None
 }
 
-/// Assemble the verified report: the fronted name plus the visible-window
-/// evidence (the "frontmost but nothing on screen" trap detector).
-fn focused_report(app: String, launched: bool) -> FocusedApp {
-    let visible_windows = pid_for_app_name(&app).and_then(visible_window_count);
+/// Assemble the verified report: the fronted name, the visible-window
+/// evidence (the "frontmost but nothing on screen" trap detector) and the
+/// front window's title. The count is SETTLED, not instant: it polls up to
+/// `WINDOW_SETTLE_MS` for a window to land on screen, and when the app has
+/// windows that stay off screen (minimized / another Space) it restores one
+/// itself — `Some(0)` now means the app truly has no window.
+async fn focused_report(app: String, launched: bool) -> FocusedApp {
+    let pid = pid_for_app_name(&app);
+    let mut visible_windows = pid.and_then(visible_window_count);
+    if let Some(pid) = pid {
+        let deadline = Instant::now() + Duration::from_millis(WINDOW_SETTLE_MS);
+        while visible_windows == Some(0) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(WINDOW_POLL_MS)).await;
+            visible_windows = visible_window_count(pid);
+        }
+        if visible_windows == Some(0) && restore_a_window(pid) {
+            log::info!("focus_app: {app:?} had no window on screen — restored one");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            visible_windows = visible_window_count(pid);
+        }
+    }
     if visible_windows == Some(0) {
         log::warn!("focus_app: {app:?} is frontmost with ZERO visible windows");
     }
+    let front_window = pid.and_then(front_window_title);
     FocusedApp {
         app,
         launched,
         visible_windows,
+        front_window,
     }
 }
 /// Snapshot the localized names of the currently running apps. Apps without a
@@ -382,7 +530,7 @@ impl AppFocus for MacosAppFocus {
                 if accepted {
                     if let Some(front) = verify_fronted(&matched, ACTIVATE_VERIFY_MS).await {
                         log::info!("focus_app: activated {front:?}");
-                        return Ok(focused_report(front, false));
+                        return Ok(focused_report(front, false).await);
                     }
                 }
                 // The OS refused, quietly dropped the request (cooperative
@@ -397,7 +545,7 @@ impl AppFocus for MacosAppFocus {
                 {
                     Ok(front) => {
                         log::info!("focus_app: fronted {front:?} via reopen");
-                        Ok(focused_report(front, false))
+                        Ok(focused_report(front, false).await)
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };
@@ -425,7 +573,7 @@ impl AppFocus for MacosAppFocus {
                 match open_and_verify(OpenTarget::Bundle(&path), &name, LAUNCH_VERIFY_MS).await {
                     Ok(front) => {
                         log::info!("focus_app: launched and fronted {front:?}");
-                        Ok(focused_report(front, true))
+                        Ok(focused_report(front, true).await)
                     }
                     Err(detail) => {
                         let err = AppFocusError::ActivationFailed { detail };

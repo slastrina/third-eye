@@ -56,6 +56,12 @@ pub struct FocusedApp {
     /// running with all windows closed) the model must react to; `None`
     /// when the platform can't count (fallback, or the list call failed).
     pub visible_windows: Option<usize>,
+    /// Title of the window that is now in front for the app (its focused
+    /// window, or the first visible one) — the model's evidence of WHAT is
+    /// already showing ("eBay: nike shoes"), so a follow-up works in that
+    /// window/tab instead of opening another. `None` when unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front_window: Option<String>,
 }
 
 /// The full app-focus failure taxonomy (R007). Serialized with a `kind` tag
@@ -182,6 +188,7 @@ mod tests {
                     app: app.clone(),
                     launched: false,
                     visible_windows: None,
+                    front_window: None,
                 }),
                 None => Err(AppFocusError::NotFound {
                     requested: app_name.to_string(),
@@ -232,10 +239,23 @@ mod tests {
             app: "Google Chrome".into(),
             launched: true,
             visible_windows: None,
+            front_window: Some("eBay: nike shoes".into()),
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["app"], "Google Chrome");
         assert_eq!(v["launched"], true);
+        assert_eq!(v["frontWindow"], "eBay: nike shoes");
+        let bare = FocusedApp {
+            front_window: None,
+            ..f
+        };
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("frontWindow")
+                .is_none(),
+            "an unreadable title is absent, not null"
+        );
     }
 
     #[test]

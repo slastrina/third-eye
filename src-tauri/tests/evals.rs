@@ -208,6 +208,7 @@ impl AppFocus for AlwaysFocus {
             app: app_name.to_string(),
             launched: false,
             visible_windows: Some(1),
+            front_window: None,
         })
     }
     async fn running_apps(&self) -> Vec<String> {
@@ -1502,6 +1503,31 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
     assert!(
         teach.contains("TEACH ME MODE") && !teach.contains("call web_search"),
         "teach prompt replaces the browsing playbook"
+    );
+    // 2026-08-30 incidents: the human way works in the CURRENT tab (cmd+l,
+    // never cmd+t), and a terminal command is submitted with a newline or
+    // Return — the "typed it but never pressed Enter" loop.
+    assert!(
+        teach.contains("key-press \"l\" with [\"cmd\"]") && !teach.contains("key-press \"t\" with"),
+        "teach search reuses the current tab's address bar"
+    );
+    assert!(
+        teach.contains("ending with a newline (the newline presses Return)")
+            && teach.contains("then read_page to read the output"),
+        "teach terminal clause missing (submit with newline, read output via read_page)"
+    );
+    // screen_query reads the focused window by default; the whole display is
+    // an explicit opt-in — pinned on the tool contract the model sees.
+    let sq = third_eye_lib::llm::toolloop::ScreenQueryTool::definition();
+    assert_eq!(
+        sq.parameters["properties"]["scope"]["enum"],
+        serde_json::json!(["window", "screen"])
+    );
+    assert!(sq.description.contains("front window (fast)"));
+    let browsing = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy", false);
+    assert!(
+        browsing.contains("ONE Third Eye tab") && browsing.contains("do NOT open it again"),
+        "one-tab clause missing from the browsing contract"
     );
     assert!(
         third_eye_lib::llm::toolloop::system_prompt_for_lane("coder", true)

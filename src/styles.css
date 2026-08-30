@@ -1464,6 +1464,20 @@ body,
   opacity: 0.85;
 }
 
+/* Nudge context (2026-08-30): the chip that shows the next question is
+   grounded in what Third Eye nudged about — same green as the banner. */
+.attach-chip--nudge {
+  border-color: rgba(147, 218, 73, 0.4);
+  max-width: 100%;
+}
+
+.attach-chip--nudge .attach-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
 .model-workspace {
   font-size: 10.5px;
   color: var(--te-text-mid);

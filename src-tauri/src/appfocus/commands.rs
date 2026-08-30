@@ -62,6 +62,7 @@ mod tests {
                 app: "TARGET".into(),
                 launched: false,
                 visible_windows: None,
+                front_window: None,
             })
         }
 

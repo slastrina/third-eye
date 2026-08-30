@@ -709,6 +709,29 @@ export function freshNudgePreload(
   return nowMs - preload.capturedAtMs <= NUDGE_PRELOAD_FRESH_MS ? preload : null;
 }
 
+/** How the staged nudge context is shown in the composer's context row —
+ *  the user can SEE that the next question is grounded in what Third Eye
+ *  nudged them about (message, app, how long ago), not guess at it. Pure. */
+export function nudgeChipLabel(payload: NudgePayload, nowMs: number): string {
+  const ageMs = Math.max(0, nowMs - payload.capturedAtMs);
+  const age =
+    ageMs < 15_000
+      ? "just now"
+      : ageMs < 60_000
+        ? `${Math.round(ageMs / 1000)}s ago`
+        : `${Math.round(ageMs / 60_000)}m ago`;
+  const where = payload.appContext ? ` · ${payload.appContext}` : "";
+  return `nudge · ${payload.message}${where} · ${age}`;
+}
+
+/** The chip's hover detail: the screen text the nudge was grounded in,
+ *  clipped so a tooltip stays a tooltip. */
+export function nudgeChipDetail(payload: NudgePayload, maxChars = 400): string {
+  const text = payload.screenText.trim().replace(/\s+/g, " ");
+  const clipped = text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+  return `Grounds your next question in what was on screen when Third Eye nudged you${payload.appContext ? ` (${payload.appContext})` : ""}:\n${clipped}`;
+}
+
 export function onNudgeShow(cb: (payload: NudgePayload) => void): Promise<UnlistenFn> {
   return listen<NudgePayload>(NUDGE_SHOW_EVENT, (e) => cb(e.payload));
 }
@@ -1374,6 +1397,9 @@ export type ChatAction =
   | { type: "privacy"; status: PrivacyStatus }
   | { type: "nudge-shown"; payload: NudgePayload }
   | { type: "nudge-dismissed"; reason: NudgeDismissReason }
+  // The user removed the nudge-context chip: the next question goes out
+  // ungrounded, exactly as if the nudge had never been summoned.
+  | { type: "nudge-preload-cleared" }
   | { type: "run-state"; phase: RunPhase }
   // The New-chat control (I3): clear the conversation, keep the environment
   // snapshots (routing, permissions, privacy, nudge) — they describe the
@@ -1881,6 +1907,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         nudgePreload: action.reason === "disabled" ? null : state.nudge,
       };
     }
+    case "nudge-preload-cleared":
+      return { ...state, nudgePreload: null };
     case "run-state":
       // The backend's broadcast is authoritative: "running" when a run is live,
       // "idle"/"stopped" once it ends. Drives the Stop control's visibility.
