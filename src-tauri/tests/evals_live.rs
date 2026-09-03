@@ -30,8 +30,17 @@ use third_eye_lib::llm::toolloop::{
     ToolOutcome, UrlGroundingExecutor, UrlSeen, WebSearchTool, CHAT_HISTORY_SEARCH_TOOL,
     INPUT_ACTION_TOOL, READ_PAGE_TOOL, REPEATED_CALL_KIND, SCREEN_QUERY_TOOL, WEB_SEARCH_TOOL,
 };
+use third_eye_lib::llm::tools::browser::{
+    BrowserBackend, BrowserError, BrowserTool, Found, TabInfo,
+};
+use third_eye_lib::llm::tools::find_files::{FileSearch, FindFilesTool, SpotlightQuery};
+use third_eye_lib::llm::tools::mac::{
+    CalendarEvent, Due, MacError, MacServices, MacTool, SystemInfo,
+};
+use third_eye_lib::llm::tools::ui_action::{AxActions, UiActionTool};
 use third_eye_lib::llm::{ChatMessage, ToolCall, ToolDefinition};
 use third_eye_lib::memory::MemoryStore;
+use third_eye_lib::screenquery::ax::{AxAct, AxActionError, AxActionReport};
 use third_eye_lib::screenquery::{ScreenElement, ScreenQuery, ScreenQueryError};
 use third_eye_lib::workspace::exec_tool::{
     RunInWorkspaceTool, TerminalSink, RUN_IN_WORKSPACE_TOOL,
@@ -85,6 +94,7 @@ impl AppFocus for AnyFocus {
         let name = match app_name.to_ascii_lowercase().as_str() {
             n if n.contains("chrome") => "Google Chrome",
             n if n.contains("term") => "Terminal",
+            n if n.contains("textedit") || n.contains("text edit") => "TextEdit",
             _ => app_name,
         }
         .to_string();
@@ -132,7 +142,9 @@ impl StubScreen {
 #[async_trait]
 impl ScreenQuery for StubScreen {
     async fn page_text(&self, app: &str) -> Option<String> {
-        Some(if app.contains("Terminal") {
+        Some(if app.contains("TextEdit") {
+            "Untitled\nDear team,\nthe draft is attached.\n[Save] [Cancel]".into()
+        } else if app.contains("Terminal") {
             "Last login: Wed Sep 3 10:00:00\n➜  ~ ls -la\ntotal 16\ndrwxr-xr-x  notes.txt\n\
              drwxr-xr-x  photos\n-rw-r--r--  todo.md\n➜  ~ "
                 .into()
@@ -164,6 +176,25 @@ impl ScreenQuery for StubScreen {
             app: Some("Google Chrome".into()),
             role: Some(role.into()),
         };
+        let focused = self.0.app.lock().unwrap().clone();
+        if focused.contains("TextEdit") {
+            let te = |text: &str, cx: i32, cy: i32, role: &str| ScreenElement {
+                text: text.into(),
+                x: cx - 100,
+                y: cy - 15,
+                width: 200,
+                height: 30,
+                cx,
+                cy,
+                app: Some("TextEdit".into()),
+                role: Some(role.into()),
+            };
+            return Ok(vec![
+                te("Dear team, the draft is attached.", 640, 300, "AXTextArea"),
+                te("Save", 700, 520, "AXButton"),
+                te("Cancel", 560, 520, "AXButton"),
+            ]);
+        }
         Ok(if self.searched_lasagna() {
             vec![
                 el("lasagna recipe", 840, 240, "AXTextField"),
@@ -263,6 +294,183 @@ impl TerminalSink for NullSink {
     fn chunk(&self, _call_id: &str, _text: &str) {}
 }
 
+/// System-tool doubles (S7 live scenarios): record what the model asked.
+#[derive(Default)]
+struct SysCalls(Mutex<Vec<String>>);
+
+struct FakeAx(Arc<SysCalls>);
+#[async_trait]
+impl AxActions for FakeAx {
+    async fn act(
+        &self,
+        app: &str,
+        title: &str,
+        role: Option<&str>,
+        act: AxAct,
+    ) -> Result<AxActionReport, AxActionError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("ui_action {app} {title:?} {role:?} {act:?}"));
+        Ok(AxActionReport {
+            matched_role: "AXButton".into(),
+            matched_title: title.into(),
+            value_after: None,
+            focused_after: Some(format!("AXButton: {title}")),
+        })
+    }
+}
+
+struct FakeBrowser(Arc<SysCalls>);
+fn ebay_tab() -> TabInfo {
+    TabInfo {
+        id: 1,
+        window_id: 1,
+        title: "nike air max | eBay".into(),
+        url: "https://www.ebay.com/sch/i.html?_nkw=nike+air+max".into(),
+        active: true,
+    }
+}
+#[async_trait]
+impl BrowserBackend for FakeBrowser {
+    async fn tabs(&self) -> Result<Vec<TabInfo>, BrowserError> {
+        Ok(vec![ebay_tab()])
+    }
+    async fn front(&self) -> Result<TabInfo, BrowserError> {
+        Ok(ebay_tab())
+    }
+    async fn switch(&self, id: i64) -> Result<TabInfo, BrowserError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("browser switch {id}"));
+        Ok(ebay_tab())
+    }
+    async fn navigate(&self, url: &str) -> Result<TabInfo, BrowserError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("browser navigate {url}"));
+        Ok(ebay_tab())
+    }
+    async fn back(&self) -> Result<TabInfo, BrowserError> {
+        self.0 .0.lock().unwrap().push("browser back".into());
+        Ok(ebay_tab())
+    }
+    async fn page_text(&self) -> Result<String, BrowserError> {
+        Ok("nike air max | eBay
+Nike Air Max 90 - $89.99
+Buy It Now
+Nike Air Max 95 - $45.00
+Buy It Now"
+            .into())
+    }
+    async fn find(&self, text: &str) -> Result<Vec<Found>, BrowserError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("browser find {text}"));
+        Ok(vec![
+            Found {
+                id: 1,
+                tag: "a".into(),
+                text: "Nike Air Max 90 - $89.99".into(),
+                href: Some("https://www.ebay.com/itm/1".into()),
+            },
+            Found {
+                id: 2,
+                tag: "a".into(),
+                text: "Nike Air Max 95 - $45.00".into(),
+                href: Some("https://www.ebay.com/itm/2".into()),
+            },
+            Found {
+                id: 3,
+                tag: "button".into(),
+                text: "Buy It Now".into(),
+                href: None,
+            },
+        ])
+    }
+    async fn click(&self, id: i64) -> Result<String, BrowserError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("browser click {id}"));
+        Ok("clicked".into())
+    }
+    async fn fill(&self, id: i64, v: &str) -> Result<String, BrowserError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("browser fill {id} {v}"));
+        Ok(v.into())
+    }
+}
+
+struct FakeSearch(Arc<SysCalls>);
+#[async_trait]
+impl FileSearch for FakeSearch {
+    async fn search(&self, q: &SpotlightQuery) -> Result<Vec<std::path::PathBuf>, String> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("find_files {} kind={:?}", q.text, q.kind));
+        Ok(vec![std::path::PathBuf::from(
+            "/Users/alex/Documents/Tax Return 2025.pdf",
+        )])
+    }
+}
+
+struct FakeMac(Arc<SysCalls>);
+#[async_trait]
+impl MacServices for FakeMac {
+    async fn notify(&self, t: &str, b: &str) -> Result<(), MacError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("mac notify {t} {b}"));
+        Ok(())
+    }
+    async fn speak(&self, t: &str) -> Result<(), MacError> {
+        self.0 .0.lock().unwrap().push(format!("mac speak {t}"));
+        Ok(())
+    }
+    async fn system_info(&self) -> SystemInfo {
+        SystemInfo {
+            battery_percent: Some(28),
+            charging: Some(true),
+            ..SystemInfo::default()
+        }
+    }
+    async fn run_shortcut(&self, n: &str, _i: Option<&str>) -> Result<String, MacError> {
+        self.0 .0.lock().unwrap().push(format!("mac shortcut {n}"));
+        Ok("ok".into())
+    }
+    async fn calendar_today(&self) -> Result<Vec<CalendarEvent>, MacError> {
+        Ok(vec![])
+    }
+    async fn reminder_add(&self, t: &str, d: Option<Due>) -> Result<(), MacError> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(format!("mac reminder {t} {d:?}"));
+        Ok(())
+    }
+    async fn note_add(&self, t: &str, _b: &str) -> Result<(), MacError> {
+        self.0 .0.lock().unwrap().push(format!("mac note {t}"));
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -335,6 +543,7 @@ struct Scenario {
 
 /// Per-run doubles the scorer inspects after the fact.
 struct Fixture {
+    sys: Arc<SysCalls>,
     input: Arc<RecordingInput>,
     opener: Arc<RecordedOpener>,
     store: Arc<MemoryStore>,
@@ -358,6 +567,7 @@ impl Fixture {
             )
             .unwrap();
         Self {
+            sys: Arc::new(SysCalls::default()),
             input: Arc::new(RecordingInput {
                 actions: Mutex::new(Vec::new()),
                 app: Mutex::new("Finder".into()),
@@ -421,6 +631,53 @@ impl Fixture {
             Box::new(read),
             Box::new(web),
             Box::new(StubRunner),
+        ]);
+        CompositeExecutor::new(vec![Box::new(
+            UrlGroundingExecutor::new(inner, seen).with_opener(self.opener.clone()),
+        )])
+    }
+
+    /// The browsing stack plus the S2–S6 system tools over doubles.
+    fn system(&self) -> CompositeExecutor {
+        let (gate, screen, read, screen_seen, focused) = self.hid();
+        let wl = || Arc::new(Mutex::new(SessionWhitelist::new()));
+        let seen = Arc::new(UrlSeen::new());
+        let web = WebSearchTool::new(
+            ScreenQueryTool::new(
+                Arc::new(StubScreen(self.input.clone())),
+                screen_seen,
+                focused.clone(),
+            ),
+            seen.clone(),
+            self.opener.clone(),
+        );
+        let inner = CompositeExecutor::new(vec![
+            Box::new(gate),
+            Box::new(screen),
+            Box::new(read),
+            Box::new(web),
+            Box::new(UiActionTool::new(
+                Arc::new(FakeAx(self.sys.clone())),
+                focused,
+                HidRunMode::AutoRun,
+                wl(),
+                Arc::new(AllowAll),
+            )),
+            Box::new(BrowserTool::new(
+                Arc::new(FakeBrowser(self.sys.clone())),
+                Arc::new(StubScreen(self.input.clone())),
+                HidRunMode::AutoRun,
+                wl(),
+                Arc::new(AllowAll),
+                false,
+            )),
+            Box::new(FindFilesTool::new(Arc::new(FakeSearch(self.sys.clone())))),
+            Box::new(MacTool::new(
+                Arc::new(FakeMac(self.sys.clone())),
+                HidRunMode::AutoRun,
+                wl(),
+                Arc::new(AllowAll),
+            )),
         ]);
         CompositeExecutor::new(vec![Box::new(
             UrlGroundingExecutor::new(inner, seen).with_opener(self.opener.clone()),
@@ -825,6 +1082,130 @@ fn scenarios() -> Vec<Scenario> {
                 vec![
                     ("no input action succeeded", !run.events.iter().any(|e| matches!(e, ToolEvent::Result(r) if r.name == INPUT_ACTION_TOOL && r.ok))),
                     ("answer does not claim it clicked or typed", !claims),
+                    answered(run),
+                ]
+            },
+        },
+        Scenario {
+            name: "ui_press_by_name",
+            lane: "heavy",
+            teach: false,
+            ask: "in TextEdit, press the Save button",
+            env: Some("Environment: the frontmost app right now is TextEdit."),
+            build: |f| f.system(),
+            score: |f, run| {
+                let sys = f.sys.0.lock().unwrap().clone();
+                // The OUTCOME is what counts: Save pressed by name through
+                // ui_action, or a grounded click on the Save element the
+                // screen read returned (700,520). The 9B prefers the click
+                // it knows — a prose preference does not move it; making
+                // AX-press the structural path for role'd clicks is the
+                // follow-up.
+                let by_name = sys.iter().any(|c| {
+                    c.starts_with("ui_action") && c.contains("\"Save\"") && c.contains("Press")
+                });
+                let by_click = f.input.actions.lock().unwrap().iter().any(
+                    |a| matches!(a, InputAction::MouseClick { x: Some(x), y: Some(y), .. } if (*x - 700).abs() < 40 && (*y - 520).abs() < 20),
+                );
+                vec![
+                    ("Save pressed (ui_action or a grounded click on Save)", by_name || by_click),
+                    ("no click on Cancel", !f.input.actions.lock().unwrap().iter().any(|a| matches!(a, InputAction::MouseClick { x: Some(x), .. } if (*x - 560).abs() < 40))),
+                    no_repeats(run),
+                    answered(run),
+                ]
+            },
+        },
+        Scenario {
+            name: "browser_click",
+            lane: "heavy",
+            teach: false,
+            ask: "on the ebay page that's open, open the $45 Air Max 95 listing",
+            env: Some(
+                "Environment: the frontmost app right now is Google Chrome.\n\
+                 The browser (Google Chrome) already shows: \"nike air max | eBay\" — \
+                 https://www.ebay.com/sch/i.html?_nkw=nike+air+max. If the request is about that \
+                 page, work IN it — do not open it again.",
+            ),
+            build: |f| f.system(),
+            score: |f, run| {
+                let sys = f.sys.0.lock().unwrap().clone();
+                let clicked_45 = sys.iter().any(|c| c == "browser click 2")
+                    || f.input.actions.lock().unwrap().iter().any(|a| {
+                        matches!(
+                            a,
+                            InputAction::MouseClick {
+                                x: Some(900),
+                                y: Some(640),
+                                ..
+                            }
+                        )
+                    });
+                vec![
+                    (
+                        "used the page (browser find/click or a grounded click)",
+                        clicked_45,
+                    ),
+                    (
+                        "no new tab / navigation",
+                        !sys.iter().any(|c| c.starts_with("browser navigate"))
+                            && f.opener.0.lock().unwrap().is_empty(),
+                    ),
+                    no_repeats(run),
+                    answered(run),
+                ]
+            },
+        },
+        Scenario {
+            name: "find_file",
+            lane: "heavy",
+            teach: false,
+            ask: "find my tax return pdf",
+            env: None,
+            build: |f| f.system(),
+            score: |f, run| {
+                let sys = f.sys.0.lock().unwrap().clone();
+                let cs = calls(&run.events);
+                vec![
+                    (
+                        "find_files called",
+                        sys.iter().any(|c| {
+                            c.starts_with("find_files") && c.to_lowercase().contains("tax")
+                        }),
+                    ),
+                    (
+                        "no shell find/mdfind",
+                        !cs.iter().any(|c| c.name == "run_command"),
+                    ),
+                    (
+                        "answer names the file",
+                        run.text.contains("Tax Return 2025"),
+                    ),
+                    answered(run),
+                ]
+            },
+        },
+        Scenario {
+            name: "reminder",
+            lane: "thin",
+            teach: false,
+            ask: "remind me to call mum on 2026-09-05 at 17:30",
+            env: None,
+            build: |f| f.system(),
+            score: |f, run| {
+                let sys = f.sys.0.lock().unwrap().clone();
+                vec![
+                    (
+                        "mac reminder_add with the title",
+                        sys.iter().any(|c| {
+                            c.starts_with("mac reminder") && c.to_lowercase().contains("mum")
+                        }),
+                    ),
+                    (
+                        "with the given date",
+                        sys.iter().any(|c| {
+                            c.contains("year: 2026, month: 9, day: 5, hour: 17, minute: 30")
+                        }),
+                    ),
                     answered(run),
                 ]
             },

@@ -321,7 +321,7 @@ fn restore_a_window(pid: i32) -> bool {
 }
 
 /// Pid of a running app by localized name (for the window count readback).
-pub(crate) fn pid_for_app_name(name: &str) -> Option<i32> {
+pub fn pid_for_app_name(name: &str) -> Option<i32> {
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
     for app in apps.iter() {

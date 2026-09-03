@@ -127,7 +127,7 @@ More vocabulary: mouse-click with clicks 2 double-clicks (open a file, select a 
 
 Every x,y you pass MUST come from the most recent screen_query — never guess coordinates. A click or move to a coordinate you did not read from screen_query will be refused. After you focus_app the screen changes, so call screen_query again before you click.
 
-Always focus_app FIRST, before screen_query. Once you have focused an app, screen_query returns only that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it hides the user's windows instead of doing what they asked.
+Always focus_app FIRST, before screen_query. When the user says "this" about text they highlighted, text_selection {action: get} reads it from whatever app is focused, and text_selection {action: replace, text} writes your result back in place. To locate a file or folder, find_files (Spotlight: name, contents, kind, folder, recency) — never find/grep/ls commands; processes lists what is running and can end one (the user is always asked). The mac tool covers the small system things — a notification, speaking a sentence aloud, battery/volume/dark-mode via system_info, today's calendar, adding a reminder or a note, and run_shortcut for the user's own Shortcuts. Once you have focused an app, screen_query returns only that app's on-screen elements — so only ever aim at an element screen_query returned. Never click a coordinate that is not one of those elements: an empty spot is the desktop wallpaper, and clicking it hides the user's windows instead of doing what they asked.
 
 Every input_action result carries a `verified` block — what ACTUALLY happened, measured from the OS after the action: `cursor` is where the mouse really ended up, `focus` names the app and UI element that now holds keyboard focus (its role, title, and current value), and for type-text `textEntered` reports whether your text was really observed in the focused field. VALIDATE every action against it before moving on: after a mouse-click, verified.clickedElement names the UI element that was actually under the click (its role and title) — if it is not the thing you aimed at (wrong title, role AXGroup instead of the link/button you wanted), the click landed off target: screen_query again and re-aim at a better element. After clicking a text field, verified.focus should name that field in the app you focused; after type-text, verified.textEntered should be true and verified.focus.value should contain what you typed. If verified contradicts your intent — the focused app is wrong, textEntered is false, the value is missing your text — the action landed in the wrong place: call screen_query again, re-aim, and retry instead of continuing the sequence. When the evidence shows your action landed in a DIFFERENT app than the one you focused, the tool fails it for you (kind verification-failed) — treat that like any failed step: screen_query, re-aim, retry.
 
@@ -148,7 +148,7 @@ When a tool refuses — kind `disabled`, `approval-denied`, `verification-failed
 /// URLs vs. on-page search box vs. address-bar typing) whose per-run
 /// coin flips were the ebay inconsistency (user report 2026-08-17).
 pub const HID_SYSTEM_PROMPT_BROWSING: &str = r#"WEB SEARCH — the ONE way to find things online: call web_search with the query, and site "ebay", "amazon", or "youtube" when the user wants that site (default google). It opens the results page and returns what is on screen with exact click coordinates: pick the best result, mouse-click its cx,cy, then read_page to extract the actual information before answering. NEVER compose search or product URLs by hand, never type URLs into the address bar, and never google another site's listings when web_search can search that site directly.
-Direct navigation is only for URLs the user gave you or that appeared in a page or tool result (run_command `open <url>`). READ the page that is already open (screen_query or read_page) before opening another one — opening page after page without reading is refused (too-many-opens); prefer clicking links on the open page over new navigations.
+Direct navigation is only for URLs the user gave you or that appeared in a page or tool result — use open {url} (never run_command open). After opening a page or app, wait_for_text for something you expect to see (the page title, a button) instead of guessing wait times. For any element screen_query listed WITH a role (AXButton, AXLink, AXTextField…), ui_action presses / sets / focuses it by name through accessibility — no mouse, no coordinates, no misses; mouse-click is for elements that only OCR found. On a web page in Chrome, browser {action: find, text} then browser {action: click, id} (or fill) works on the page's own links, buttons and fields — no pixels; browser page_text reads the page; browser tabs / switch move between open tabs instead of opening new ones. READ the page that is already open (screen_query or read_page) before opening another one — opening page after page without reading is refused (too-many-opens); prefer clicking links on the open page over new navigations.
 When the browser already shows the site you need, work IN that window — click its controls, use its filters. A follow-up that refines a search ("only under $50", "now the PC version") means refine on the SAME site: another web_search there or the site's own filters. Every web_search and open lands in ONE Third Eye tab that is reused — never press cmd+t or cmd+n to get "a fresh" tab or window, and when the Environment line says the browser already shows the page the user is talking about, do NOT open it again: focus_app the browser, screen_query, and act on that page."#;
 
 /// The coding contract (coder lane only).
@@ -181,7 +181,10 @@ pub fn system_prompt_for_lane(lane: &str, teach: bool) -> String {
 /// human at the keyboard does not have. Pure — the assembly filter and the
 /// tests share it.
 pub fn teach_mode_strips(tool: &str) -> bool {
-    tool == "run_command" || tool == WEB_SEARCH_TOOL || tool == "run_in_workspace"
+    tool == "run_command"
+        || tool == WEB_SEARCH_TOOL
+        || tool == "run_in_workspace"
+        || tool == crate::llm::tools::ui_action::UI_ACTION_TOOL
 }
 
 /// Every clause in one string — the prompt-contract eval surface (each
@@ -833,6 +836,45 @@ impl UrlGroundingExecutor {
         self.opener = Some(opener);
         self
     }
+
+    /// Why a navigation to `url` must not happen now: ungrounded (never
+    /// given or read), or past the open budget without having read the
+    /// page that is open. `None` = go ahead.
+    fn refuse_navigation(&self, url: &str) -> Option<ToolOutcome> {
+        if !url_is_open_by_default(url) && !self.seen.contains(url) {
+            log::warn!("llm: navigation refused — ungrounded url {url:?}");
+            return Some(ToolOutcome::failure(
+                UNGROUNDED_URL_KIND,
+                format!(
+                    "{url} was never given by the user or read from a page — you cannot \
+                     know it exists, and opening guessed URLs floods the browser with \
+                     dead tabs. To FIND something: web_search (or open ONE search-results \
+                     URL), then screen_query and CLICK the result you want. URLs the user \
+                     typed, or that appeared in a tool result, open fine."
+                ),
+            ));
+        }
+        // The progress rule (2026-08-17, replacing the fixed cap's
+        // premature quitting): past the free budget, another open is
+        // EARNED by reading the page you already have — blind
+        // open-after-open still stops.
+        let past_budget = self.opens.load(std::sync::atomic::Ordering::SeqCst) >= MAX_OPENS_PER_RUN;
+        if past_budget
+            && !self
+                .read_since_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            log::warn!("llm: navigation refused — unread page open ({url:?})");
+            return Some(ToolOutcome::failure(
+                TOO_MANY_OPENS_KIND,
+                "you opened a page and have not read it — screen_query or read_page \
+                 the page that is open (and click its links) before navigating \
+                 anywhere else."
+                    .to_string(),
+            ));
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -870,44 +912,44 @@ impl ToolExecutor for UrlGroundingExecutor {
                 }
             }
         }
+        // The typed `open {url}` tool (S1) and `browser navigate` (S3) are
+        // navigation too: same grounding and the same progress budget as a
+        // shell `open`, then the tool itself performs the (one-tab) open.
+        let is_browser_navigate = call.name == crate::llm::tools::browser::BROWSER_TOOL
+            && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .is_some_and(|v| v.get("action").and_then(|a| a.as_str()) == Some("navigate"));
+        if call.name == crate::llm::tools::open::OPEN_TOOL || is_browser_navigate {
+            let url = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("url")
+                        .and_then(|u| u.as_str())
+                        .map(str::trim)
+                        .map(String::from)
+                })
+                .filter(|u| !u.is_empty());
+            if let Some(url) = url {
+                if let Some(refusal) = self.refuse_navigation(&url) {
+                    return refusal;
+                }
+                let outcome = self.inner.execute(call).await;
+                if outcome.ok {
+                    self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.read_since_open
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.seen.harvest(&outcome.content);
+                return outcome;
+            }
+        }
         if call.name == crate::command_runner::RUN_COMMAND_TOOL {
             let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from));
             if let Some(url) = command.as_deref().and_then(open_command_url) {
-                if !url_is_open_by_default(&url) && !self.seen.contains(&url) {
-                    log::warn!("llm: run_command refused — ungrounded url {url:?}");
-                    return ToolOutcome::failure(
-                        UNGROUNDED_URL_KIND,
-                        format!(
-                            "{url} was never given by the user or read from a page — you cannot \
-                             know it exists, and opening guessed URLs floods the browser with \
-                             dead tabs. To FIND something: open ONE search-results URL (e.g. \
-                             https://www.google.com/search?q=…), then screen_query and CLICK \
-                             the result you want. URLs the user typed, or that appeared in a \
-                             tool result, open fine."
-                        ),
-                    );
-                }
-                // The progress rule (2026-08-17, replacing the fixed cap's
-                // premature quitting): past the free budget, another open
-                // is EARNED by reading the page you already have — blind
-                // open-after-open still stops.
-                let past_budget =
-                    self.opens.load(std::sync::atomic::Ordering::SeqCst) >= MAX_OPENS_PER_RUN;
-                if past_budget
-                    && !self
-                        .read_since_open
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    log::warn!("llm: run_command refused — unread page open ({url:?})");
-                    return ToolOutcome::failure(
-                        TOO_MANY_OPENS_KIND,
-                        "you opened a page and have not read it — screen_query or read_page \
-                         the page that is open (and click its links) before navigating \
-                         anywhere else."
-                            .to_string(),
-                    );
+                if let Some(refusal) = self.refuse_navigation(&url) {
+                    return refusal;
                 }
                 let outcome = match &self.opener {
                     // One tab: the navigation lands in Third Eye's own tab
@@ -936,12 +978,23 @@ impl ToolExecutor for UrlGroundingExecutor {
         }
         let outcome = self.inner.execute(call).await;
         // A successful read earns the next navigation (progress rule); a
-        // web_search both opened and read, so it satisfies itself.
+        // web_search both opened and read, so it satisfies itself. The
+        // browser tool's tabs / page_text / find are reads too.
+        let browser_read = call.name == crate::llm::tools::browser::BROWSER_TOOL
+            && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .is_some_and(|v| {
+                    matches!(
+                        v.get("action").and_then(|a| a.as_str()),
+                        Some("page_text") | Some("find") | Some("tabs")
+                    )
+                });
         if outcome.ok
-            && matches!(
-                call.name.as_str(),
-                SCREEN_QUERY_TOOL | READ_PAGE_TOOL | WEB_SEARCH_TOOL
-            )
+            && (browser_read
+                || matches!(
+                    call.name.as_str(),
+                    SCREEN_QUERY_TOOL | READ_PAGE_TOOL | WEB_SEARCH_TOOL
+                ))
         {
             self.read_since_open
                 .store(true, std::sync::atomic::Ordering::SeqCst);

@@ -30,6 +30,11 @@ pub fn write_text(text: &str) -> Result<(), String> {
     platform::write(text)
 }
 
+/// Read the clipboard's text (the selection tool's fallback path).
+pub fn read_text() -> Result<Option<String>, String> {
+    platform::read()
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};

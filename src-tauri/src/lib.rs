@@ -302,6 +302,7 @@ pub fn run() {
             workspace::commands::set_workspace_roots,
             bridge::bridge_status,
             integrations::integrations_status,
+            llm::tools::browser::chrome_js_status_cmd,
             integrations::install_cli,
             integrations::remove_cli,
             integrations::install_finder_action,

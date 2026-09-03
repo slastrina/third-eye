@@ -243,6 +243,13 @@ pub fn frontmost_app_name() -> Option<String> {
     app.localizedName().map(|n| n.to_string())
 }
 
+/// Pid of the app owning the frontmost window — the per-app AX entry point
+/// (system-wide AX queries fail with kAXErrorCannotComplete from helper
+/// processes; the app element never does).
+pub fn frontmost_app_pid() -> Option<i32> {
+    frontmost_window_owner_pid()
+}
+
 /// Owner pid of the frontmost on-screen layer-0 non-own window.
 fn frontmost_window_owner_pid() -> Option<i32> {
     #[repr(C)]

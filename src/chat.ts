@@ -202,6 +202,18 @@ export function revealLog(): Promise<void> {
   return invoke<void>("reveal_log");
 }
 
+/** Settings → Integrations: whether Chrome lets Third Eye script its
+ *  pages (the browser tool's find/click/fill). */
+export interface ChromeJsStatus {
+  running: boolean;
+  jsEnabled: boolean | null;
+  detail: string;
+}
+
+export function chromeJsStatus(): Promise<ChromeJsStatus> {
+  return invoke<ChromeJsStatus>("chrome_js_status_cmd");
+}
+
 export function laneHealth(): Promise<LaneHealth[]> {
   return invoke<LaneHealth[]>("lane_health");
 }
@@ -895,7 +907,11 @@ export type ActionKind =
   | "clipboard"
   | "write-file"
   | "run-in-workspace"
-  | "run-command";
+  | "run-command"
+  | "open"
+  | "ui-action"
+  | "browser"
+  | "mac-service";
 
 /** The `hid://approval-request` payload — the serde camelCase serialization of
  *  Rust's ApprovalRequestPayload. Pixel-free: a correlation id, the action kind,

@@ -205,9 +205,9 @@ fn walk_interactive(pid: i32, app_name: &str, deadline: std::time::Instant) -> V
         enable_chromium_accessibility(root);
         // Iterative DFS with owned queue of (element, depth). Every element
         // pointer in the queue is retained by its parent CFArray, which we
-        // keep alive in `arrays` until the walk ends.
+        // keep alive in `arrays` until the walk ends. Windows before menus.
         let mut arrays: Vec<CFRetained<CFArray>> = Vec::new();
-        let mut queue: Vec<(*mut std::ffi::c_void, usize)> = vec![(root, 0)];
+        let mut queue = windows_first_queue(root, &mut arrays);
         let mut visited = 0usize;
         while let Some((el, depth)) = queue.pop() {
             visited += 1;
@@ -360,5 +360,388 @@ mod tests {
             assert!(el.cy >= el.y && el.cy <= el.y + el.height);
         }
         eprintln!("harvested {} Finder element(s)", elements.len());
+    }
+}
+
+/// Seed a DFS queue with the app's top-level children so that WINDOWS are
+/// walked before the MENU BAR (the stack pops last-pushed first). Chrome's
+/// menus alone are hundreds of items and exhausted the visit budget before
+/// the window was reached (ui_action live probe, 2026-09-03). The children
+/// array is kept alive in `arrays` like every other level.
+unsafe fn windows_first_queue(
+    root: *mut std::ffi::c_void,
+    arrays: &mut Vec<CFRetained<CFArray>>,
+) -> Vec<(*mut std::ffi::c_void, usize)> {
+    let mut queue = Vec::new();
+    if let Some(children) = copy_children(root) {
+        let count = children.count() as usize;
+        let mut windows = Vec::new();
+        let mut menus = Vec::new();
+        for i in 0..count {
+            let child = children.value_at_index(i as isize) as *mut std::ffi::c_void;
+            if child.is_null() {
+                continue;
+            }
+            match copy_string(child, "AXRole").as_deref() {
+                Some("AXMenuBar") | Some("AXMenuBarItem") | Some("AXMenu") => menus.push(child),
+                _ => windows.push(child),
+            }
+        }
+        for m in menus {
+            queue.push((m, 1));
+        }
+        for w in windows {
+            queue.push((w, 1));
+        }
+        arrays.push(children);
+    }
+    queue
+}
+
+// ---------------------------------------------------------------------------
+// ui_action (system tools S2): act on an element by identity, not pixels
+// ---------------------------------------------------------------------------
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementPerformAction(element: *mut std::ffi::c_void, action: *const CFString) -> i32;
+    fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
+}
+
+/// What `ui_action` does to the matched element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxAct {
+    Press,
+    SetValue(String),
+    Focus,
+}
+
+/// What the OS reported after the action — the tool's `verified` block.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AxActionReport {
+    pub matched_role: String,
+    pub matched_title: String,
+    /// The element's AXValue after the action (text fields, checkboxes).
+    pub value_after: Option<String>,
+    /// System-wide focused element after the action, as "AXRole: title".
+    pub focused_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxActionError {
+    /// No element matched; `candidates` are the labels that were there.
+    NotFound {
+        candidates: Vec<String>,
+    },
+    /// Several elements matched loosely and none exactly.
+    Ambiguous {
+        candidates: Vec<String>,
+    },
+    /// The element does not support that action (a label has no AXPress).
+    Unsupported {
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
+}
+
+impl AxActionError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AxActionError::NotFound { .. } => "not-found",
+            AxActionError::Ambiguous { .. } => "ambiguous",
+            AxActionError::Unsupported { .. } => "unsupported",
+            AxActionError::Failed { .. } => "action-failed",
+        }
+    }
+}
+
+impl std::fmt::Display for AxActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AxActionError::NotFound { candidates } => write!(
+                f,
+                "no element with that title in the focused app; on screen: {}",
+                candidates.join(" | ")
+            ),
+            AxActionError::Ambiguous { candidates } => write!(
+                f,
+                "several elements match — name one exactly: {}",
+                candidates.join(" | ")
+            ),
+            AxActionError::Unsupported { detail } | AxActionError::Failed { detail } => {
+                f.write_str(detail)
+            }
+        }
+    }
+}
+
+/// Normalize a role filter: "button" → "AXButton", "AXLink" stays.
+pub fn normalize_role(role: &str) -> String {
+    let r = role.trim();
+    if r.is_empty() {
+        return String::new();
+    }
+    if r.to_ascii_lowercase().starts_with("ax") {
+        format!("AX{}", &r[2..])
+    } else {
+        let mut chars = r.chars();
+        let first = chars
+            .next()
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or_default();
+        format!("AX{first}{}", chars.as_str())
+    }
+}
+
+/// Choose the element `title` names among `candidates` (role, label). An
+/// exact (case-insensitive) label wins; otherwise exactly one containing
+/// match; several loose matches are ambiguous; none is not-found. Pure —
+/// the whole matching policy.
+pub fn pick_target(
+    candidates: &[(String, String)],
+    title: &str,
+    role: Option<&str>,
+) -> Result<usize, AxActionError> {
+    let want = title.trim().to_lowercase();
+    let role = role.map(normalize_role).filter(|r| !r.is_empty());
+    let pool: Vec<(usize, &(String, String))> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (r, _))| {
+            role.as_deref()
+                .is_none_or(|want_role| r.eq_ignore_ascii_case(want_role))
+        })
+        .collect();
+    if let Some((i, _)) = pool
+        .iter()
+        .find(|(_, (_, l))| l.trim().to_lowercase() == want)
+    {
+        return Ok(*i);
+    }
+    let loose: Vec<&(usize, &(String, String))> = pool
+        .iter()
+        .filter(|(_, (_, l))| l.to_lowercase().contains(&want))
+        .collect();
+    let labels = |items: &[&(usize, &(String, String))]| -> Vec<String> {
+        items
+            .iter()
+            .take(8)
+            .map(|(_, (r, l))| format!("{r} {l:?}"))
+            .collect()
+    };
+    match loose.len() {
+        1 => Ok(loose[0].0),
+        0 => Err(AxActionError::NotFound {
+            candidates: labels(&pool.iter().collect::<Vec<_>>()),
+        }),
+        _ => Err(AxActionError::Ambiguous {
+            candidates: labels(&loose),
+        }),
+    }
+}
+
+unsafe fn focused_summary() -> Option<String> {
+    let system = AXUIElementCreateSystemWide();
+    if system.is_null() {
+        return None;
+    }
+    let attr = CFString::from_str("AXFocusedUIElement");
+    let mut el: *mut std::ffi::c_void = std::ptr::null_mut();
+    let err = AXUIElementCopyAttributeValue(system, &*attr, &mut el);
+    CFRelease(system);
+    if err != 0 || el.is_null() {
+        return None;
+    }
+    let role = copy_string(el, "AXRole").unwrap_or_default();
+    let title = copy_string(el, "AXTitle")
+        .or_else(|| copy_string(el, "AXDescription"))
+        .unwrap_or_default();
+    CFRelease(el);
+    Some(format!("{role}: {title}"))
+}
+
+/// Find the element `title` (optionally `role`) names in `pid`'s
+/// interactive tree and perform `act` on it, then read the element and the
+/// system focus back. Blocking — lift onto `spawn_blocking`. The walk
+/// shares the interactive harvest's budgets; the chosen element stays
+/// alive because its parent arrays are held until the action is done.
+pub fn perform_ui_action_blocking(
+    pid: i32,
+    title: &str,
+    role: Option<&str>,
+    act: AxAct,
+) -> Result<AxActionReport, AxActionError> {
+    let deadline = std::time::Instant::now() + INTERACTIVE_BUDGET;
+    unsafe {
+        let root = AXUIElementCreateApplication(pid);
+        if root.is_null() {
+            return Err(AxActionError::Failed {
+                detail: "the app has no accessibility tree (not running?)".into(),
+            });
+        }
+        enable_chromium_accessibility(root);
+        let mut arrays: Vec<CFRetained<CFArray>> = Vec::new();
+        // The stack pops LAST-pushed first. The app's children are windows
+        // and the menu bar; Chrome's menus alone are hundreds of items and
+        // exhausted the budget before the window was reached (live probe
+        // 2026-09-03). Push the menu bar FIRST (walked last) and windows
+        // last (walked first): the controls the user sees come first.
+        let mut queue = windows_first_queue(root, &mut arrays);
+        let mut found: Vec<(*mut std::ffi::c_void, String, String)> = Vec::new();
+        let mut visited = 0usize;
+        while let Some((el, depth)) = queue.pop() {
+            visited += 1;
+            if visited > MAX_VISITED
+                || found.len() >= MAX_ELEMENTS
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            if let Some(r) = copy_string(el, "AXRole") {
+                if INTERACTIVE_ROLES.contains(&r.as_str()) {
+                    if let Some(label) = element_label(el, &r) {
+                        found.push((el, r, label));
+                    }
+                }
+            }
+            if depth < MAX_DEPTH {
+                if let Some(children) = copy_children(el) {
+                    let count = children.count() as usize;
+                    for i in 0..count {
+                        let child = children.value_at_index(i as isize) as *mut std::ffi::c_void;
+                        if !child.is_null() {
+                            queue.push((child, depth + 1));
+                        }
+                    }
+                    arrays.push(children);
+                }
+            }
+        }
+        let candidates: Vec<(String, String)> = found
+            .iter()
+            .map(|(_, r, l)| (r.clone(), l.clone()))
+            .collect();
+        let idx = match pick_target(&candidates, title, role) {
+            Ok(i) => i,
+            Err(e) => {
+                CFRelease(root);
+                return Err(e);
+            }
+        };
+        let (el, matched_role, matched_title) = found[idx].clone();
+        let err = match &act {
+            AxAct::Press => {
+                let action = CFString::from_str("AXPress");
+                AXUIElementPerformAction(el, &*action)
+            }
+            AxAct::SetValue(value) => {
+                let attr = CFString::from_str("AXValue");
+                let v = CFString::from_str(value);
+                AXUIElementSetAttributeValue(
+                    el,
+                    &*attr,
+                    &*v as *const CFString as *const std::ffi::c_void,
+                )
+            }
+            AxAct::Focus => {
+                let attr = CFString::from_str("AXFocused");
+                match objc2_core_foundation::kCFBooleanTrue {
+                    Some(yes) => AXUIElementSetAttributeValue(
+                        el,
+                        &*attr,
+                        yes as *const objc2_core_foundation::CFBoolean as *const std::ffi::c_void,
+                    ),
+                    None => -1,
+                }
+            }
+        };
+        let result = if err == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Ok(AxActionReport {
+                matched_role,
+                matched_title,
+                value_after: copy_string(el, "AXValue"),
+                focused_after: focused_summary(),
+            })
+        } else {
+            // -25205 kAXErrorActionUnsupported, -25206 kAXErrorAttributeUnsupported.
+            let detail = format!(
+                "{} on {matched_role} {matched_title:?} failed (AX error {err})",
+                match &act {
+                    AxAct::Press => "press",
+                    AxAct::SetValue(_) => "set_value",
+                    AxAct::Focus => "focus",
+                }
+            );
+            Err(if err == -25205 || err == -25206 || err == -25201 {
+                AxActionError::Unsupported { detail }
+            } else {
+                AxActionError::Failed { detail }
+            })
+        };
+        drop(arrays);
+        CFRelease(root);
+        result
+    }
+}
+
+#[cfg(test)]
+mod ui_action_tests {
+    use super::*;
+
+    fn c(role: &str, label: &str) -> (String, String) {
+        (role.into(), label.into())
+    }
+
+    #[test]
+    fn roles_normalize_to_ax_prefix() {
+        assert_eq!(normalize_role("button"), "AXButton");
+        assert_eq!(normalize_role("AXLink"), "AXLink");
+        assert_eq!(normalize_role("axTextField"), "AXTextField");
+        assert_eq!(normalize_role("  "), "");
+    }
+
+    #[test]
+    fn exact_beats_loose_and_role_filters() {
+        let cands = vec![
+            c("AXButton", "Save"),
+            c("AXButton", "Save As…"),
+            c("AXLink", "Save"),
+            c("AXTextField", "Search"),
+        ];
+        assert_eq!(pick_target(&cands, "save", None), Ok(0), "first exact wins");
+        assert_eq!(pick_target(&cands, "save", Some("link")), Ok(2));
+        assert_eq!(
+            pick_target(&cands, "save as", None),
+            Ok(1),
+            "one loose match"
+        );
+        assert_eq!(pick_target(&cands, "sea", Some("textfield")), Ok(3));
+    }
+
+    #[test]
+    fn ambiguity_and_absence_are_typed_with_candidates() {
+        let cands = vec![
+            c("AXButton", "Add to cart"),
+            c("AXButton", "Add to wishlist"),
+        ];
+        match pick_target(&cands, "add to", None) {
+            Err(AxActionError::Ambiguous { candidates }) => assert_eq!(candidates.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        match pick_target(&cands, "checkout", None) {
+            Err(AxActionError::NotFound { candidates }) => {
+                assert_eq!(candidates.len(), 2, "what IS there rides back")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            pick_target(&cands, "add to cart", Some("link")),
+            Err(AxActionError::NotFound { candidates: vec![] }),
+            "a role filter that matches nothing lists nothing"
+        );
     }
 }

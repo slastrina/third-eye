@@ -242,12 +242,18 @@ fn cursor_location() -> Result<(f64, f64), InputError> {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
+    fn AXUIElementCreateApplication(pid: i32) -> *mut std::ffi::c_void;
     fn AXUIElementCopyAttributeValue(
         element: *mut std::ffi::c_void,
         attribute: *const CFString,
         value: *mut *mut std::ffi::c_void,
     ) -> i32;
     fn AXUIElementGetPid(element: *mut std::ffi::c_void, pid: *mut i32) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: *mut std::ffi::c_void,
+        attribute: *const CFString,
+        value: *const std::ffi::c_void,
+    ) -> i32;
     fn AXUIElementCopyElementAtPosition(
         application: *mut std::ffi::c_void,
         x: f32,
@@ -478,6 +484,82 @@ fn verification_needle(text: &str) -> Option<String> {
     } else {
         last
     })
+}
+
+/// The focused element of the FRONTMOST app (its AXFocusedUIElement),
+/// retained; the caller releases. Per-app rather than system-wide: the
+/// system-wide query answers kAXErrorCannotComplete (-25204) from helper
+/// processes, the app element never does (selection probe 2026-09-03).
+unsafe fn frontmost_focused_element() -> Result<*mut std::ffi::c_void, String> {
+    let pid = crate::capture::macos::frontmost_app_pid()
+        .ok_or_else(|| "no frontmost app window".to_string())?;
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return Err("the frontmost app has no accessibility tree".into());
+    }
+    let attr = CFString::from_str("AXFocusedUIElement");
+    let mut el: *mut std::ffi::c_void = std::ptr::null_mut();
+    let err = AXUIElementCopyAttributeValue(app, &*attr, &mut el);
+    CFRelease(app);
+    if err != 0 || el.is_null() {
+        return Err(format!("nothing has keyboard focus (AX error {err})"));
+    }
+    Ok(el)
+}
+
+/// The focused element's selected text, with the focus snapshot
+/// (text_selection S4). `None` when nothing is focused; `Some((None,
+/// focus))` when the element exposes no selection (a canvas, a web page
+/// without a text control) — the caller falls back to cmd+c.
+pub fn selected_text_blocking() -> Option<(Option<String>, FocusReport)> {
+    unsafe {
+        let el = frontmost_focused_element().ok()?;
+        let selected = copy_string_attr(el, "AXSelectedText").filter(|s| !s.is_empty());
+        let mut pid: i32 = 0;
+        let app = (AXUIElementGetPid(el, &mut pid) == 0)
+            .then(|| app_name_for_pid(pid))
+            .flatten();
+        let role = copy_string_attr(el, "AXRole");
+        let title =
+            copy_string_attr(el, "AXTitle").or_else(|| copy_string_attr(el, "AXDescription"));
+        let value = if role.as_deref() == Some("AXSecureTextField") {
+            None
+        } else {
+            copy_string_attr(el, "AXValue")
+        };
+        CFRelease(el);
+        Some((
+            selected,
+            redact_focus(FocusReport {
+                app,
+                role,
+                title,
+                value,
+            }),
+        ))
+    }
+}
+
+/// Replace the focused element's selection with `text` (inserting at the
+/// caret when nothing is selected) through AXSelectedText. `Ok(false)` =
+/// the element does not support it (the caller falls back to cmd+v).
+pub fn set_selected_text_blocking(text: &str) -> Result<bool, String> {
+    unsafe {
+        let el = frontmost_focused_element()?;
+        let sel = CFString::from_str("AXSelectedText");
+        let value = CFString::from_str(text);
+        let err = AXUIElementSetAttributeValue(
+            el,
+            &*sel,
+            &*value as *const CFString as *const std::ffi::c_void,
+        );
+        CFRelease(el);
+        match err {
+            0 => Ok(true),
+            -25205 | -25206 | -25201 | -25200 => Ok(false),
+            other => Err(format!("setting the selection failed (AX error {other})")),
+        }
+    }
 }
 
 /// Post-`type-text` observation: poll (bounded) until the focused element's

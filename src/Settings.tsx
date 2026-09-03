@@ -42,6 +42,8 @@ import {
   type LaneHealth,
   logPath,
   revealLog,
+  chromeJsStatus,
+  type ChromeJsStatus,
   setCommandsEnabled,
   setHidRunMode,
   setMemoryRetention,
@@ -623,6 +625,13 @@ function Settings() {
   const [log, setLog] = useState<string | null>(null);
   useEffect(() => {
     logPath().then(setLog, () => setLog(null));
+  }, []);
+  // Chrome page scripting (system tools S3): a one-time manual toggle in
+  // Chrome; shown with a recheck so the user can confirm it took.
+  const [chromeJs, setChromeJs] = useState<ChromeJsStatus | null>(null);
+  const recheckChromeJs = () => chromeJsStatus().then(setChromeJs, () => setChromeJs(null));
+  useEffect(() => {
+    recheckChromeJs();
   }, []);
   const pinLane = (lane: string, value: string) => {
     const model = value === DEFAULT_OPTION ? null : value;
@@ -1815,6 +1824,20 @@ function Settings() {
               <strong>Integration change failed</strong>
               <span>{integrations.error}</span>
             </div>
+          )}
+          {chromeJs !== null && (
+            <>
+              <h3 className="guard-subheading">Chrome pages</h3>
+              <div className="settings-row">
+                <span className="settings-row-label">Page scripting</span>
+                <span data-chrome-js={chromeJs.jsEnabled === null ? "unknown" : chromeJs.jsEnabled ? "on" : "off"}>
+                  {chromeJs.jsEnabled ? "on ✓" : chromeJs.jsEnabled === false ? "off" : "unknown"} — {chromeJs.detail}
+                </span>
+                <button type="button" className="settings-refresh" onClick={recheckChromeJs}>
+                  Recheck
+                </button>
+              </div>
+            </>
           )}
           {integrations !== null && (
             <>

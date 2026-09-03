@@ -1425,6 +1425,214 @@ impl TerminalSink for NullSinkStuck {
     fn chunk(&self, _call_id: &str, _text: &str) {}
 }
 
+/// OPEN TOOL (system tools S1): the typed `open {url}` is navigation and
+/// goes through the SAME grounding and progress budget as a shell open —
+/// an invented URL is refused, a search-results URL opens, and a third
+/// blind open (nothing read since) is refused too. Path opens are gated.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_open_tool_is_grounded_and_budgeted_like_a_shell_open() {
+    use third_eye_lib::llm::tools::open::{OpenTool, PathOpener, OPEN_TOOL};
+    struct QuietOpener(Mutex<Vec<String>>);
+    #[async_trait]
+    impl Opener for QuietOpener {
+        async fn open(&self, url: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(url.into());
+            Ok(())
+        }
+    }
+    struct NoPaths;
+    #[async_trait]
+    impl PathOpener for NoPaths {
+        async fn open_path(&self, _p: &std::path::Path) -> Result<(), String> {
+            panic!("no path open in this eval")
+        }
+    }
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            OPEN_TOOL,
+            r#"{"url":"https://shop.example/deal-of-the-day"}"#,
+        ),
+        scripted::round_tool(
+            "c2",
+            OPEN_TOOL,
+            r#"{"url":"https://www.google.com/search?q=lasagna"}"#,
+        ),
+        scripted::round_tool(
+            "c3",
+            OPEN_TOOL,
+            r#"{"url":"https://www.google.com/search?q=carbonara"}"#,
+        ),
+        scripted::round_tool(
+            "c4",
+            OPEN_TOOL,
+            r#"{"url":"https://www.google.com/search?q=ragu"}"#,
+        ),
+        scripted::round_text("Opened what I could."),
+    ])
+    .await;
+    let opener = Arc::new(QuietOpener(Mutex::new(Vec::new())));
+    let open = OpenTool::new(
+        opener.clone(),
+        Arc::new(NoPaths),
+        Arc::new(AlwaysFocus),
+        HidRunMode::AutoRun,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        Arc::new(NeverPrompt),
+    );
+    let executor = CompositeExecutor::new(vec![Box::new(UrlGroundingExecutor::new(
+        CompositeExecutor::new(vec![Box::new(open)]),
+        Arc::new(UrlSeen::new()),
+    ))]);
+    let (text, events) = run_scenario(&endpoint, &executor, "open some pages").await;
+    assert_eq!(text, "Opened what I could.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert_eq!(
+        results[0].2.as_deref(),
+        Some(UNGROUNDED_URL_KIND),
+        "invented URL refused"
+    );
+    assert!(
+        results[1].1 && results[2].1,
+        "two search-results opens run: {results:?}"
+    );
+    assert_eq!(
+        results[3].2.as_deref(),
+        Some(TOO_MANY_OPENS_KIND),
+        "a third blind open is refused: {:?}",
+        results[3]
+    );
+    assert_eq!(
+        opener.0.lock().unwrap().as_slice(),
+        [
+            "https://www.google.com/search?q=lasagna",
+            "https://www.google.com/search?q=carbonara"
+        ]
+    );
+}
+
+/// TOKEN BUDGET (system tools S7): the eight new definitions together stay
+/// under ~1.8k tokens (≈7,000 chars of JSON) so the 9B's fixed context does
+/// not balloon — a definition that grows past its share fails here first.
+#[test]
+fn eval_system_tool_definitions_fit_the_token_budget() {
+    use third_eye_lib::llm::tools::{
+        browser, find_files, mac, open, processes, text_selection, ui_action, wait_for_text,
+    };
+    let defs = [
+        open::OpenTool::definition(),
+        wait_for_text::WaitForTextTool::definition(),
+        ui_action::UiActionTool::definition(),
+        browser::BrowserTool::definition(),
+        text_selection::TextSelectionTool::definition(),
+        find_files::FindFilesTool::definition(),
+        processes::ProcessesTool::definition(),
+        mac::MacTool::definition(),
+    ];
+    let mut total = 0usize;
+    for d in &defs {
+        let bytes = serde_json::to_string(d).unwrap().len();
+        assert!(
+            bytes <= 1_400,
+            "{} definition is {bytes} bytes — trim it",
+            d.name
+        );
+        total += bytes;
+    }
+    assert!(
+        total <= 7_000,
+        "system tool definitions total {total} bytes (cap 7000 ≈ 1.8k tokens)"
+    );
+}
+
+/// BROWSER NAVIGATE (system tools S3) is navigation: an invented URL is
+/// refused by the same grounding as open/shell open; a given one goes
+/// through to the backend.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_browser_navigate_is_grounded_like_open() {
+    use third_eye_lib::llm::tools::browser::{
+        BrowserBackend, BrowserError, BrowserTool, Found, TabInfo, BROWSER_TOOL,
+    };
+    struct Fake(Mutex<Vec<String>>);
+    fn tab() -> TabInfo {
+        TabInfo {
+            id: 1,
+            window_id: 1,
+            title: "t".into(),
+            url: "https://x.example/".into(),
+            active: true,
+        }
+    }
+    #[async_trait]
+    impl BrowserBackend for Fake {
+        async fn tabs(&self) -> Result<Vec<TabInfo>, BrowserError> {
+            Ok(vec![tab()])
+        }
+        async fn front(&self) -> Result<TabInfo, BrowserError> {
+            Ok(tab())
+        }
+        async fn switch(&self, _id: i64) -> Result<TabInfo, BrowserError> {
+            Ok(tab())
+        }
+        async fn navigate(&self, url: &str) -> Result<TabInfo, BrowserError> {
+            self.0.lock().unwrap().push(url.into());
+            Ok(tab())
+        }
+        async fn back(&self) -> Result<TabInfo, BrowserError> {
+            Ok(tab())
+        }
+        async fn page_text(&self) -> Result<String, BrowserError> {
+            Ok("text".into())
+        }
+        async fn find(&self, _t: &str) -> Result<Vec<Found>, BrowserError> {
+            Ok(vec![])
+        }
+        async fn click(&self, _id: i64) -> Result<String, BrowserError> {
+            Ok("x".into())
+        }
+        async fn fill(&self, _id: i64, _v: &str) -> Result<String, BrowserError> {
+            Ok("x".into())
+        }
+    }
+    let (endpoint, _captured) = scripted::spawn(vec![
+        scripted::round_tool(
+            "c1",
+            BROWSER_TOOL,
+            r#"{"action":"navigate","url":"https://shop.example/guess"}"#,
+        ),
+        scripted::round_tool(
+            "c2",
+            BROWSER_TOOL,
+            r#"{"action":"navigate","url":"https://www.google.com/search?q=lasagna"}"#,
+        ),
+        scripted::round_text("Done."),
+    ])
+    .await;
+    let fake = Arc::new(Fake(Mutex::new(Vec::new())));
+    let tool = BrowserTool::new(
+        fake.clone(),
+        Arc::new(FixedScreen),
+        HidRunMode::AutoRun,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        Arc::new(NeverPrompt),
+        false,
+    );
+    let executor = CompositeExecutor::new(vec![Box::new(UrlGroundingExecutor::new(
+        CompositeExecutor::new(vec![Box::new(tool)]),
+        Arc::new(UrlSeen::new()),
+    ))]);
+    let (text, events) = run_scenario(&endpoint, &executor, "go to the shop").await;
+    assert_eq!(text, "Done.");
+    let results = collect_results(&events);
+    assert_eq!(results[0].2.as_deref(), Some(UNGROUNDED_URL_KIND));
+    assert!(results[1].1, "{results:?}");
+    assert_eq!(
+        fake.0.lock().unwrap().as_slice(),
+        ["https://www.google.com/search?q=lasagna"]
+    );
+}
+
 /// SEARCH BUDGET (live evals 2026-09-03): a model re-phrasing the same
 /// search 20+ times never repeats EXACT arguments, so the repeat breaker
 /// never fires. web_search refuses typed past its per-run budget.
@@ -1616,6 +1824,48 @@ fn eval_prompt_contract_load_bearing_clauses_present() {
     );
     // screen_query reads the focused window by default; the whole display is
     // an explicit opt-in — pinned on the tool contract the model sees.
+    // System tools S6: the mac bundle is named once, with its surface.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("run_shortcut for the user's own Shortcuts"),
+        "S6 mac clause missing"
+    );
+    // System tools S5: Spotlight and processes replace shell idioms.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("find_files (Spotlight")
+            && HID_SYSTEM_PROMPT.contains("processes lists what is running"),
+        "S5 clauses missing"
+    );
+    // System tools S4: the selection is the "this" the user means.
+    assert!(
+        HID_SYSTEM_PROMPT.contains("text_selection {action: get} reads it"),
+        "S4 text_selection clause missing"
+    );
+    // System tools S3: the browser tool is the DOM path on web pages.
+    assert!(
+        third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy", false)
+            .contains("browser {action: find, text} then browser {action: click, id}"),
+        "S3 browser clause missing"
+    );
+    // System tools S2: ui_action is the named-control path, stripped in
+    // teach mode (the human way is visible).
+    let browsing = third_eye_lib::llm::toolloop::system_prompt_for_lane("heavy", false);
+    assert!(
+        browsing.contains("ui_action presses / sets / focuses it by name"),
+        "S2 ui_action clause missing"
+    );
+    assert!(
+        third_eye_lib::llm::toolloop::teach_mode_strips(
+            third_eye_lib::llm::tools::ui_action::UI_ACTION_TOOL
+        ),
+        "teach mode must strip ui_action"
+    );
+    // System tools S1: the browsing contract names the typed open and the
+    // wait, and never the shell idiom it replaced.
+    assert!(
+        browsing.contains("use open {url} (never run_command open)")
+            && browsing.contains("wait_for_text for something you expect to see"),
+        "S1 open/wait_for_text clauses missing"
+    );
     let sq = third_eye_lib::llm::toolloop::ScreenQueryTool::definition();
     assert_eq!(
         sq.parameters["properties"]["scope"]["enum"],

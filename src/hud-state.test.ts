@@ -42,6 +42,28 @@ describe("describeCall", () => {
     expect(described).toEqual({ label: "click · 312, 208", input: true, target: { x: 312, y: 208 } });
   });
 
+  it("labels the S1 system tools without a pointer target", () => {
+    expect(describeCall("open", JSON.stringify({ url: "https://www.ebay.com/sch/i.html?_nkw=x" }))).toEqual({
+      label: "open · ebay.com/sch/i.html?_nkw=x",
+      input: false,
+      target: null,
+    });
+    expect(describeCall("open", JSON.stringify({ path: "/Users/alex/Desktop/report.pdf" })).label).toBe("open · report.pdf");
+    expect(describeCall("open", JSON.stringify({ app: "Finder" })).label).toBe("open · Finder");
+    expect(describeCall("wait_for_text", JSON.stringify({ text: "Welcome back" })).label).toBe("wait for · “Welcome back”");
+    expect(describeCall("browser", JSON.stringify({ action: "find", text: "Buy It Now" })).label).toBe("find on page · “Buy It Now”");
+    expect(describeCall("browser", JSON.stringify({ action: "navigate", url: "https://www.ebay.com/x" })).label).toBe("go to · ebay.com/x");
+    expect(describeCall("browser", JSON.stringify({ action: "tabs" })).label).toBe("list tabs");
+    expect(describeCall("find_files", JSON.stringify({ query: "tax return" })).label).toBe("find files · “tax return”");
+    expect(describeCall("mac", JSON.stringify({ action: "reminder_add", title: "Call mum" })).label).toBe("remind · “Call mum”");
+    expect(describeCall("mac", JSON.stringify({ action: "system_info" })).label).toBe("check the system");
+    expect(describeCall("processes", JSON.stringify({ action: "kill", name: "node" })).label).toBe("kill · node");
+    expect(describeCall("text_selection", JSON.stringify({ action: "get" }))).toEqual({ label: "read the selection", input: false, target: null });
+    const press = describeCall("ui_action", JSON.stringify({ action: "press", element: "Add to cart", role: "button" }));
+    expect(press).toEqual({ label: "press · “Add to cart”", input: true, target: null });
+    expect(describeCall("ui_action", JSON.stringify({ action: "set_value", element: "Search", value: "x" })).label).toBe("set · “Search”");
+  });
+
   it("truncates typed text and never exposes a target for typing", () => {
     const described = describeCall("input_action", JSON.stringify({ action: "type-text", text: "a".repeat(40) }));
     expect(described.label).toBe(`type · “${"a".repeat(24)}…”`);

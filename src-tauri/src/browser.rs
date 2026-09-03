@@ -130,11 +130,11 @@ fn default_browser_is_chrome() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn chrome_running() -> bool {
+pub(crate) fn chrome_running() -> bool {
     crate::appfocus::macos::pid_for_app_name("Google Chrome").is_some()
 }
 
-async fn osascript(script: &str, timeout: Duration) -> Result<String, String> {
+pub(crate) async fn osascript(script: &str, timeout: Duration) -> Result<String, String> {
     let run = tokio::process::Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(script)

@@ -1108,7 +1108,7 @@ pub async fn chat(
             // screen_query share: its post-action verification fails an action
             // whose focus readback lands outside the focused app (M008).
             InputTool::new(
-                keyboard_safe_backend,
+                keyboard_safe_backend.clone(),
                 input_state.arm_state(),
                 focused_app.clone(),
             ),
@@ -1130,10 +1130,89 @@ pub async fn chat(
         // Teach mode strips it: searching is done the visible human way.
         if !teach_active {
             executors.push(Box::new(crate::llm::toolloop::WebSearchTool::new(
-                ScreenQueryTool::new(screen_state.backend(), screen_seen, focused_app.clone()),
+                ScreenQueryTool::new(
+                    screen_state.backend(),
+                    screen_seen.clone(),
+                    focused_app.clone(),
+                ),
                 url_seen.clone(),
                 std::sync::Arc::new(crate::llm::toolloop::SystemOpener),
             )));
+        }
+        // System tools S1 (specs/2026-09-03-system-tools.md): a typed `open`
+        // (URL → the one tab, path → default app after approval, app →
+        // verified focus) for every lane, and `wait_for_text` for the
+        // on-screen lanes — the structural replacement for guessed waits.
+        executors.push(Box::new(crate::llm::tools::open::OpenTool::new(
+            std::sync::Arc::new(crate::llm::toolloop::SystemOpener),
+            std::sync::Arc::new(crate::llm::tools::open::SystemPathOpener),
+            appfocus_state.backend(),
+            mode,
+            approval.whitelist(),
+            approver.clone(),
+        )));
+        // S2: act on controls by name through accessibility — a click
+        // without the mouse. HID-class; teach mode strips it (visible only).
+        if routed_lane != "coder" && !teach_active {
+            executors.push(Box::new(crate::llm::tools::ui_action::UiActionTool::new(
+                std::sync::Arc::new(crate::llm::tools::ui_action::MacosAxActions),
+                focused_app.clone(),
+                mode,
+                approval.whitelist(),
+                approver.clone(),
+            )));
+        }
+        // S6: notify / speak / system_info / Shortcuts / Calendar / Reminders /
+        // Notes in one discriminated tool, every lane.
+        executors.push(Box::new(crate::llm::tools::mac::MacTool::new(
+            std::sync::Arc::new(crate::llm::tools::mac::SystemMacServices),
+            mode,
+            approval.whitelist(),
+            approver.clone(),
+        )));
+        // S5: Spotlight search for every lane; processes (list/kill, kill
+        // always asks) where the model does system and coding work.
+        executors.push(Box::new(crate::llm::tools::find_files::FindFilesTool::new(
+            std::sync::Arc::new(crate::llm::tools::find_files::Mdfind),
+        )));
+        if routed_lane != "thin" {
+            executors.push(Box::new(crate::llm::tools::processes::ProcessesTool::new(
+                std::sync::Arc::new(crate::llm::tools::processes::PsBackend),
+                approver.clone(),
+            )));
+        }
+        // S4: the user's selection as context and target, in any app.
+        executors.push(Box::new(
+            crate::llm::tools::text_selection::TextSelectionTool::new(
+                std::sync::Arc::new(crate::llm::tools::text_selection::MacosSelectionAx),
+                std::sync::Arc::new(crate::llm::tools::text_selection::SystemClipboard),
+                keyboard_safe_backend.clone(),
+                mode,
+                approval.whitelist(),
+                approver.clone(),
+                teach_active,
+            ),
+        ));
+        // S3: Chrome's tabs and DOM directly. Teach mode keeps the reads
+        // (tabs, page_text, find) and refuses the mutations typed.
+        if routed_lane != "coder" {
+            executors.push(Box::new(crate::llm::tools::browser::BrowserTool::new(
+                std::sync::Arc::new(crate::llm::tools::browser::ChromeBackend),
+                screen_state.backend(),
+                mode,
+                approval.whitelist(),
+                approver.clone(),
+                teach_active,
+            )));
+        }
+        if routed_lane != "coder" {
+            executors.push(Box::new(
+                crate::llm::tools::wait_for_text::WaitForTextTool::new(
+                    screen_state.backend(),
+                    screen_seen.clone(),
+                    focused_app.clone(),
+                ),
+            ));
         }
         // Page-text continuity (2026-07-27): read the focused app's full
         // content so follow-ups about an open page are answered by reading

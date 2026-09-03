@@ -103,6 +103,75 @@ export function describeCall(name: string, rawArguments: string): {
     };
   }
   if (name === "read_page") return { label: "read the page", input: false, target: null };
+  if (name === "open") {
+    const url = typeof args.url === "string" ? args.url : "";
+    const path = typeof args.path === "string" ? args.path : "";
+    const app = typeof args.app === "string" ? args.app : "";
+    const shown = url
+      ? url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 40)
+      : path
+        ? (path.split("/").filter(Boolean).pop() ?? path)
+        : app;
+    return { label: shown ? `open · ${shown}` : "open", input: false, target: null };
+  }
+  if (name === "ui_action") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const element = typeof args.element === "string" ? args.element : "";
+    const shown = element.length > 30 ? `${element.slice(0, 30)}…` : element;
+    const verb = action === "set_value" ? "set" : action === "focus" ? "focus" : "press";
+    return { label: shown ? `${verb} · “${shown}”` : `${verb} a control`, input: true, target: null };
+  }
+  if (name === "browser") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const text = typeof args.text === "string" ? args.text : "";
+    const url = typeof args.url === "string" ? args.url : "";
+    const shown = (s: string) => (s.length > 30 ? `${s.slice(0, 30)}…` : s);
+    const label =
+      action === "find" ? `find on page · “${shown(text)}”`
+      : action === "click" ? (text ? `click on page · “${shown(text)}”` : "click on page")
+      : action === "fill" ? (text ? `fill · “${shown(text)}”` : "fill a field")
+      : action === "navigate" ? `go to · ${shown(url.replace(/^https?:\/\/(www\.)?/, ""))}`
+      : action === "switch" ? "switch tab"
+      : action === "back" ? "go back"
+      : action === "tabs" ? "list tabs"
+      : action === "page_text" ? "read the page"
+      : "browser";
+    return { label, input: false, target: null };
+  }
+  if (name === "text_selection") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const label = action === "get" ? "read the selection" : action === "insert" ? "insert text" : "replace the selection";
+    return { label, input: action !== "get", target: null };
+  }
+  if (name === "find_files") {
+    const query = typeof args.query === "string" ? args.query : "";
+    return { label: query ? `find files · “${query.length > 30 ? `${query.slice(0, 30)}…` : query}”` : "find files", input: false, target: null };
+  }
+  if (name === "processes") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const who = typeof args.name === "string" ? args.name : typeof args.pid === "number" ? `pid ${args.pid}` : "";
+    return { label: action === "kill" ? (who ? `kill · ${who}` : "kill a process") : "list processes", input: false, target: null };
+  }
+  if (name === "mac") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const title = typeof args.title === "string" ? args.title : typeof args.name === "string" ? args.name : "";
+    const shown = title.length > 30 ? `${title.slice(0, 30)}…` : title;
+    const label =
+      action === "notify" ? "send a notification"
+      : action === "speak" ? "speak"
+      : action === "system_info" ? "check the system"
+      : action === "run_shortcut" ? (shown ? `shortcut · ${shown}` : "run a shortcut")
+      : action === "calendar_today" ? "today's calendar"
+      : action === "reminder_add" ? (shown ? `remind · “${shown}”` : "add a reminder")
+      : action === "note_add" ? (shown ? `note · “${shown}”` : "add a note")
+      : "mac";
+    return { label, input: false, target: null };
+  }
+  if (name === "wait_for_text") {
+    const text = typeof args.text === "string" ? args.text : "";
+    const shown = text.length > 30 ? `${text.slice(0, 30)}…` : text;
+    return { label: shown ? `wait for · “${shown}”` : "wait for text", input: false, target: null };
+  }
   if (name === "memory_search") {
     const query = typeof args.query === "string" ? args.query : "";
     return { label: query ? `recall · “${query}”` : "search memory", input: false, target: null };

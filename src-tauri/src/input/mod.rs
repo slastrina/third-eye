@@ -259,6 +259,19 @@ pub enum ActionKind {
     /// default OFF) plus per-command approval through the same prompt/
     /// whitelist plumbing; the approval summary is the exact command line.
     RunCommand,
+    /// Open a file/folder with its default app (the `open` tool's path
+    /// form, S1 system tools) — launches whatever handles the file, so it
+    /// asks like any HID action; URL opens are grounded separately.
+    Open,
+    /// Press / set / focus an accessibility element by name (the
+    /// `ui_action` tool, S2) — a click without the mouse, gated like one.
+    UiAction,
+    /// Chrome tab/DOM mutations (the `browser` tool, S3): switch, navigate,
+    /// back, click, fill — gated like a click; reads are free.
+    Browser,
+    /// The `mac` tool's mutations (S6): run a Shortcut, add a reminder or
+    /// note — the user's data, gated like an action.
+    MacService,
 }
 
 /// Which mouse button an action targets. Kebab-case in JSON to match the rest

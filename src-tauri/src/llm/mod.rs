@@ -22,6 +22,7 @@ pub mod router;
 pub mod routing;
 pub mod skills;
 pub mod toolloop;
+pub mod tools;
 pub mod trace;
 
 use async_trait::async_trait;
