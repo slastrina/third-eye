@@ -16,7 +16,7 @@ TAURI := npm run tauri --
 .PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg install-app preview vsix \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
-        clean-web clean-rust
+        clean-web clean-rust evals evals-live
 
 ## help: List available targets
 help:
@@ -176,6 +176,10 @@ clean-rust:
 #   cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --ignored --nocapture
 evals:
 	cargo test --manifest-path src-tauri/Cargo.toml --test evals -- --nocapture
+
+## evals-live: Score the LIVE model on ten canonical asks (stub tools, N runs each). Env: TE_EVAL_RUNS, TE_EVAL_ONLY, TE_EVAL_MODEL, TE_EVAL_MIN_PASS
+evals-live:
+	cargo test --manifest-path src-tauri/Cargo.toml --test evals_live -- --ignored --nocapture --test-threads=1
 
 ## vsix: Build the VS Code extension package (vscode-extension/*.vsix)
 vsix:

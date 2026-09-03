@@ -61,6 +61,18 @@ async function installOverlayIpcMock(page: Page): Promise<void> {
               roots: ["/Users/alex/code/other", "/Users/alex/code/active-project"],
               persistError: null,
             });
+          case "lane_health":
+            return Promise.resolve([
+              { lane: "thin", model: "qwen-9b", state: "loaded", toolUse: true, warning: null },
+              {
+                lane: "heavy",
+                model: "qwen-9b",
+                state: "missing",
+                toolUse: null,
+                warning: "qwen-9b is not served by LM Studio — re-pin the heavy lane in Settings",
+              },
+              { lane: "coder", model: "qwen-9b", state: "loaded", toolUse: true, warning: null },
+            ]);
           default:
             return Promise.reject(`mock: no such command ${cmd}`);
         }
@@ -68,6 +80,18 @@ async function installOverlayIpcMock(page: Page): Promise<void> {
     };
   });
 }
+
+test("an unhealthy lane pin turns its footer pill red and names the problem", async ({ page }) => {
+  await installOverlayIpcMock(page);
+  await page.goto("/");
+  const heavy = page.locator(".model-lane--unhealthy");
+  await expect(heavy).toHaveCount(1);
+  await expect(heavy).toHaveText("⚠ heavy");
+  await expect(heavy).toHaveAttribute("data-lane-health", "missing");
+  await expect(heavy).toHaveAttribute("title", /not served by LM Studio — re-pin the heavy lane/);
+  // Healthy lanes are untouched.
+  await expect(page.locator(".model-lane", { hasText: /^thin$/ })).toHaveCount(1);
+});
 
 test("the context row names the ACTIVE (first) workspace root", async ({ page }) => {
   await installOverlayIpcMock(page);

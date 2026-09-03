@@ -69,6 +69,7 @@ async function installNudgeIpcMock(
     (seed: { status: MockNudgeStatus }) => {
       const status: MockNudgeStatus = { ...seed.status };
       const chatCalls: unknown[] = [];
+      const reportCopies: number[] = [];
       let failPersist: string | null = null;
       let nextRequestId = 1;
 
@@ -87,6 +88,9 @@ async function installNudgeIpcMock(
         },
         chatCalls() {
           return chatCalls;
+        },
+        reportCopies() {
+          return reportCopies;
         },
         failNextPersist(detail: string) {
           failPersist = detail;
@@ -139,6 +143,10 @@ async function installNudgeIpcMock(
             case "chat": {
               chatCalls.push(args.messages);
               return Promise.resolve(nextRequestId++);
+            }
+            case "copy_run_report": {
+              reportCopies.push(args.requestId);
+              return Promise.resolve(`# Third Eye run #${args.requestId} — finished`);
             }
             case "chat_sessions":
               return Promise.resolve([
@@ -329,6 +337,32 @@ test("the summoned chat SHOWS the nudge context as a chip the user can drop", as
   expect(calls).toHaveLength(1);
   const first = calls[0] as Array<{ role: string; content: string }>;
   expect(first.every((m) => m.role !== "system")).toBe(true);
+});
+
+test("a finished answer offers 'copy run report' keyed by its request id", async ({ page }) => {
+  await installNudgeIpcMock(page);
+  await page.goto("/");
+  await waitForListener(page, "llm://done");
+  await emit(page, "overlay://state-changed", "visible-focused");
+  const input = page.getByLabel("Overlay input");
+  await input.fill("what did you do");
+  await input.press("Enter");
+  // The backend finishes request 1 (the mock's first chat id).
+  await emit(page, "llm://done", {
+    requestId: 1,
+    text: "I opened Terminal and ran ls.",
+    tokenCount: 8,
+    firstTokenMs: 10,
+    totalMs: 900,
+    promptTokens: 100,
+    completionTokens: 8,
+  });
+  const button = page.locator("[data-run-report='1']");
+  await expect(button).toHaveText("copy run report");
+  await button.click();
+  await expect(button).toHaveText("report copied ✓");
+  const copies = await page.evaluate(() => (window as any).__mockNudge.reportCopies());
+  expect(copies).toEqual([1]);
 });
 
 test("an auto-timeout dismiss still grounds the next question (late summon)", async ({ page }) => {

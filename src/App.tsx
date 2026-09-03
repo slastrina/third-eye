@@ -17,6 +17,10 @@ import {
   composeContextBlocks,
   type FileContext,
   freshNudgePreload,
+  copyRunReport,
+  laneHealth,
+  laneTitle,
+  type LaneHealth,
   nudgeChipDetail,
   nudgeChipLabel,
   nudgeContextFrame,
@@ -1114,6 +1118,19 @@ function App() {
   };
 
   const [routedLane, setRoutedLane] = useState<string | null>(null);
+  // Lane health (review item 5): pins checked against the served models at
+  // mount, after every routing change, and on a slow tick — a stale pin
+  // turns its pill red instead of failing the next run silently.
+  const [health, setHealth] = useState<LaneHealth[]>([]);
+  // "Copy run report" feedback: the request id whose report was just copied.
+  const [copiedReport, setCopiedReport] = useState<number | null>(null);
+  const refreshHealth = () => laneHealth().then(setHealth, () => undefined);
+  useEffect(() => {
+    refreshHealth();
+    const timer = window.setInterval(refreshHealth, 60_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.modelInfo]);
   const [verbose, setVerbose] = useState(false);
   const [teach, setTeach] = useState(false);
   const [wsRoots, setWsRoots] = useState<string[]>([]);
@@ -1404,6 +1421,31 @@ function App() {
                     {formatTokens(message.usage.completionTokens)} tok
                   </span>
                 )}
+                {message.role === "assistant" &&
+                  message.status === "done" &&
+                  message.requestId !== undefined && (
+                    <button
+                      type="button"
+                      className="chat-run-report"
+                      data-run-report={message.requestId}
+                      title="Copy a markdown report of this run — every tool call, its result, timing and what the OS observed — for a bug report"
+                      onClick={() => {
+                        const id = message.requestId as number;
+                        copyRunReport(id).then(
+                          () => {
+                            setCopiedReport(id);
+                            window.setTimeout(
+                              () => setCopiedReport((c) => (c === id ? null : c)),
+                              2000,
+                            );
+                          },
+                          () => undefined,
+                        );
+                      }}
+                    >
+                      {copiedReport === message.requestId ? "report copied ✓" : "copy run report"}
+                    </button>
+                  )}
               </div>
             ))}
           </div>
@@ -1788,18 +1830,23 @@ function App() {
               >
                 {routing.auto && routedLane ? `auto→${routedLane}` : "auto"}
               </button>
-              {routing.lanes.map((lane) => (
-                <button
-                  key={lane.name}
-                  type="button"
-                  className="model-lane"
-                  aria-pressed={!routing.auto && lane.name === routing.activeLane}
-                  title={lane.modelId ?? "endpoint default model"}
-                  onClick={() => overrideLane(lane.name)}
-                >
-                  {lane.name}
-                </button>
-              ))}
+              {routing.lanes.map((lane) => {
+                const h = health.find((x) => x.lane === lane.name);
+                const unhealthy = Boolean(h?.warning);
+                return (
+                  <button
+                    key={lane.name}
+                    type="button"
+                    className={unhealthy ? "model-lane model-lane--unhealthy" : "model-lane"}
+                    data-lane-health={h?.state}
+                    aria-pressed={!routing.auto && lane.name === routing.activeLane}
+                    title={laneTitle(lane.modelId, h)}
+                    onClick={() => overrideLane(lane.name)}
+                  >
+                    {unhealthy ? `⚠ ${lane.name}` : lane.name}
+                  </button>
+                );
+              })}
               <button
                 type="button"
                 className="model-lane model-lane--teach"

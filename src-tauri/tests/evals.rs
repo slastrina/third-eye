@@ -1375,6 +1375,104 @@ async fn eval_identical_repeated_calls_break_typed_after_three_attempts() {
     drop(scratch);
 }
 
+/// STUCK BREAKER (live evals 2026-09-03): a model that keeps re-issuing the
+/// SAME refused call after the repeat breaker fired used to burn every
+/// round to the ceiling. After three consecutive refusals the next round
+/// offers NO tools — the model must answer in text; a tool call there ends
+/// the run without dispatch, exactly like the ceiling round.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_stuck_on_a_refused_call_forces_a_text_answer() {
+    let (scratch, workspace) = ScratchWorkspace::new("stuck");
+    let same = r#"{"command":"exit 3"}"#;
+    // 3 executions + 3 refusals, then the model tries a 7th time: with the
+    // stuck breaker that round carries no tools, so the call is never
+    // dispatched and the loop ends. Without it, a 4th refusal would appear.
+    let rounds: Vec<Vec<u8>> = (0..7)
+        .map(|i| scripted::round_tool(&format!("c{i}"), RUN_IN_WORKSPACE_TOOL, same))
+        .collect();
+    let (endpoint, captured) = scripted::spawn(rounds).await;
+    let executor = CompositeExecutor::new(vec![Box::new(RunInWorkspaceTool::new(
+        workspace,
+        Arc::new(Mutex::new(SessionWhitelist::new())),
+        Arc::new(AllowAll),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(NullSinkStuck),
+    ))]);
+    let (_text, events) = run_scenario(&endpoint, &executor, "run it").await;
+    let results = collect_results(&events);
+    assert_eq!(
+        results.len(),
+        6,
+        "3 real + 3 refused, then no dispatch: {results:?}"
+    );
+    assert!(results[3..]
+        .iter()
+        .all(|r| r.2.as_deref() == Some("repeated-call")));
+    // The 7th request went out WITHOUT tools (the forced text round).
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 7, "seven rounds were requested");
+    let last = String::from_utf8_lossy(&requests[6]);
+    assert!(
+        !last.contains("\"tools\""),
+        "the stuck round must offer no tools: {last}"
+    );
+    drop(requests);
+    let _ = scratch;
+}
+
+struct NullSinkStuck;
+impl TerminalSink for NullSinkStuck {
+    fn chunk(&self, _call_id: &str, _text: &str) {}
+}
+
+/// SEARCH BUDGET (live evals 2026-09-03): a model re-phrasing the same
+/// search 20+ times never repeats EXACT arguments, so the repeat breaker
+/// never fires. web_search refuses typed past its per-run budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_web_search_refuses_past_its_per_run_budget() {
+    struct QuietOpener;
+    #[async_trait]
+    impl Opener for QuietOpener {
+        async fn open(&self, _url: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let n = third_eye_lib::llm::toolloop::MAX_WEB_SEARCHES_PER_RUN;
+    let mut rounds: Vec<Vec<u8>> = (0..=n)
+        .map(|i| {
+            scripted::round_tool(
+                &format!("c{i}"),
+                WEB_SEARCH_TOOL,
+                &format!(r#"{{"query":"nike air max variant {i}","site":"ebay"}}"#),
+            )
+        })
+        .collect();
+    rounds.push(scripted::round_text("Here is what I found."));
+    let (endpoint, _captured) = scripted::spawn(rounds).await;
+    let screen_seen = Arc::new(ScreenSeen::new());
+    let focused_app = Arc::new(FocusedAppGate::new());
+    let web = WebSearchTool::new(
+        ScreenQueryTool::new(Arc::new(FixedScreen), screen_seen, focused_app),
+        Arc::new(UrlSeen::new()),
+        Arc::new(QuietOpener),
+    );
+    let executor = CompositeExecutor::new(vec![Box::new(web)]);
+    let (text, events) = run_scenario(&endpoint, &executor, "find nike air max").await;
+    assert_eq!(text, "Here is what I found.");
+    let results = collect_results(&events);
+    assert_eq!(results.len(), n + 1, "{results:?}");
+    assert!(
+        results[..n].iter().all(|r| r.1),
+        "the budget's searches run: {results:?}"
+    );
+    assert_eq!(
+        results[n].2.as_deref(),
+        Some(third_eye_lib::llm::toolloop::TOO_MANY_SEARCHES_KIND),
+        "the (n+1)th search is refused typed: {:?}",
+        results[n]
+    );
+}
+
 /// PROMPT CONTRACT: the load-bearing behavioural clauses exist. Each assert
 /// names the behaviour it protects — deleting the clause flips this red
 /// (spec success criterion 5).

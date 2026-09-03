@@ -60,7 +60,39 @@ import {
   type NudgePayload,
   type PrivacyStatus,
   isLocalEndpoint,
+  allowlistEntryAlwaysAsks,
+  laneTitle,
 } from "./chat";
+
+describe("lane health titles", () => {
+  it("names the pin, and the problem when there is one", () => {
+    expect(laneTitle("qwen-9b", undefined)).toBe("qwen-9b");
+    expect(laneTitle(null, undefined)).toBe("endpoint default model");
+    expect(
+      laneTitle("qwen3.5-27b", {
+        lane: "heavy",
+        model: "qwen3.5-27b",
+        state: "missing",
+        toolUse: null,
+        warning: "qwen3.5-27b is not served by LM Studio",
+      }),
+    ).toBe("qwen3.5-27b — ⚠ qwen3.5-27b is not served by LM Studio");
+  });
+});
+
+describe("allowlist dangerous-verb glyph", () => {
+  const verbs = ["kill", "rm", "sudo"];
+  it("flags entries whose verb always asks, path-prefixed or not", () => {
+    expect(allowlistEntryAlwaysAsks("kill", verbs)).toBe(true);
+    expect(allowlistEntryAlwaysAsks("  /bin/rm -rf", verbs)).toBe(true);
+    expect(allowlistEntryAlwaysAsks("mkfs.ext4", verbs)).toBe(true);
+    expect(allowlistEntryAlwaysAsks("ls", verbs)).toBe(false);
+    expect(allowlistEntryAlwaysAsks("killer", verbs)).toBe(false);
+  });
+  it("is quiet when the backend sent no verb list (older backend)", () => {
+    expect(allowlistEntryAlwaysAsks("kill")).toBe(false);
+  });
+});
 
 describe("image paste helpers (N1)", () => {
   it("extracts base64 only from real base64 image data URLs", () => {

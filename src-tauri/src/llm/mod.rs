@@ -12,6 +12,7 @@
 
 pub mod commands;
 pub mod guard;
+pub mod lane_health;
 pub mod lmstudio;
 pub mod mcp;
 pub mod mcp_keystore;
@@ -21,6 +22,7 @@ pub mod router;
 pub mod routing;
 pub mod skills;
 pub mod toolloop;
+pub mod trace;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

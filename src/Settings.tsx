@@ -37,6 +37,11 @@ import {
   openInputSettings,
   privacyStatus,
   setCommandsAllowlist,
+  allowlistEntryAlwaysAsks,
+  laneHealth,
+  type LaneHealth,
+  logPath,
+  revealLog,
   setCommandsEnabled,
   setHidRunMode,
   setMemoryRetention,
@@ -608,6 +613,17 @@ function Settings() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  // Lane health (review item 5): re-checked whenever the lane list changes
+  // (a pin, a refresh) so the warning under a select is never stale.
+  const [health, setHealth] = useState<LaneHealth[]>([]);
+  useEffect(() => {
+    laneHealth().then(setHealth, () => setHealth([]));
+  }, [state.modelInfo]);
+  // The always-on log's location (review item 1) — null outside the app.
+  const [log, setLog] = useState<string | null>(null);
+  useEffect(() => {
+    logPath().then(setLog, () => setLog(null));
+  }, []);
   const pinLane = (lane: string, value: string) => {
     const model = value === DEFAULT_OPTION ? null : value;
     setLaneModel(lane, model).then(
@@ -1206,6 +1222,11 @@ function Settings() {
                     </option>
                   ))}
                 </select>
+                {health.find((h) => h.lane === lane.name)?.warning && (
+                  <span className="settings-lane-warning" data-lane-warning={lane.name} role="alert">
+                    ⚠ {health.find((h) => h.lane === lane.name)?.warning}
+                  </span>
+                )}
               </label>
             ))
           ) : (
@@ -1419,6 +1440,15 @@ function Settings() {
               {commands.allowlist.map((entry) => (
                 <div key={entry} className="allowlist-row">
                   <code className="allowlist-entry">{entry}</code>
+                  {allowlistEntryAlwaysAsks(entry, commands.dangerousVerbs) && (
+                    <span
+                      className="allowlist-danger"
+                      data-allowlist-danger="true"
+                      title="Dangerous verb: Third Eye always asks before running this, allowlisted or not"
+                    >
+                      ⚠ always asks
+                    </span>
+                  )}
                   <button
                     type="button"
                     className="memory-delete"
@@ -2832,6 +2862,21 @@ function Settings() {
               <span className="settings-status-value">
                 v{build.version} · {build.gitHash} ·{" "}
                 {new Date(build.builtAtMs).toLocaleString()}
+              </span>
+            </div>
+          )}
+          {log && (
+            <div className="settings-status-row">
+              <span className="settings-row-label">Log</span>
+              <span className="settings-status-value" data-log-path>
+                <code title={log}>{log.replace(/^\/Users\/[^/]+/, "~")}</code>{" "}
+                <button
+                  type="button"
+                  className="chat-retry"
+                  onClick={() => revealLog().catch(() => undefined)}
+                >
+                  Reveal
+                </button>
               </span>
             </div>
           )}

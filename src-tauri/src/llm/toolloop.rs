@@ -64,6 +64,19 @@ pub const REPEATED_CALL_LIMIT: u32 = 3;
 /// of narrating another lap.
 pub const REPEATED_CALL_KIND: &str = "repeated-call";
 
+/// Stuck breaker (live evals 2026-09-03): a model that keeps issuing the
+/// SAME refused call after the repeat breaker fired — 15 read_page calls
+/// in a row, each refused — burned rounds to the ceiling (a 4-minute
+/// run). After this many CONSECUTIVE repeated-call refusals the next
+/// round offers no tools, forcing a text answer from what it has.
+pub const STUCK_REFUSALS_LIMIT: u32 = 3;
+
+/// Searches one run may make (live evals 2026-09-03): a model re-phrasing
+/// the same search 20+ times never trips the exact-args repeat breaker;
+/// past this budget web_search refuses typed — read what you have.
+pub const MAX_WEB_SEARCHES_PER_RUN: usize = 5;
+pub const TOO_MANY_SEARCHES_KIND: &str = "too-many-searches";
+
 /// The one tool S03 ships. The name is part of the model-facing contract
 /// and the UI's memory-consulted check (T04).
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
@@ -435,6 +448,32 @@ pub struct ToolResultEvent {
     /// Absent for every other tool (their results are model-facing data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Wall time the executor took (run trace, review item 1).
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// input_action's post-action readback (`verified`), lifted out of the
+    /// model-facing content so a run report shows what the OS observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<serde_json::Value>,
+    /// A failed result's content, bounded — the typed kind alone rarely
+    /// says WHY ("unrecognized key", the ⚠ reason, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Cap on the error text riding a failed tool-result event.
+const RESULT_ERROR_CHARS: usize = 300;
+
+/// The `verified` block of an input_action result, if present. Pure.
+pub fn verified_block(call_name: &str, content: &str) -> Option<serde_json::Value> {
+    if call_name != INPUT_ACTION_TOOL {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("verified")
+        .cloned()
+        .filter(|v| !v.is_null())
 }
 
 /// Cap on the UI preview riding a tool-result event.
@@ -924,6 +963,8 @@ pub struct WebSearchTool {
     screen: ScreenQueryTool,
     url_seen: Arc<UrlSeen>,
     opener: Arc<dyn Opener>,
+    /// Searches executed this run (the tool is built per request).
+    searches: std::sync::atomic::AtomicUsize,
 }
 
 pub const WEB_SEARCH_TOOL: &str = "web_search";
@@ -983,6 +1024,7 @@ impl WebSearchTool {
             screen,
             url_seen,
             opener,
+            searches: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1042,6 +1084,22 @@ impl ToolExecutor for WebSearchTool {
             .to_string();
         if query.is_empty() {
             return ToolOutcome::failure("invalid-arguments", "query must not be empty");
+        }
+        // The search budget: past it, the answer is in the results already
+        // on screen (or honestly not findable) — not in a 21st re-phrasing.
+        let done = self
+            .searches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if done >= MAX_WEB_SEARCHES_PER_RUN {
+            log::warn!("llm: web_search refused — {done} searches already this run");
+            return ToolOutcome::failure(
+                TOO_MANY_SEARCHES_KIND,
+                format!(
+                    "you have already searched {done} times this run. STOP searching: read the \
+                     results you already have (screen_query / read_page), click one, and answer \
+                     from it — or tell the user plainly what you could not find."
+                ),
+            );
         }
         let site = args
             .get("site")
@@ -2521,6 +2579,8 @@ pub async fn run_tool_loop_with_stop(
     let mut saw_usage = false;
     // Repeat breaker: exact (tool, arguments) execution counts this run.
     let mut call_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Stuck breaker: repeated-call refusals in a row (reset by any real call).
+    let mut consecutive_refusals: u32 = 0;
     for round in 0..=MAX_TOOL_ROUNDS {
         // Stop observed between rounds: terminate before issuing the next
         // request, with the text streamed so far (R006 — never silent).
@@ -2530,7 +2590,14 @@ pub async fn run_tool_loop_with_stop(
             );
             return Ok(LoopOutcome::stopped(streamed_text, streamed_tokens));
         }
-        let tools = if round < MAX_TOOL_ROUNDS {
+        let stuck = consecutive_refusals >= STUCK_REFUSALS_LIMIT;
+        if stuck {
+            log::warn!(
+                "llm: {consecutive_refusals} repeated-call refusals in a row — forcing a text \
+                 answer at round {round} (request={request_id})"
+            );
+        }
+        let tools = if round < MAX_TOOL_ROUNDS && !stuck {
             executor.definitions()
         } else {
             Vec::new()
@@ -2615,7 +2682,14 @@ pub async fn run_tool_loop_with_stop(
             let repeat_key = format!("{}\x01{}", call.name, call.arguments.trim());
             let seen = call_counts.entry(repeat_key).or_insert(0);
             *seen += 1;
-            let result = if *seen > REPEATED_CALL_LIMIT {
+            let executed_at = std::time::Instant::now();
+            let refused_repeat = *seen > REPEATED_CALL_LIMIT;
+            if refused_repeat {
+                consecutive_refusals += 1;
+            } else {
+                consecutive_refusals = 0;
+            }
+            let result = if refused_repeat {
                 // The same exact call for the (LIMIT+1)th time: executing it
                 // again cannot produce new information — refuse typed and
                 // force a strategy change (or an honest report).
@@ -2652,6 +2726,12 @@ pub async fn run_tool_loop_with_stop(
                 mode: result.mode,
                 failure: result.failure,
                 preview: result_preview(&call.name, &result.content),
+                elapsed_ms: executed_at.elapsed().as_millis() as u64,
+                verified: verified_block(&call.name, &result.content),
+                error: (!result.ok).then(|| {
+                    let text: String = result.content.chars().take(RESULT_ERROR_CHARS).collect();
+                    text
+                }),
             }));
 
             // Second half of the round-trip: the tool-role answer.
@@ -2976,7 +3056,9 @@ mod tests {
             .map(|i| {
                 tool_call_outcome(vec![search_call(
                     &format!("call_{i}"),
-                    r#"{"query":"again"}"#,
+                    // Distinct per round: identical calls would trip the
+                    // repeat/stuck breakers, which have their own tests.
+                    &format!(r#"{{"query":"again {i}"}}"#),
                 )])
             })
             .collect();
@@ -3018,7 +3100,9 @@ mod tests {
             .map(|i| {
                 tool_call_outcome(vec![search_call(
                     &format!("call_{i}"),
-                    r#"{"query":"again"}"#,
+                    // Distinct per round: identical calls would trip the
+                    // repeat/stuck breakers, which have their own tests.
+                    &format!(r#"{{"query":"again {i}"}}"#),
                 )])
             })
             .collect();
@@ -3054,7 +3138,12 @@ mod tests {
         // Defensive bound: even if the model "calls" a tool when none were
         // offered, the loop ends — no dispatch, no extra request.
         let mut responses: Vec<Result<StreamOutcome, LlmError>> = (0..MAX_TOOL_ROUNDS)
-            .map(|i| tool_call_outcome(vec![search_call(&format!("call_{i}"), r#"{"query":"q"}"#)]))
+            .map(|i| {
+                tool_call_outcome(vec![search_call(
+                    &format!("call_{i}"),
+                    &format!(r#"{{"query":"q {i}"}}"#),
+                )])
+            })
             .collect();
         responses.push(tool_call_outcome(vec![search_call(
             "call_zombie",
@@ -3332,6 +3421,9 @@ mod tests {
             mode: Some(SearchMode::Semantic),
             failure: None,
             preview: None,
+            elapsed_ms: 0,
+            verified: None,
+            error: None,
         };
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["requestId"], 7);

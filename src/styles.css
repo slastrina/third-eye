@@ -716,6 +716,11 @@ body,
   cursor: pointer;
 }
 
+.model-lane--unhealthy {
+  color: #ff6b6b;
+  border-color: rgba(255, 107, 107, 0.55);
+}
+
 .model-lane:hover {
   background: rgba(255, 255, 255, 0.1);
 }
@@ -1503,6 +1508,23 @@ body,
   font-family: var(--te-font-mono);
 }
 
+.chat-run-report {
+  display: inline-block;
+  margin: 2px 0 0 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 10px;
+  color: var(--te-text-dim);
+  font-family: var(--te-font-mono);
+  cursor: pointer;
+}
+
+.chat-run-report:hover {
+  color: var(--te-text-mid);
+  text-decoration: underline;
+}
+
 .model-session-tokens {
   font-size: 10px;
   color: var(--te-text-dim);
@@ -1817,6 +1839,18 @@ body,
   align-items: center;
   gap: 8px;
 }
+.settings-lane-warning {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: #ff6b6b;
+}
+
+.allowlist-danger {
+  font-size: 10.5px;
+  color: #f0b429;
+  white-space: nowrap;
+}
+
 .allowlist-entry {
   flex: 1;
   font-family: var(--te-font-mono);

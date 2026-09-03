@@ -1522,6 +1522,40 @@ pub async fn chat(
         // `Some` exactly for Ok outcomes (stopped included), `None` on Err.
         let reply_for_ingest = ingest_reply_text(&result);
 
+        // Run trace (review item 1): the copyable record of what this run
+        // did — kept for the last few runs, rendered by `run_report`.
+        {
+            let events = tool_events.lock().map(|e| e.clone()).unwrap_or_default();
+            let model = task_app
+                .state::<LlmState>()
+                .model_info()
+                .lanes
+                .into_iter()
+                .find(|l| l.name == routed_lane)
+                .and_then(|l| l.model_id);
+            let mut trace = crate::llm::trace::RunTrace::new(
+                id,
+                &user_ask,
+                &routed_lane,
+                model,
+                teach_active,
+                &events,
+            );
+            trace.total_ms = total_ms;
+            match &result {
+                Ok(o) => {
+                    trace.prompt_tokens = o.outcome.prompt_tokens;
+                    trace.completion_tokens = o.outcome.completion_tokens;
+                    trace.answer_chars = o.outcome.text.chars().count();
+                    trace.end = if o.stopped { "stopped" } else { "done" }.to_string();
+                }
+                Err(e) => trace.end = e.kind().to_string(),
+            }
+            task_app
+                .state::<Arc<crate::llm::trace::RunTraces>>()
+                .push(trace);
+        }
+
         match result {
             Ok(loop_outcome) => {
                 let outcome = loop_outcome.outcome;
@@ -1839,6 +1873,47 @@ pub fn model_info(state: State<'_, LlmState>) -> ModelInfo {
     state.model_info()
 }
 
+/// Lane health (review item 5): every lane's pin checked against LM
+/// Studio's served models — loaded? tool-capable? there at all? Pull-based:
+/// the UI asks at mount, after every model-info broadcast, and on a slow
+/// tick; the answer is data, never an error.
+#[tauri::command]
+pub async fn lane_health(
+    state: State<'_, LlmState>,
+) -> Result<Vec<crate::llm::lane_health::LaneHealth>, String> {
+    let info = state.model_info();
+    Ok(crate::llm::lane_health::check(&info.endpoint, &info.lanes).await)
+}
+
+/// The markdown run report for one request (review item 1) — `None` when
+/// the run is older than the retained window. Newest run when `request_id`
+/// is 0.
+#[tauri::command]
+pub fn run_report(
+    traces: State<'_, Arc<crate::llm::trace::RunTraces>>,
+    request_id: u64,
+) -> Option<String> {
+    let trace = if request_id == 0 {
+        traces.latest()
+    } else {
+        traces.get(request_id)
+    }?;
+    Some(trace.render_markdown())
+}
+
+/// Put a run report on the system clipboard (the transcript's "Copy run
+/// report"); returns the report so the UI can confirm what was copied.
+#[tauri::command]
+pub fn copy_run_report(
+    traces: State<'_, Arc<crate::llm::trace::RunTraces>>,
+    request_id: u64,
+) -> Result<String, String> {
+    let report = run_report(traces, request_id)
+        .ok_or_else(|| "that run is no longer retained".to_string())?;
+    crate::clipboard_tool::write_text(&report)?;
+    Ok(report)
+}
+
 /// The endpoint-config IPC surface (S05): what this run targets, what is
 /// persisted, and what an unset override falls back to. Health-as-value like
 /// `model_info` — a snapshot at any time, never an error.
@@ -2086,6 +2161,13 @@ pub fn respond_hid_approval(
 /// Apply an "Always (forever)" approval: persist the grant and return the
 /// downgraded verdict the waiting gate should act on this run.
 fn persist_always_grant(app: &AppHandle, kind: ActionKind, summary: &str) -> ApprovalVerdict {
+    // A dangerous command's prompt is prefixed ⚠ by the tools (review item
+    // 6): "always" on it is allow-ONCE — nothing is persisted, so the next
+    // `kill`/`rm`/`sudo` asks again.
+    if summary.starts_with('⚠') {
+        log::info!("llm: always-grant refused for a dangerous command ({kind:?}); allowing once");
+        return ApprovalVerdict::AllowOnce;
+    }
     if kind == ActionKind::RunCommand {
         // The summary is "Run command: <exact command line>" — the grant is
         // the command's first token via the EXISTING persistent allowlist

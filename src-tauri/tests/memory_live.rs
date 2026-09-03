@@ -363,6 +363,9 @@ async fn live_chat_exchange_distills_to_source_chat_memory_and_recalls() {
             mode: None,
             failure: None,
             preview: None,
+            elapsed_ms: 0,
+            verified: None,
+            error: None,
         }),
     ];
     let exchange = chat_ingest::capture_exchange(
@@ -471,6 +474,9 @@ async fn live_multi_topic_session_summary_distills_and_recalls() {
                 mode: None,
                 failure: None,
                 preview: None,
+                elapsed_ms: 0,
+                verified: None,
+                error: None,
             }),
         ]
     }

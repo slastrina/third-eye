@@ -374,8 +374,16 @@ impl ToolExecutor for RunInWorkspaceTool {
             .lock()
             .map(|w| w.contains(ActionKind::RunInWorkspace))
             .unwrap_or(false);
-        if !WorkspaceState::is_tmp(&cwd) && !kind_granted && !self.workspace.dir_granted(&cwd) {
-            let summary = format!("Run in {}: {command}", cwd.display());
+        // Dangerous verbs ALWAYS ask (review item 6): tmp, the kind grant and
+        // a blessed directory are all ignored, and "always" is allow-once.
+        let danger = crate::command_runner::dangerous_command(&command);
+        let promptless = danger.is_none()
+            && (WorkspaceState::is_tmp(&cwd) || kind_granted || self.workspace.dir_granted(&cwd));
+        if !promptless {
+            let summary = match &danger {
+                Some(reason) => format!("⚠ {reason} — in {}: {command}", cwd.display()),
+                None => format!("Run in {}: {command}", cwd.display()),
+            };
             match self
                 .approver
                 .request(ActionKind::RunInWorkspace, summary)
@@ -383,8 +391,11 @@ impl ToolExecutor for RunInWorkspaceTool {
             {
                 ApprovalVerdict::AllowOnce => {}
                 ApprovalVerdict::AllowKind | ApprovalVerdict::AllowAlways => {
-                    // Session grant for THIS directory (and its subtree).
-                    self.workspace.grant_dir(cwd.clone());
+                    // Session grant for THIS directory (and its subtree) —
+                    // never earned by a dangerous command.
+                    if danger.is_none() {
+                        self.workspace.grant_dir(cwd.clone());
+                    }
                 }
                 ApprovalVerdict::Deny => {
                     return ToolOutcome::failure(
@@ -533,6 +544,42 @@ mod tests {
         assert!(outcome.ok, "{outcome:?}");
         assert_eq!(prompt.1.load(Ordering::SeqCst), 1, "non-tmp prompts");
         let _ = std::fs::remove_dir_all(&non_tmp);
+    }
+
+    /// Review item 6: even in tmp, with the kind granted, a dangerous verb
+    /// asks — and its "always" answer blesses nothing.
+    #[tokio::test]
+    async fn dangerous_verbs_ask_even_in_tmp_with_the_kind_granted() {
+        let (ws, dir) = scratch_ws("danger");
+        let whitelist = Arc::new(Mutex::new(SessionWhitelist::new()));
+        whitelist.lock().unwrap().allow(ActionKind::RunInWorkspace);
+        let prompt = Arc::new(ScriptedPrompt::new(ApprovalVerdict::AllowAlways));
+        let sink = Arc::new(RecordingSink(Mutex::new(String::new())));
+        let tool = RunInWorkspaceTool::new(
+            ws.clone(),
+            whitelist,
+            prompt.clone(),
+            Arc::new(AtomicBool::new(false)),
+            sink,
+        );
+        let outcome = tool
+            .execute(&call(serde_json::json!({"command": "kill -0 $$"})))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(
+            prompt.1.load(Ordering::SeqCst),
+            1,
+            "tmp + kind grant still asks"
+        );
+        assert!(
+            !ws.dir_granted(&dir),
+            "always on a dangerous command blesses nothing"
+        );
+        let _ = tool
+            .execute(&call(serde_json::json!({"command": "kill -0 $$"})))
+            .await;
+        assert_eq!(prompt.1.load(Ordering::SeqCst), 2, "asks every time");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

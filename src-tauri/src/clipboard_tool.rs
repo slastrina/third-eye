@@ -25,6 +25,11 @@ pub const WAIT_TOOL: &str = "wait";
 /// Read cap: a giant clipboard must not flood the model context.
 const MAX_READ_CHARS: usize = 16 * 1024;
 
+/// Put text on the system clipboard (the run report's "Copy").
+pub fn write_text(text: &str) -> Result<(), String> {
+    platform::write(text)
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};

@@ -821,6 +821,9 @@ mod tests {
             mode: None,
             failure: failure.map(Into::into),
             preview: None,
+            elapsed_ms: 0,
+            verified: None,
+            error: None,
         })
     }
 

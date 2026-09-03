@@ -9,7 +9,9 @@ use third_eye_lib::ocr::macos::extract_elements_scoped_blocking;
 use third_eye_lib::screenquery::macos::SCREEN_QUERY_MAX_DIMENSION;
 
 fn main() {
-    let app = std::env::args().nth(1).unwrap_or_else(|| "Terminal".to_string());
+    let app = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "Terminal".to_string());
     for (label, scope) in [("screen", None), ("window", Some(app.as_str()))] {
         for round in 1..=2 {
             let start = Instant::now();

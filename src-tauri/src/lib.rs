@@ -25,6 +25,7 @@ pub mod integrations;
 #[cfg(desktop)]
 pub mod inventory;
 pub mod llm;
+pub mod logging;
 #[cfg(desktop)]
 pub mod memory;
 pub mod memory_window;
@@ -79,24 +80,11 @@ pub fn run() {
     // relaunches (a `npm run tauri dev` started from a terminal otherwise sends
     // stderr to that terminal, unreadable by an out-of-band observer). Opt-in:
     // an unset var keeps the plain stderr behavior for normal runs.
-    {
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"));
-        if let Ok(path) = std::env::var("THIRD_EYE_LOG_FILE") {
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    builder.target(env_logger::Target::Pipe(Box::new(file)));
-                }
-                Err(e) => {
-                    eprintln!("third-eye: cannot open THIRD_EYE_LOG_FILE {path:?}: {e} — logging to stderr");
-                }
-            }
-        }
-        builder.init();
+    // Always-on log file (review item 1): ~/Library/Logs/Third Eye/third-eye.log,
+    // size-rotated; THIRD_EYE_LOG_FILE overrides the path, RUST_LOG the level.
+    match logging::init() {
+        Some(path) => log::info!("third-eye: logging to {}", path.display()),
+        None => log::warn!("third-eye: no log file — stderr only"),
     }
 
     // Privacy-guard telemetry (M003 S02): one shared GuardState behind every
@@ -179,6 +167,7 @@ pub fn run() {
 
     builder
         .manage(overlay::OverlayManager::new())
+        .manage(std::sync::Arc::new(llm::trace::RunTraces::new()))
         .manage(guard.clone())
         .manage(capture::commands::CaptureState::with_platform_backend())
         // HID input (M005/S01): the managed InputControl backend the composite
@@ -240,6 +229,11 @@ pub fn run() {
             llm::commands::set_lane_model,
             llm::commands::list_models,
             llm::commands::model_info,
+            llm::commands::lane_health,
+            llm::commands::run_report,
+            llm::commands::copy_run_report,
+            logging::log_path,
+            logging::reveal_log,
             llm::commands::llm_endpoint_status,
             llm::commands::set_llm_endpoint,
             llm::commands::guard_status,

@@ -176,6 +176,42 @@ export interface ModelInfo {
   auto: boolean;
 }
 
+/** One lane's pin checked against LM Studio's served models (review item
+ *  5) — the serde shape of Rust's lane_health::LaneHealth. */
+export interface LaneHealth {
+  lane: string;
+  model: string | null;
+  state: "loaded" | "not-loaded" | "missing" | "unknown" | "unpinned";
+  toolUse: boolean | null;
+  /** One-line problem statement, or null when the lane is healthy. */
+  warning: string | null;
+}
+
+/** Put the run's markdown report on the clipboard; resolves to the report
+ *  (review item 1). Rejects when the run is no longer retained. */
+export function copyRunReport(requestId: number): Promise<string> {
+  return invoke<string>("copy_run_report", { requestId });
+}
+
+/** Where the always-on log lives (Settings → Status). */
+export function logPath(): Promise<string | null> {
+  return invoke<string | null>("log_path");
+}
+
+export function revealLog(): Promise<void> {
+  return invoke<void>("reveal_log");
+}
+
+export function laneHealth(): Promise<LaneHealth[]> {
+  return invoke<LaneHealth[]>("lane_health");
+}
+
+/** The footer pill's title: the pin, plus the problem when there is one. */
+export function laneTitle(modelId: string | null, health: LaneHealth | undefined): string {
+  const pin = modelId ?? "endpoint default model";
+  return health?.warning ? `${pin} — ⚠ ${health.warning}` : pin;
+}
+
 /** Start a streaming completion; resolves to the request id whose llm://*
  *  events to accept. The backend aborts any prior in-flight request. */
 export function sendChat(messages: ChatMessage[]): Promise<number> {
@@ -1101,6 +1137,15 @@ export interface CommandsStatus {
    *  or entry + space-separated tail) run without an approval prompt. */
   allowlist: string[];
   error: string | null;
+  /** Verbs that ALWAYS ask even when allowlisted (Settings shows ⚠). */
+  dangerousVerbs?: string[];
+}
+
+/** Whether an allowlist entry's verb is one the backend always prompts
+ *  for regardless of the list — the Settings ⚠ glyph. Pure. */
+export function allowlistEntryAlwaysAsks(entry: string, dangerousVerbs: string[] = []): boolean {
+  const verb = entry.trim().split(/\s+/)[0]?.split("/").pop() ?? "";
+  return dangerousVerbs.includes(verb) || verb.startsWith("mkfs");
 }
 
 /** Read the terminal-commands gate. */
@@ -1281,6 +1326,9 @@ export interface UiMessage {
   /** Assistant only: real token spend for the turn (in/out), when the
    *  backend reported usage. */
   usage?: { promptTokens: number; completionTokens: number };
+  /** Assistant only: the backend request this answer came from — the key
+   *  for "Copy run report" (review item 1). Set when the run finishes. */
+  requestId?: number;
   /** Assistant only: accumulated chain-of-thought from a thinking model,
    *  rendered as a dimmed "Thinking…" region above the answer. Transient —
    *  streamed via llm://reasoning, never sent back as history or persisted.
@@ -1840,6 +1888,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           status: "done",
           memory: settleMemoryPhase(m.memory),
           usage,
+          requestId: action.payload.requestId,
         })),
       };
     }
