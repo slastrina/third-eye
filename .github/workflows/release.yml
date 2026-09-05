@@ -100,6 +100,7 @@ jobs:
 
             ```
             brew tap slastrina/tap
+            brew trust slastrina/tap
             brew install --cask third-eye
             ```
 

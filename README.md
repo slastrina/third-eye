@@ -44,8 +44,11 @@ It is built for one machine, one person, and a model running on that machine. No
 
 ```sh
 brew tap slastrina/tap
+brew trust slastrina/tap
 brew install --cask third-eye
 ```
+
+(`brew trust` is Homebrew's confirmation that you accept casks from a third-party tap.)
 
 `brew upgrade --cask third-eye` updates it; the app also checks GitHub's latest release once a day (Settings → Status → Updates, one request to `api.github.com`, off with one toggle) and tells you when a newer version exists.
 
