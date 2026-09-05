@@ -90,8 +90,7 @@ fn key_round_trips_through_the_real_credential_store_and_never_lands_on_disk() {
     // friends) and the repo-side config files for the seeded bytes.
     let mut scanned = 0usize;
     if let Some(home) = std::env::var_os("HOME") {
-        let app_data =
-            Path::new(&home).join("Library/Application Support/com.slastrina.thirdeye");
+        let app_data = Path::new(&home).join("Library/Application Support/com.slastrina.thirdeye");
         assert_absent_under(&app_data, seeded.as_bytes(), &mut scanned);
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
