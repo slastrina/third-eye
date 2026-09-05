@@ -102,14 +102,20 @@ build-web:
 ## build-cli: Build the thirdeye CLI and stage it into src-tauri/binaries/
 # The bundler ships it in Resources (Settings → Integrations installs it
 # from there). Release CI calls this before tauri-action builds the app.
+# Tauri external binaries are looked up by target triple:
+# binaries/thirdeye-<triple>, landing in Contents/MacOS/thirdeye — signed,
+# hardened and notarized with the app (a Resources copy was rejected by
+# notarization, 2026-09-05).
+HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
 build-cli:
 	cd src-tauri && cargo build --release --bin thirdeye
-	mkdir -p src-tauri/binaries && cp src-tauri/target/release/thirdeye src-tauri/binaries/thirdeye
+	mkdir -p src-tauri/binaries && cp src-tauri/target/release/thirdeye "src-tauri/binaries/thirdeye-$(HOST_TRIPLE)"
 
 ## build-tauri: Build the Tauri desktop app bundle for the current OS
-# The staged CLI is a BUNDLING concern: tauri.bundle.conf.json adds it as a
-# resource only here, so a plain cargo build / clippy / test on a fresh
-# checkout never fails on a missing binaries/ glob (CI, 2026-09-05).
+# The staged CLI is a BUNDLING concern: tauri.bundle.conf.json declares it
+# as an external binary only here, so a plain cargo build / clippy / test
+# on a fresh checkout never fails on a missing binaries/ entry (CI,
+# 2026-09-05).
 build-tauri: build-cli
 	$(TAURI) build --config src-tauri/tauri.bundle.conf.json
 

@@ -7,16 +7,24 @@
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
-/// Where the bundled CLI lives inside the app (Resources/binaries/thirdeye,
-/// staged by `make build-tauri`). None in dev runs without a bundle.
+/// Where the bundled CLI lives inside the app. It ships as a Tauri
+/// external binary (sidecar): Contents/MacOS/thirdeye, next to the app's
+/// own executable — which is what gets it signed, hardened and notarized
+/// with the app (a plain Resources copy failed notarization, 2026-09-05).
+/// None in dev runs without a bundle.
 pub fn bundled_cli(app: &AppHandle) -> Option<std::path::PathBuf> {
-    let path = app
+    let beside_exe = std::env::current_exe().ok()?.parent()?.join("thirdeye");
+    if beside_exe.exists() {
+        return Some(beside_exe);
+    }
+    // Pre-sidecar bundles staged the CLI under Resources/binaries.
+    let legacy = app
         .path()
         .resource_dir()
         .ok()?
         .join("binaries")
         .join("thirdeye");
-    path.exists().then_some(path)
+    legacy.exists().then_some(legacy)
 }
 
 fn home() -> Result<std::path::PathBuf, String> {
