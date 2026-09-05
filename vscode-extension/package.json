@@ -4,7 +4,8 @@
   "description": "Live visibility into Third Eye's coding agent: files open as the agent edits them, diffs and run output stream in, and debug sessions start only with your approval.",
   "version": "0.1.0",
   "publisher": "slastrina",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/slastrina/third-eye.git" },
   "private": true,
   "engines": {
     "vscode": "^1.85.0"
@@ -31,7 +32,7 @@
   "scripts": {
     "compile": "tsc -p .",
     "test": "tsc -p . && node --test \"out/test/*.test.js\"",
-    "package": "npm run compile && npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+    "package": "npm run compile && npx --yes @vscode/vsce package --skip-license"
   },
   "dependencies": {
     "ws": "^8.18.0"

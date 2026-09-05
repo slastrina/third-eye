@@ -2,6 +2,12 @@
   "name": "third-eye",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slastrina/third-eye.git"
+  },
+  "homepage": "https://iokig.com/third-eye",
   "type": "module",
   "scripts": {
     "dev": "vite",

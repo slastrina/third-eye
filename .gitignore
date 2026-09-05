@@ -46,3 +46,11 @@ tmp/
 
 # Storybook static build (dev artifact, never shipped)
 storybook-static/
+
+# Local-only tooling and overrides (never part of the public tree)
+.agents/
+.claude/
+skills-lock.json
+test-results/
+local.mk
+src-tauri/binaries/

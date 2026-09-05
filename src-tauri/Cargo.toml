@@ -5,6 +5,9 @@ version = "0.1.0"
 description = "Third Eye — instant AI overlay"
 authors = ["slastrina"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/slastrina/third-eye"
+homepage = "https://iokig.com/third-eye"
 
 [lib]
 name = "third_eye_lib"

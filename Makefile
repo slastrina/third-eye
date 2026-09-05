@@ -13,10 +13,15 @@ TAURI := npm run tauri --
 
 .DEFAULT_GOAL := help
 
+# Local, untracked overrides — e.g. `export APPLE_SIGNING_IDENTITY := …`
+# so release builds are signed on your machine while the tracked config
+# stays identity-free. See README → Development.
+-include local.mk
+
 .PHONY: help install dev tauri-dev build build-web build-tauri run-app build-dmg install-app preview vsix \
         test test-unit test-e2e test-all check check-rust check-guard \
         check-mcp-guard linux-check win-check fmt fmt-check lint clean \
-        clean-web clean-rust evals evals-live
+        clean-web clean-rust evals evals-live build-cli
 
 ## help: List available targets
 help:
@@ -94,12 +99,15 @@ install-app: build-tauri
 build-web:
 	npm run build
 
-## build-tauri: Build the Tauri desktop app bundle for the current OS
-# The thirdeye CLI is staged into src-tauri/binaries/ first so the bundler
-# ships it in Resources (Settings → Integrations installs it from there).
-build-tauri:
+## build-cli: Build the thirdeye CLI and stage it into src-tauri/binaries/
+# The bundler ships it in Resources (Settings → Integrations installs it
+# from there). Release CI calls this before tauri-action builds the app.
+build-cli:
 	cd src-tauri && cargo build --release --bin thirdeye
 	mkdir -p src-tauri/binaries && cp src-tauri/target/release/thirdeye src-tauri/binaries/thirdeye
+
+## build-tauri: Build the Tauri desktop app bundle for the current OS
+build-tauri: build-cli
 	$(TAURI) build
 
 # ── Test ────────────────────────────────────────────────────────────────

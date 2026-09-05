@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Third Eye — a local AI that can see your screen and use your Mac</title>
+<meta name="description" content="Third Eye is an open-source macOS overlay that pairs a local language model with real eyes and hands: it reads your screen, drives your apps, runs commands, edits code and remembers — every action verified, anything risky asks first.">
+<meta property="og:title" content="Third Eye">
+<meta property="og:description" content="A local AI that can see your screen and use your Mac. Open source, MIT.">
+<meta property="og:image" content="https://slastrina.github.io/third-eye/assets/hero.svg">
+<meta property="og:type" content="website">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<style>
+  :root{--bg:#0b1422;--bg2:#101d34;--card:#132441;--line:#2c4368;--text:#f3f7ff;--mid:#c7d3e6;--dim:#8ea1bf;--green:#93da49;--green2:#4f8f1f}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  a{color:var(--green)}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header{display:flex;align-items:center;justify-content:space-between;padding:20px 0}
+  header .brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:18px;color:var(--text);text-decoration:none}
+  header .brand img{width:36px;height:36px}
+  nav a{color:var(--mid);text-decoration:none;margin-left:22px;font-size:15px}
+  nav a:hover{color:var(--text)}
+  .hero{padding:48px 0 24px;display:grid;grid-template-columns:1.15fr 1fr;gap:40px;align-items:center}
+  .hero h1{font-size:52px;line-height:1.05;letter-spacing:-1px;margin:0 0 18px}
+  .hero p.lead{font-size:20px;color:var(--mid);margin:0 0 26px;max-width:36em}
+  .cta{display:flex;gap:12px;flex-wrap:wrap}
+  .btn{display:inline-block;padding:12px 20px;border-radius:12px;font-weight:600;text-decoration:none;border:1px solid var(--line);color:var(--text);background:var(--card)}
+  .btn.primary{background:var(--green);color:#0b1422;border-color:var(--green)}
+  .btn:hover{filter:brightness(1.08)}
+  .hero img{width:100%;border-radius:18px;border:1px solid var(--line);box-shadow:0 30px 80px rgba(0,0,0,.45)}
+  .chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}
+  .chip{font-size:13px;color:var(--mid);border:1px solid var(--line);border-radius:999px;padding:6px 12px;background:rgba(255,255,255,.03)}
+  section{padding:56px 0;border-top:1px solid rgba(255,255,255,.06)}
+  h2{font-size:30px;letter-spacing:-.5px;margin:0 0 8px}
+  .sub{color:var(--dim);margin:0 0 30px;max-width:44em}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .card{background:linear-gradient(180deg,var(--card),var(--bg2));border:1px solid var(--line);border-radius:16px;padding:22px}
+  .card h3{margin:0 0 8px;font-size:17px}
+  .card p{margin:0;color:var(--mid);font-size:15px}
+  .card .k{color:var(--green);font-size:12px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;margin-bottom:10px}
+  pre{background:#070d17;border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;color:#dbe6f7;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:start}
+  ul.clean{padding-left:18px;color:var(--mid)}
+  ul.clean li{margin:6px 0}
+  .arch img{width:100%;border-radius:16px;border:1px solid var(--line)}
+  footer{padding:36px 0 60px;color:var(--dim);font-size:14px;border-top:1px solid rgba(255,255,255,.06)}
+  footer a{color:var(--mid)}
+  @media (max-width:860px){.hero{grid-template-columns:1fr}.hero h1{font-size:40px}.grid{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="brand" href="#"><img src="assets/logo.svg" alt="">Third Eye</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#safety">Safety</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/slastrina/third-eye">GitHub</a>
+      <a href="https://iokig.com/third-eye">Blog</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <h1>A local AI that can see your screen and use your Mac.</h1>
+      <p class="lead">Third Eye is a summonable overlay that pairs a language model running on your machine with real eyes and hands. It reads what is on screen, drives your apps, runs commands, edits code, and remembers — and every action is checked against what the OS actually did.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/slastrina/third-eye/releases">Download for macOS</a>
+        <a class="btn" href="https://github.com/slastrina/third-eye">Source on GitHub</a>
+      </div>
+      <div class="chips">
+        <span class="chip">🔒 Local-first · nothing leaves your Mac by default</span>
+        <span class="chip">🧾 MIT licensed</span>
+        <span class="chip">🦀 Tauri + Rust + React</span>
+      </div>
+    </div>
+    <img src="assets/hero.svg" alt="Third Eye hero artwork">
+  </div>
+
+  <section id="features">
+    <h2>What it does</h2>
+    <p class="sub">One hotkey, one panel, a model that can look and act. Each capability is a tool with a typed contract — the model cannot narrate past a failure.</p>
+    <div class="grid">
+      <div class="card"><div class="k">See</div><h3>Reads the screen the way you do</h3><p>The focused window through the accessibility tree first, on-device OCR second — with real click targets, in a few hundred milliseconds.</p></div>
+      <div class="card"><div class="k">Act</div><h3>Uses your apps for real</h3><p>Clicks, typing and shortcuts; presses controls by name; talks to Chrome's tabs and page; reads and rewrites the text you selected in any app.</p></div>
+      <div class="card"><div class="k">Verify</div><h3>Every action reports back</h3><p>Where the cursor really landed, which app holds focus, whether the text arrived. A wrong-app readback is a failure the model must handle.</p></div>
+      <div class="card"><div class="k">Teach</div><h3>Teach Me mode</h3><p>Flip a toggle and it does things the human way — visible keyboard and mouse only, narrated, ending with a numbered "do it yourself" recap.</p></div>
+      <div class="card"><div class="k">Code</div><h3>A coding agent, too</h3><p>Workspace tools, diffs in the loop, a VS Code extension that shows edits live, and a <code>thirdeye</code> CLI and TUI.</p></div>
+      <div class="card"><div class="k">Remember</div><h3>Memory that stays yours</h3><p>A local store with categories, tags, pins and expiry. Facts ride the system turn automatically. Transcripts are redacted before they are saved.</p></div>
+    </div>
+  </section>
+
+  <section id="safety">
+    <h2>Built to be trusted with a keyboard</h2>
+    <p class="sub">The design rule is <em>structure over prose</em>: a small local model treats instructions as advisory, so the guarantees live in code, not in the prompt.</p>
+    <div class="two">
+      <ul class="clean">
+        <li><strong>Three run modes</strong> — Off, Ask, Auto-run — with per-kind session grants and a persistent command allowlist.</li>
+        <li><strong>Dangerous verbs always ask.</strong> <code>sudo</code>, <code>rm</code>, <code>kill</code>, <code>git push</code>, uploads, pipe-to-shell — allowlisted or not, and "always" never sticks.</li>
+        <li><strong>Grounding.</strong> A click needs coordinates from a screen read; a navigation needs a URL you gave or it read. Guesses are refused, typed.</li>
+        <li><strong>Budgets and breakers</strong> end loops: opens earned by reading, a search budget, a repeat breaker, a stuck breaker that forces a text answer.</li>
+        <li><strong>Redaction at the choke points</strong> and a fail-closed guard that refuses non-local endpoints unless you opt in.</li>
+        <li><strong>Every run leaves a report</strong> you can copy into a bug report; the log is always on.</li>
+      </ul>
+      <div class="arch"><img src="assets/architecture.svg" alt="Architecture diagram"></div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="sub">macOS 14+ and <a href="https://lmstudio.ai">LM Studio</a> serving a tool-capable model on <code>localhost:1234</code>. Unsigned builds need a right-click → Open the first time.</p>
+    <div class="two">
+      <div>
+        <h3>From a release</h3>
+        <p style="color:var(--mid)">Grab the DMG from <a href="https://github.com/slastrina/third-eye/releases">Releases</a>, drag Third Eye to Applications, open it, and follow the four-step tour (Accessibility, Screen Recording, and what each is for).</p>
+      </div>
+      <div>
+        <h3>From source</h3>
+<pre>git clone https://github.com/slastrina/third-eye.git
+cd third-eye
+npm install
+make install-app</pre>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Third Eye is made by <a href="https://github.com/slastrina">slastrina</a>. Read the story and more projects at <a href="https://iokig.com/third-eye">iokig.com</a>. · <a href="https://github.com/slastrina/third-eye/blob/main/LICENSE">MIT License</a>
+  </footer>
+</div>
+</body>
+</html>
