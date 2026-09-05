@@ -58,8 +58,8 @@ build: build-tauri
 # and Accessibility to THIS app (System Settings → Privacy & Security); the
 # grant sticks across launches, and only drops when the app is REBUILT
 # (ad-hoc signing changes the binary hash — re-toggle the grant after a
-# rebuild, or set a real signingIdentity in tauri.conf.json to make it
-# survive rebuilds too).
+# rebuild, or export APPLE_SIGNING_IDENTITY from an untracked local.mk to
+# make it survive rebuilds too).
 APP_BUNDLE := src-tauri/target/release/bundle/macos/Third Eye.app
 
 ## run-app: Build the release app bundle and launch it (stable binary for OS permission grants)
@@ -76,7 +76,7 @@ build-dmg: build-tauri
 # Build FIRST (the old app keeps running through the slow part), then quit,
 # swap the /Applications copy, and relaunch. Quit is graceful (AppleScript)
 # with a pkill fallback; the signed bundle keeps its TCC grants across the
-# swap (Developer ID signingIdentity in tauri.conf.json).
+# swap (Developer ID identity exported from local.mk).
 ## install-app: Rebuild, quit the running Third Eye, replace /Applications/Third Eye.app, relaunch it
 install-app: build-tauri
 	@# Graceful quit, then WAIT for the process to actually exit before the
@@ -107,8 +107,11 @@ build-cli:
 	mkdir -p src-tauri/binaries && cp src-tauri/target/release/thirdeye src-tauri/binaries/thirdeye
 
 ## build-tauri: Build the Tauri desktop app bundle for the current OS
+# The staged CLI is a BUNDLING concern: tauri.bundle.conf.json adds it as a
+# resource only here, so a plain cargo build / clippy / test on a fresh
+# checkout never fails on a missing binaries/ glob (CI, 2026-09-05).
 build-tauri: build-cli
-	$(TAURI) build
+	$(TAURI) build --config src-tauri/tauri.bundle.conf.json
 
 # ── Test ────────────────────────────────────────────────────────────────
 

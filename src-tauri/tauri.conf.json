@@ -133,10 +133,7 @@
     ],
     "macOS": {
       "signingIdentity": null
-    },
-    "resources": [
-      "binaries/*"
-    ]
+    }
   },
   "mainBinaryName": "third-eye"
 }

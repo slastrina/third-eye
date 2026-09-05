@@ -45,4 +45,4 @@ jobs:
           releaseBody: See CHANGELOG.md for what changed.
           releaseDraft: true
           prerelease: false
-          args: --target aarch64-apple-darwin
+          args: --target aarch64-apple-darwin --config src-tauri/tauri.bundle.conf.json
