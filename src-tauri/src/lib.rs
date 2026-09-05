@@ -40,6 +40,7 @@ pub mod settings_window;
 pub mod tool_toggles;
 #[cfg(desktop)]
 pub mod tray;
+pub mod updates;
 #[cfg(desktop)]
 pub mod watcher;
 #[cfg(desktop)]
@@ -168,6 +169,7 @@ pub fn run() {
     builder
         .manage(overlay::OverlayManager::new())
         .manage(std::sync::Arc::new(llm::trace::RunTraces::new()))
+        .manage(updates::UpdateState::default())
         .manage(guard.clone())
         .manage(capture::commands::CaptureState::with_platform_backend())
         // HID input (M005/S01): the managed InputControl backend the composite
@@ -233,6 +235,9 @@ pub fn run() {
             llm::commands::run_report,
             llm::commands::copy_run_report,
             logging::log_path,
+            updates::update_status,
+            updates::check_for_updates,
+            updates::set_update_checks,
             logging::reveal_log,
             llm::commands::llm_endpoint_status,
             llm::commands::set_llm_endpoint,
@@ -462,6 +467,7 @@ pub fn run() {
             // over the THIRD_EYE_* env fallback the router booted with.
             #[cfg(desktop)]
             llm::commands::apply_persisted_lane_models(app.handle());
+            updates::spawn_periodic(app.handle());
 
             // Persisted MCP run mode (M007 S04, R016): a present settings.json
             // key restores the user's Off/Ask/Auto-run choice; absent/garbage

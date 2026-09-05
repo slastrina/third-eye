@@ -62,7 +62,18 @@ import {
   isLocalEndpoint,
   allowlistEntryAlwaysAsks,
   laneTitle,
+  updateSummary,
 } from "./chat";
+
+describe("update summary", () => {
+  const base = { enabled: true, current: "0.1.0", available: null, releaseUrl: null, checkedAtMs: null, error: null };
+  it("reads as one line per state", () => {
+    expect(updateSummary(base)).toBe("v0.1.0 — not checked yet");
+    expect(updateSummary({ ...base, checkedAtMs: 1 })).toBe("v0.1.0 — up to date");
+    expect(updateSummary({ ...base, checkedAtMs: 1, available: "0.2.0" })).toBe("v0.1.0 → v0.2.0 available");
+    expect(updateSummary({ ...base, error: "offline" })).toBe("v0.1.0 — check failed: offline");
+  });
+});
 
 describe("lane health titles", () => {
   it("names the pin, and the problem when there is one", () => {

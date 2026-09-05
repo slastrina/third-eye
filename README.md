@@ -40,7 +40,16 @@ It is built for one machine, one person, and a model running on that machine. No
 
 **Requirements:** macOS 14+, Apple Silicon recommended, and [LM Studio](https://lmstudio.ai) serving a tool-capable chat model on `http://localhost:1234` (a 9B Qwen-class instruct model with tool use is a good start).
 
-**Install a release:** grab the latest DMG from [Releases](https://github.com/slastrina/third-eye/releases), drag *Third Eye* to Applications, open it. Unsigned builds need a right-click → *Open* the first time.
+**Install with Homebrew:**
+
+```sh
+brew tap slastrina/tap
+brew install --cask third-eye
+```
+
+`brew upgrade --cask third-eye` updates it; the app also checks GitHub's latest release once a day (Settings → Status → Updates, one request to `api.github.com`, off with one toggle) and tells you when a newer version exists.
+
+**Or grab the DMG** from [Releases](https://github.com/slastrina/third-eye/releases), drag *Third Eye* to Applications, open it. Releases are signed and notarized; an unsigned local build needs a right-click → *Open* the first time.
 
 **Or build from source:**
 
@@ -70,6 +79,12 @@ Third Eye's design rule is **structure over prose**: instructions in a prompt ar
 - **Consent, not containment.** Tools work anywhere; writing or running somewhere new asks for the directory first; `/tmp` is always free.
 
 Read more in [`docs/TECH-STACK.md`](docs/TECH-STACK.md) and the design specs under [`specs/`](specs/).
+
+## Releasing
+
+1. Bump the version in `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` and `package.json` (the workflow refuses a tag that does not match `tauri.conf.json`).
+2. `git tag v0.2.0 && git push origin v0.2.0`.
+3. The `release` workflow builds the app on a macOS runner, signs and notarizes it when the Apple secrets are configured, publishes a GitHub Release with `Third-Eye_<version>_aarch64.dmg` + `.sha256`, and pushes the updated cask to [`slastrina/homebrew-tap`](https://github.com/slastrina/homebrew-tap) when `HOMEBREW_TAP_PAT` is set.
 
 ## Development
 

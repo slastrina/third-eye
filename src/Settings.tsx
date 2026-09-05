@@ -44,6 +44,12 @@ import {
   revealLog,
   chromeJsStatus,
   type ChromeJsStatus,
+  updateStatus,
+  checkForUpdates,
+  setUpdateChecks,
+  onUpdateStatus,
+  updateSummary,
+  type UpdateStatus,
   setCommandsEnabled,
   setHidRunMode,
   setMemoryRetention,
@@ -628,6 +634,19 @@ function Settings() {
   }, []);
   // Chrome page scripting (system tools S3): a one-time manual toggle in
   // Chrome; shown with a recheck so the user can confirm it took.
+  // Updates (parity with caffeinate-menubar): the last daily/manual check.
+  const [updates, setUpdates] = useState<UpdateStatus | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  useEffect(() => {
+    updateStatus().then(setUpdates, () => setUpdates(null));
+    let un: (() => void) | undefined;
+    onUpdateStatus(setUpdates).then((u) => (un = u), () => undefined);
+    return () => un?.();
+  }, []);
+  const checkUpdatesNow = () => {
+    setCheckingUpdates(true);
+    checkForUpdates().then(setUpdates, () => undefined).finally(() => setCheckingUpdates(false));
+  };
   const [chromeJs, setChromeJs] = useState<ChromeJsStatus | null>(null);
   const recheckChromeJs = () => chromeJsStatus().then(setChromeJs, () => setChromeJs(null));
   useEffect(() => {
@@ -2885,6 +2904,42 @@ function Settings() {
               <span className="settings-status-value">
                 v{build.version} · {build.gitHash} ·{" "}
                 {new Date(build.builtAtMs).toLocaleString()}
+              </span>
+            </div>
+          )}
+          {updates !== null && (
+            <div className="settings-status-row" data-updates-row>
+              <span className="settings-row-label">Updates</span>
+              <span className="settings-status-value">
+                <span data-update-summary>{updateSummary(updates)}</span>
+                {updates.available && updates.releaseUrl && (
+                  <>
+                    {" "}
+                    <a href={updates.releaseUrl} target="_blank" rel="noopener noreferrer">
+                      Download
+                    </a>
+                    {" · "}
+                    <code>brew upgrade --cask third-eye</code>
+                  </>
+                )}{" "}
+                <button
+                  type="button"
+                  className="chat-retry"
+                  disabled={checkingUpdates}
+                  onClick={checkUpdatesNow}
+                >
+                  {checkingUpdates ? "Checking…" : "Check now"}
+                </button>
+                <label className="settings-inline-toggle">
+                  <input
+                    type="checkbox"
+                    checked={updates.enabled}
+                    onChange={(event) =>
+                      setUpdateChecks(event.target.checked).then(setUpdates, () => undefined)
+                    }
+                  />{" "}
+                  check daily (one request to api.github.com)
+                </label>
               </span>
             </div>
           )}

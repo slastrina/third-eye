@@ -1839,6 +1839,15 @@ body,
   align-items: center;
   gap: 8px;
 }
+.settings-inline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  font-size: 11px;
+  color: var(--te-text-mid);
+}
+
 .settings-lane-warning {
   flex-basis: 100%;
   font-size: 11px;

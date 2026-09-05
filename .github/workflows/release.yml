@@ -1,24 +1,47 @@
 name: release
 
-# Builds the macOS app and attaches the DMG to a GitHub Release when a
-# v* tag is pushed. Unsigned unless the signing/notarization secrets below
-# are configured (then tauri-action signs and notarizes automatically):
-#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-#   APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID
+# Tag v* → build, (sign + notarize when the Apple secrets are set), publish
+# a GitHub Release with the DMG + sha256, and bump the Homebrew cask in
+# slastrina/homebrew-tap (when HOMEBREW_TAP_PAT is set).
+#
+# Secrets (same names as caffeinate-menubar, mapped to what Tauri expects):
+#   DEVELOPER_ID_CERT_P12 (base64 .p12), DEVELOPER_ID_CERT_PASSWORD,
+#   APPLE_SIGNING_IDENTITY ("Developer ID Application: … (TEAMID)"),
+#   APPLE_ID, APPLE_APP_PASSWORD (app-specific), APPLE_TEAM_ID,
+#   HOMEBREW_TAP_PAT (repo scope on slastrina/homebrew-tap).
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). Must already exist."
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   macos:
+    name: Build, sign, release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag }}"; [ -n "$TAG" ] || TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          CONF=$(python3 -c 'import json;print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          if [ "$CONF" != "${TAG#v}" ]; then
+            echo "::error::tag $TAG does not match tauri.conf.json version $CONF — bump the version (Cargo.toml, tauri.conf.json, package.json) first"; exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -28,21 +51,80 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci
-      - name: stage the thirdeye CLI into the bundle
+
+      - name: Stage the thirdeye CLI into the bundle
         run: make build-cli
-      - uses: tauri-apps/tauri-action@v0
+
+      - name: Build the app (signed + notarized when secrets are present)
+        id: build
+        uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Third Eye ${{ github.ref_name }}
-          releaseBody: See CHANGELOG.md for what changed.
-          releaseDraft: true
-          prerelease: false
           args: --target aarch64-apple-darwin --config src-tauri/tauri.bundle.conf.json
+
+      - name: Package artifacts
+        id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          mkdir -p dist-release
+          DMG=$(ls src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -1)
+          cp "$DMG" "dist-release/Third-Eye_${VERSION}_aarch64.dmg"
+          cd dist-release
+          shasum -a 256 "Third-Eye_${VERSION}_aarch64.dmg" > "Third-Eye_${VERSION}_aarch64.dmg.sha256"
+          echo "sha=$(awk '{print $1}' "Third-Eye_${VERSION}_aarch64.dmg.sha256")" >> "$GITHUB_OUTPUT"
+          ls -lh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Third Eye ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist-release/*.dmg
+            dist-release/*.sha256
+          body: |
+            ## Install
+
+            ### Homebrew
+
+            ```
+            brew tap slastrina/tap
+            brew install --cask third-eye
+            ```
+
+            ### Manual
+
+            Download the DMG below, drag **Third Eye** to Applications, open it. The first-start tour walks through the Accessibility and Screen Recording permissions.
+
+            ### Requirements
+
+            macOS 14 (Sonoma) or later, Apple Silicon, and [LM Studio](https://lmstudio.ai) serving a tool-capable model on `localhost:1234`.
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.artifacts.outputs.sha }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_PAT" ]; then
+            echo "HOMEBREW_TAP_PAT not set — skipping the tap update."; exit 0
+          fi
+          TAP_DIR="$RUNNER_TEMP/homebrew-tap"
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/slastrina/homebrew-tap.git" "$TAP_DIR"
+          mkdir -p "$TAP_DIR/Casks"
+          sed -e "s/__VERSION__/${VERSION}/" -e "s/__SHA256__/${SHA}/" packaging/homebrew/third-eye.rb.template > "$TAP_DIR/Casks/third-eye.rb"
+          cd "$TAP_DIR"
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add Casks/third-eye.rb
+          git commit -m "third-eye ${VERSION}" || { echo "cask unchanged"; exit 0; }
+          git push origin HEAD

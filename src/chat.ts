@@ -202,6 +202,43 @@ export function revealLog(): Promise<void> {
   return invoke<void>("reveal_log");
 }
 
+/** Settings → Status "Updates": the last GitHub releases/latest check —
+ *  the serde shape of Rust's updates::UpdateStatus. */
+export interface UpdateStatus {
+  enabled: boolean;
+  current: string;
+  available: string | null;
+  releaseUrl: string | null;
+  checkedAtMs: number | null;
+  error: string | null;
+}
+
+export const UPDATE_STATE_EVENT = "updates://state";
+
+export function updateStatus(): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>("update_status");
+}
+
+export function checkForUpdates(): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>("check_for_updates");
+}
+
+export function setUpdateChecks(enable: boolean): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>("set_update_checks", { enable });
+}
+
+export function onUpdateStatus(cb: (status: UpdateStatus) => void): Promise<UnlistenFn> {
+  return listen<UpdateStatus>(UPDATE_STATE_EVENT, (e) => cb(e.payload));
+}
+
+/** The one-line summary for the Updates row. Pure. */
+export function updateSummary(s: UpdateStatus): string {
+  if (s.error) return `v${s.current} — check failed: ${s.error}`;
+  if (s.available) return `v${s.current} → v${s.available} available`;
+  if (s.checkedAtMs) return `v${s.current} — up to date`;
+  return `v${s.current} — not checked yet`;
+}
+
 /** Settings → Integrations: whether Chrome lets Third Eye script its
  *  pages (the browser tool's find/click/fill). */
 export interface ChromeJsStatus {

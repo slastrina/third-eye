@@ -1,0 +1,22 @@
+cask "third-eye" do
+  version "__VERSION__"
+  sha256 "__SHA256__"
+
+  url "https://github.com/slastrina/third-eye/releases/download/v#{version}/Third-Eye_#{version}_aarch64.dmg"
+  name "Third Eye"
+  desc "Local AI overlay that can see your screen and use your Mac"
+  homepage "https://iokig.com/third-eye"
+
+  depends_on macos: ">= :sonoma"
+  depends_on arch: :arm64
+
+  app "Third Eye.app"
+
+  zap trash: [
+    "~/Library/Application Support/com.slastrina.thirdeye",
+    "~/Library/Logs/Third Eye",
+    "~/Library/Preferences/com.slastrina.thirdeye.plist",
+    "~/Library/WebKit/com.slastrina.thirdeye",
+    "~/Library/Caches/com.slastrina.thirdeye",
+  ]
+end
