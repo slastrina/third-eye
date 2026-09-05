@@ -2139,7 +2139,7 @@ pub fn set_verbose_status(app: AppHandle, enable: bool) -> VerboseStatus {
 #[tauri::command]
 pub async fn list_models_detailed(
     state: State<'_, LlmState>,
-) -> Result<Vec<crate::llm::lmstudio::LmModelRow>, ()> {
+) -> Result<Vec<crate::llm::lmstudio::LmModelRow>, String> {
     let endpoint = state.router.endpoint().to_string();
     Ok(crate::llm::lmstudio::model_rows(&endpoint)
         .await

@@ -1,0 +1,6 @@
+# Pinned so CI (dtolnay/rust-toolchain) and every checkout lint with the
+# same clippy: a newer stable's fresh lints failed CI while local was
+# green (2026-09-05). Bump deliberately, with `cargo clippy` run first.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

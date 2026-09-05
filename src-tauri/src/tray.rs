@@ -1262,7 +1262,7 @@ mod tests {
     fn assert_template_safe(buf: &[u8]) {
         assert_eq!(buf.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         let (mut opaque, mut transparent) = (0usize, 0usize);
-        for px in buf.chunks_exact(4) {
+        for px in buf.as_chunks::<4>().0 {
             match px {
                 [255, 255, 255, 255] => opaque += 1,
                 [0, 0, 0, 0] => transparent += 1,

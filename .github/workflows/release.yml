@@ -46,7 +46,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master # version from rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri

@@ -15,9 +15,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The version and components come from rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
