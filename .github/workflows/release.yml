@@ -8,7 +8,10 @@ name: release
 #   DEVELOPER_ID_CERT_P12 (base64 .p12), DEVELOPER_ID_CERT_PASSWORD,
 #   APPLE_SIGNING_IDENTITY ("Developer ID Application: … (TEAMID)"),
 #   APPLE_ID, APPLE_APP_PASSWORD (app-specific), APPLE_TEAM_ID,
+#   APPLE_ORG_NAME (the cert's organization — set ONLY so the log masks it),
 #   HOMEBREW_TAP_PAT (repo scope on slastrina/homebrew-tap).
+# The .p12 must contain ONLY the Developer ID Application identity: the
+# bundler prints every identity it finds, and picks the wrong one otherwise.
 
 on:
   push:
@@ -67,6 +70,9 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Not used by Tauri — referenced so GitHub masks the certificate's
+          # organization name, which the bundler prints in the log.
+          APPLE_ORG_NAME: ${{ secrets.APPLE_ORG_NAME }}
         with:
           args: --target aarch64-apple-darwin --config src-tauri/tauri.bundle.conf.json
 
