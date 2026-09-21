@@ -7,7 +7,7 @@ cask "third-eye" do
   desc "Local AI overlay that can see your screen and use your Mac"
   homepage "https://iokig.com/third-eye"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
   depends_on arch: :arm64
 
   app "Third Eye.app"
